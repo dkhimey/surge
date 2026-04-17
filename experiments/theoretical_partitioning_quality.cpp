@@ -1,4 +1,6 @@
 #include <cmath>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -29,9 +31,9 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(log_id);
     Log logger(log_id);
 
-    Communicator comm;
-
     std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
+    std::cout << "Dataset has " << data_info.first << " vectors with dimension " << data_info.second << "\n";
+    
     int nvectors = data_info.first;
     int dim = data_info.second;
     
@@ -44,39 +46,60 @@ int main(int argc, char **argv) {
     std::vector<float> sample = getSample(DATASETS[dataset_name]["base_file"], 
                                               nvectors, dim, sample_size);
 
-    Coordinator metaIndex(dim, comm, &logger);
+    Coordinator metaIndex(dim, &logger);
     metaIndex.setSampleData(sample.data(), sample_size);
 
     int ncenters = 10000;
     int ef_construction = 200;
     int M_meta = 16;
+    int k = 10;
 
     metaIndex.build(ncenters, num_partitions, ef_construction, M_meta);
     metaIndex.save(log_id);
 
     FileFormat format = getFileFormat(DATASETS[dataset_name]["base_file"]);
-    std::vector<std::vector<int>> gt_indices = readGT(DATASETS[dataset_name]["gt_file"], format);
 
+    std::cout << "Reading ground truth data from " << DATASETS[dataset_name]["gt_file"] << "\n";
+    std::vector<std::vector<int>> gt_indices = readGTBin(DATASETS[dataset_name]["gt_file"]);
+    std::cout << "Finished reading ground truth data\n";
+
+    std::cout << "Memory mapping dataset file " << DATASETS[dataset_name]["base_file"] << "\n";
     int fd = open(DATASETS[dataset_name]["base_file"].c_str(), O_RDONLY);
 
     struct stat st;
     fstat(fd, &st);
 
     void* ptr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (ptr == MAP_FAILED) {
+        std::cerr << "mmap failed: " << strerror(errno) << "\n";
+        close(fd);
+        return 1;
+    }
     float* data = reinterpret_cast<float*>(static_cast<char*>(ptr) + 8);
+
+    std::cout << "Finished memory mapping dataset file\n";
 
     // compute theoretical recall:
     // 1. check where each of the k gt vectors is assigned
+    std::cout << "Computing ground truth partition assignments\n";
     std::vector<std::vector<size_t>> gt_partitions(num_queries);
     for (int i = 0; i < num_queries; i++) {
-        gt_partitions[i].reserve(gt_indices[i].size());
-        for (int idx : gt_indices[i]) {
-            float* vec_ptr = data + idx * dim;;
+        size_t gt_k = std::min(static_cast<size_t>(k), gt_indices[i].size());
+        gt_partitions[i].reserve(gt_k);
+        for (size_t j = 0; j < gt_k; ++j) {
+            int idx = gt_indices[i][j];
+            if (idx < 0 || idx >= nvectors) {
+                std::cerr << "GT index " << idx << " out of bounds (nvectors=" << nvectors << ")\n";
+                continue;
+            }
+            float* vec_ptr = data + static_cast<size_t>(idx) * dim;
             // route gt vec_ptr
             size_t gt_partition = metaIndex.getCurrentPartition(vec_ptr);
             gt_partitions[i].push_back(gt_partition);
         }
     }
+
+    std::cout << "Finished computing ground truth partition assignments\n";
 
     std::ofstream out(log_id + "/routing_metrics.csv");
     out << "mode,param,recall,activation,imbalance,query_time_s\n";
@@ -152,6 +175,7 @@ int main(int argc, char **argv) {
     // 2. check where query would be routed to
         // routing strategy: branching factor
         // branching factors: iterate
+    std::cout << "Computing routing metrics for different strategies\n";
     std::vector<int> branching_factors = {1, 2, 5, 15, 20, 25, 30};
     for (int bf: branching_factors) {
            auto start = std::chrono::high_resolution_clock::now();
@@ -159,6 +183,7 @@ int main(int argc, char **argv) {
            double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
            write_metrics("branching_factor", bf, query_partitions, elapsed);
     }
+    std::cout << "Finished computing routing metrics for branching factor strategy\n";
 
         // routing stategy: recall target
     std::vector<float> recall_targets = {0.5, 0.7, 0.8, 0.9, 0.95, .98};
@@ -168,6 +193,7 @@ int main(int argc, char **argv) {
            double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
            write_metrics("recall_target", rt, query_partitions, elapsed);
     }
+    std::cout << "Finished computing routing metrics for recall target strategy\n";
 
         // routing stratefy: nprobe
     std::vector<int> nprobes = {1, 2, 3, 4, 5, 6, 7, 8, 9};

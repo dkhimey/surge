@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 #include <omp.h>
 
 typedef falconn::DenseVector<float> Point;
@@ -20,7 +21,23 @@ Point transformVector(float* vec, size_t dim, float alpha = 0.5);
 // ========== Coordinator Implementation ==========
 Coordinator::Coordinator(
         int dim,
-        Communicator& comm,
+        Log* logger)
+        : dim_(dim),
+    comm_(nullptr),
+        logger_(logger),
+        gen_(std::random_device{}())
+{
+    
+    space_ = new hnswlib::L2Space(dim_);
+    computeDistance_ = [this](float* a, float* b) { return computeEuclideanDistance(a, b, dim_); };
+
+    std::cout << "[Coordinator]: Instantiated.\n";
+}
+
+
+Coordinator::Coordinator(
+        int dim,
+        Communicator* comm,
         Log* logger)
         : dim_(dim),
         comm_(comm),
@@ -862,6 +879,10 @@ std::vector<int> Coordinator::handle_query(
     size_t branching_factor,
     std::vector<std::atomic<int>>* executor_hits
 ) {
+    if (!comm_) {
+        throw std::runtime_error("[Coordinator] communicator not set");
+    }
+
     std::vector<size_t> executors = route_query(query_vector, branching_factor);
     if (executor_hits) {
         for (size_t idx : executors) (*executor_hits)[idx]++;
@@ -874,15 +895,15 @@ std::vector<int> Coordinator::handle_query(
         header.size = num_neighbors;
         header.tag = tag;
 
-        comm_.send_header(header, idx + 1);
-        comm_.send_vector(query_vector, dim_, idx + 1, tag);
+        comm_->send_header(header, idx + 1);
+        comm_->send_vector(query_vector, dim_, idx + 1, tag);
     }
 
     std::vector<int> results(executors.size() * num_neighbors);
     for (size_t i = 0; i < executors.size(); ++i) {
         size_t idx = executors[i];
         int* dest = results.data() + i * num_neighbors;
-        comm_.recv_result(dest, num_neighbors, idx + 1, tag);
+        comm_->recv_result(dest, num_neighbors, idx + 1, tag);
     }
 
     return results;
@@ -950,6 +971,10 @@ std::vector<std::vector<int>> Coordinator::handle_queries(
     size_t num_neighbors,
     size_t branching_factor
 ) {
+    if (!comm_) {
+        throw std::runtime_error("[Coordinator] communicator not set");
+    }
+
     std::vector<std::vector<float>> per_executor_batches(num_partitions_ + 1);
     std::vector<std::vector<int>> per_executor_queryid(num_partitions_ + 1);
 
@@ -979,11 +1004,11 @@ std::vector<std::vector<int>> Coordinator::handle_queries(
         header.size = per_executor_batches[idx].size() / dim_;
         header.tag = make_tag(QUERY_BATCH_SEND, idx);
 
-        comm_.send_header(header, idx);
-        comm_.send_vector_batch(per_executor_batches[idx].data(), per_executor_batches[idx].size() / dim_, dim_, idx, header.tag);
+        comm_->send_header(header, idx);
+        comm_->send_vector_batch(per_executor_batches[idx].data(), per_executor_batches[idx].size() / dim_, dim_, idx, header.tag);
 
         std::vector<int> results(per_executor_queryid[idx].size() * num_neighbors);
-        comm_.recv_result_batch(results.data(), per_executor_queryid[idx].size() * num_neighbors, idx, header.tag);
+        comm_->recv_result_batch(results.data(), per_executor_queryid[idx].size() * num_neighbors, idx, header.tag);
 
         for (size_t i = 0; i < per_executor_queryid[idx].size(); i++) {
             int query_id = per_executor_queryid[idx][i];
@@ -1001,6 +1026,10 @@ void Coordinator::handle_insert(
     std::vector<float>& insert_distances,
     std::atomic<size_t>& completed
 ) {
+    if (!comm_) {
+        throw std::runtime_error("[Coordinator] communicator not set");
+    }
+
     RebuildState cur = rebuild_state.load(std::memory_order_acquire);
     if (cur == REBUILDING) {
         std::lock_guard<std::mutex> lock(insert_log_mutex_);
@@ -1032,10 +1061,10 @@ void Coordinator::handle_insert(
     header.type = INSERT_SEND;
     header.tag = tag;
     
-    comm_.send_header(header, executor + 1);
-    comm_.send_insert(insert_vector, dim_, label, executor + 1, tag);
+    comm_->send_header(header, executor + 1);
+    comm_->send_insert(insert_vector, dim_, label, executor + 1, tag);
 
-    bool success = comm_.recv_ack(INSERT_SUCCESS, executor + 1, tag);
+    bool success = comm_->recv_ack(INSERT_SUCCESS, executor + 1, tag);
     if (!success) {
         std::cout << "FAILED TO INSERT " << insert_idx << "\n";
     }
@@ -1044,6 +1073,10 @@ void Coordinator::handle_insert(
 }
 
 void Coordinator::handle_inserts(std::vector<float>& insert_vectors, std::vector<int>& labels) {
+    if (!comm_) {
+        throw std::runtime_error("[Coordinator] communicator not set");
+    }
+
     RebuildState cur = rebuild_state.load(std::memory_order_acquire);
 
     if (cur == REBUILDING) {
@@ -1084,8 +1117,8 @@ void Coordinator::handle_inserts(std::vector<float>& insert_vectors, std::vector
         header.size = per_executor_labels[idx].size();
         header.tag = tag;
 
-        comm_.send_header(header, idx);
-        comm_.send_insert_batch(
+        comm_->send_header(header, idx);
+        comm_->send_insert_batch(
             per_executor_vecs[idx].data(), 
             per_executor_labels[idx].data(),
             per_executor_labels[idx].size(), 
@@ -1094,7 +1127,7 @@ void Coordinator::handle_inserts(std::vector<float>& insert_vectors, std::vector
             tag
         );
 
-        bool success = comm_.recv_ack(INSERT_BATCH_SUCCESS, idx, tag);
+        bool success = comm_->recv_ack(INSERT_BATCH_SUCCESS, idx, tag);
         if (!success) {
             std::cout << "FAILED TO INSERT BATCH FOR Executor " << idx << "\n";
         }
@@ -1102,6 +1135,10 @@ void Coordinator::handle_inserts(std::vector<float>& insert_vectors, std::vector
 }
 
 bool Coordinator::handle_delete(int label, int world_size) {
+    if (!comm_) {
+        throw std::runtime_error("[Coordinator] communicator not set");
+    }
+
     // if (label % 10000 == 0)
     //     std::cout << "[Coordinator] Handling delete for label " << label << "\n";
     RebuildState cur = rebuild_state.load(std::memory_order_acquire);
@@ -1117,10 +1154,10 @@ bool Coordinator::handle_delete(int label, int world_size) {
     std::vector<float> vec(dim_);
     int center_idx = label_to_center_[label];
     int partition = partitions[center_idx];
-    comm_.send_delete(label, partition + 1, tag);
-    if (comm_.recv_ack(DELETE_SUCCESS, partition + 1, tag)) {
+    comm_->send_delete(label, partition + 1, tag);
+    if (comm_->recv_ack(DELETE_SUCCESS, partition + 1, tag)) {
         success = true;
-        comm_.recv_delete(vec.data(), dim_, partition + 1, tag);
+        comm_->recv_delete(vec.data(), dim_, partition + 1, tag);
     }
 
     if (success)
@@ -1130,6 +1167,10 @@ bool Coordinator::handle_delete(int label, int world_size) {
 }
 
 void Coordinator::handle_deletes(const std::vector<int>& labels, int world_size) {
+    if (!comm_) {
+        throw std::runtime_error("[Coordinator] communicator not set");
+    }
+
     RebuildState cur = rebuild_state.load(std::memory_order_acquire);
     if (cur == REBUILDING) {
         std::lock_guard<std::mutex> lg(delete_log_mutex_);
@@ -1162,14 +1203,14 @@ void Coordinator::handle_deletes(const std::vector<int>& labels, int world_size)
         header.size = per_executor_labels[idx].size();
         header.tag = tag;
         
-        comm_.send_header(header, idx);
-        comm_.send_delete_batch(per_executor_labels[idx].data(), per_executor_labels[idx].size(), idx, tag);
-        bool success = comm_.recv_ack(DELETE_BATCH_SUCCESS, idx, tag);
+        comm_->send_header(header, idx);
+        comm_->send_delete_batch(per_executor_labels[idx].data(), per_executor_labels[idx].size(), idx, tag);
+        bool success = comm_->recv_ack(DELETE_BATCH_SUCCESS, idx, tag);
         if (!success) {
             std::cout << "FAILED TO DELETE BATCH FOR Executor " << idx << "\n";
         }
 
-        comm_.recv_delete_batch_results(per_executor_vecs[idx].data(), dim_, idx, tag);
+        comm_->recv_delete_batch_results(per_executor_vecs[idx].data(), dim_, idx, tag);
 
         updateCentersForDeleteBatch_(per_executor_vecs[idx], per_executor_centerids[idx]);
         // two options: run in the parallel loop per executor, 

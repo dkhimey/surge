@@ -19,7 +19,12 @@ class Coordinator {
 public:
     Coordinator(
         int dim,
-        Communicator& comm,
+        Log* logger
+    );
+
+    Coordinator(
+        int dim,
+        Communicator* comm,
         Log* logger
     );
 
@@ -133,7 +138,7 @@ public:
     
 private:
     Log* logger_;
-    Communicator& comm_;
+    Communicator* comm_ = nullptr;
 
     size_t dim_;
     size_t num_partitions_;

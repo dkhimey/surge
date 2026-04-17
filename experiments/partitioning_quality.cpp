@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
                                               nvectors, dim, sample_size);
         
         // build meta hnsw on the centers
-        Coordinator metaIndex(dim, comm, &logger);
+        Coordinator metaIndex(dim, &comm, &logger);
         metaIndex.setSampleData(sample.data(), sample_size);
 
         int ncenters = 10000; //TODO: hard coded
