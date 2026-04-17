@@ -1,0 +1,183 @@
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <chrono>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <omp.h>
+
+#include "index.h"
+
+int main(int argc, char **argv) {
+    int node, world_size;
+
+    if (argc != 4) {
+        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <sample_size>\n";
+        return 1;
+    }
+
+    std::string dataset_name = argv[1];
+    int num_partitions = std::stoi(argv[2]);
+    int sample_size = std::stoi(argv[3]);
+
+    std::string log_id = "theoretical_partition_quality_" + dataset_name + "_" + std::to_string(num_partitions);
+    std::filesystem::create_directories(log_id);
+    Log logger(log_id);
+
+    Communicator comm;
+
+    std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
+    int nvectors = data_info.first;
+    int dim = data_info.second;
+    
+    std::vector<float> query_vectors = readVecs(DATASETS[dataset_name]["query_file"], dim);
+    int num_queries = query_vectors.size() / dim;
+
+    printf("Max threads: %d\n", omp_get_max_threads());
+
+    // build only meta-HNSW
+    std::vector<float> sample = getSample(DATASETS[dataset_name]["base_file"], 
+                                              nvectors, dim, sample_size);
+
+    Coordinator metaIndex(dim, comm, &logger);
+    metaIndex.setSampleData(sample.data(), sample_size);
+
+    int ncenters = 10000;
+    int ef_construction = 200;
+    int M_meta = 16;
+
+    metaIndex.build(ncenters, num_partitions, ef_construction, M_meta);
+    metaIndex.save(log_id);
+
+    FileFormat format = getFileFormat(DATASETS[dataset_name]["base_file"]);
+    std::vector<std::vector<int>> gt_indices = readGT(DATASETS[dataset_name]["gt_file"], format);
+
+    int fd = open(DATASETS[dataset_name]["base_file"].c_str(), O_RDONLY);
+
+    struct stat st;
+    fstat(fd, &st);
+
+    void* ptr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    float* data = reinterpret_cast<float*>(static_cast<char*>(ptr) + 8);
+
+    // compute theoretical recall:
+    // 1. check where each of the k gt vectors is assigned
+    std::vector<std::vector<size_t>> gt_partitions(num_queries);
+    for (int i = 0; i < num_queries; i++) {
+        gt_partitions[i].reserve(gt_indices[i].size());
+        for (int idx : gt_indices[i]) {
+            float* vec_ptr = data + idx * dim;;
+            // route gt vec_ptr
+            size_t gt_partition = metaIndex.getCurrentPartition(vec_ptr);
+            gt_partitions[i].push_back(gt_partition);
+        }
+    }
+
+    std::ofstream out(log_id + "/routing_metrics.csv");
+    out << "mode,param,recall,activation,imbalance,query_time_s\n";
+
+    std::ofstream raw_counts_out(log_id + "/routing_partition_counts.csv");
+    raw_counts_out << "mode,param,partition_id,count\n";
+
+    auto write_metrics = [&](const std::string& mode_name, double param, const std::vector<std::vector<size_t>>& query_partitions, double query_time_s) {
+        std::vector<long long> per_partition_counts(num_partitions, 0);
+        double total_recall = 0.0;
+        double total_activation = 0.0;
+
+        for (int i = 0; i < num_queries; i++) {
+            const std::vector<size_t>& visited_parts = query_partitions[i];
+            for (size_t partition_id : visited_parts) {
+                if (partition_id < static_cast<size_t>(num_partitions)) {
+                    per_partition_counts[partition_id] += 1;
+                }
+            }
+
+            total_activation += static_cast<double>(visited_parts.size()) / static_cast<double>(num_partitions);
+
+            int hits = 0;
+            for (size_t part : gt_partitions[i]) {
+                if (std::find(visited_parts.begin(), visited_parts.end(), part) != visited_parts.end()) {
+                    hits += 1;
+                }
+            }
+
+            if (!gt_partitions[i].empty()) {
+                total_recall += static_cast<double>(hits) / static_cast<double>(gt_partitions[i].size());
+            }
+        }
+
+        double mean = std::accumulate(per_partition_counts.begin(), per_partition_counts.end(), 0.0) /
+                      static_cast<double>(per_partition_counts.size());
+        double variance = 0.0;
+        for (long long count : per_partition_counts) {
+            double diff = static_cast<double>(count) - mean;
+            variance += diff * diff;
+        }
+        variance /= static_cast<double>(per_partition_counts.size());
+        double stddev = std::sqrt(variance);
+        double imbalance = mean > 0.0 ? stddev / mean : 0.0;
+
+        double average_recall = total_recall / static_cast<double>(num_queries);
+        double average_activation = total_activation / static_cast<double>(num_queries);
+
+        out << mode_name << ','
+            << param << ','
+            << average_recall << ','
+            << average_activation << ','
+            << imbalance << ','
+            << query_time_s << '\n';
+
+        for (int partition_id = 0; partition_id < num_partitions; partition_id++) {
+            raw_counts_out << mode_name << ','
+                           << param << ','
+                           << partition_id << ','
+                           << per_partition_counts[partition_id] << '\n';
+        }
+
+        std::cout << mode_name
+                  << " param=" << param
+                  << " recall=" << average_recall
+                  << " activation=" << average_activation
+                  << " imbalance=" << imbalance
+                  << " time_s=" << query_time_s
+                  << "\n";
+    };
+
+
+    // 2. check where query would be routed to
+        // routing strategy: branching factor
+        // branching factors: iterate
+    std::vector<int> branching_factors = {1, 2, 5, 15, 20, 25, 30};
+    for (int bf: branching_factors) {
+           auto start = std::chrono::high_resolution_clock::now();
+        std::vector<std::vector<size_t>> query_partitions = metaIndex.route_queries(query_vectors, RoutingMode::BranchingFactor, bf);
+           double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
+           write_metrics("branching_factor", bf, query_partitions, elapsed);
+    }
+
+        // routing stategy: recall target
+    std::vector<float> recall_targets = {0.5, 0.7, 0.8, 0.9, 0.95, .98};
+    for (float rt: recall_targets) {
+           auto start = std::chrono::high_resolution_clock::now();
+        std::vector<std::vector<size_t>> query_partitions = metaIndex.route_queries(query_vectors, RoutingMode::RecallTarget, rt);
+           double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
+           write_metrics("recall_target", rt, query_partitions, elapsed);
+    }
+
+        // routing stratefy: nprobe
+    std::vector<int> nprobes = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    for (int np: nprobes) {
+           auto start = std::chrono::high_resolution_clock::now();
+        std::vector<std::vector<size_t>> query_partitions = metaIndex.route_queries(query_vectors, RoutingMode::NProbe, np);
+           double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
+           write_metrics("nprobe", np, query_partitions, elapsed);
+    }
+
+    munmap(ptr, st.st_size);
+    close(fd);
+}
