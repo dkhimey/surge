@@ -27,7 +27,12 @@ int main(int argc, char **argv) {
     int num_partitions = std::stoi(argv[2]);
     int sample_size = std::stoi(argv[3]);
 
-    std::string log_id = "theoretical_partition_quality_" + dataset_name + "_" + std::to_string(num_partitions);
+    // add time stamp in year_month_day_log_id format
+    auto now = std::time(nullptr);
+    auto* tm = std::localtime(&now);
+    std::ostringstream oss;
+    oss << std::put_time(tm, "%Y%m%d_%H%M%S");
+    std::string log_id = "theoretical_partition_quality_" + dataset_name + "_" + std::to_string(num_partitions) + "_" + oss.str();
     std::filesystem::create_directories(log_id);
     Log logger(log_id);
 
@@ -46,6 +51,8 @@ int main(int argc, char **argv) {
     std::vector<float> sample = getSample(DATASETS[dataset_name]["base_file"], 
                                               nvectors, dim, sample_size);
 
+    std::cout << "Initialized Sample " << sample_size << " samples\n";
+
     Coordinator metaIndex(dim, &logger);
     metaIndex.setSampleData(sample.data(), sample_size);
 
@@ -53,6 +60,8 @@ int main(int argc, char **argv) {
     int ef_construction = 200;
     int M_meta = 16;
     int k = 10;
+
+    std::cout << "Building meta-HNSW index\n";
 
     metaIndex.build(ncenters, num_partitions, ef_construction, M_meta);
     metaIndex.save(log_id);
@@ -75,7 +84,6 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
-    float* data = reinterpret_cast<float*>(static_cast<char*>(ptr) + 8);
 
     std::cout << "Finished memory mapping dataset file\n";
 
@@ -83,6 +91,8 @@ int main(int argc, char **argv) {
     // 1. check where each of the k gt vectors is assigned
     std::cout << "Computing ground truth partition assignments\n";
     std::vector<std::vector<size_t>> gt_partitions(num_queries);
+    bool format_error = false;
+    # pragma omp parallel for
     for (int i = 0; i < num_queries; i++) {
         size_t gt_k = std::min(static_cast<size_t>(k), gt_indices[i].size());
         gt_partitions[i].reserve(gt_k);
@@ -92,11 +102,39 @@ int main(int argc, char **argv) {
                 std::cerr << "GT index " << idx << " out of bounds (nvectors=" << nvectors << ")\n";
                 continue;
             }
-            float* vec_ptr = data + static_cast<size_t>(idx) * dim;
-            // route gt vec_ptr
-            size_t gt_partition = metaIndex.getCurrentPartition(vec_ptr);
+            std::vector<float> vec(dim);
+            if (format == U8BIN) {
+                uint8_t* data_u8 = reinterpret_cast<uint8_t*>(static_cast<char*>(ptr) + 8);
+                for (int d = 0; d < dim; d++) {
+                    vec[d] = static_cast<float>(data_u8[static_cast<size_t>(idx) * dim + d]);
+                }
+            } else if (format == I8BIN) {
+                int8_t* data_i8 = reinterpret_cast<int8_t*>(static_cast<char*>(ptr) + 8);
+                for (int d = 0; d < dim; d++) {
+                    vec[d] = static_cast<float>(data_i8[static_cast<size_t>(idx) * dim + d]);
+                }
+            } else if (format == FBIN) {
+                float* data_f = reinterpret_cast<float*>(static_cast<char*>(ptr) + 8);
+                for (int d = 0; d < dim; d++) {
+                    vec[d] = data_f[static_cast<size_t>(idx) * dim + d];
+                }
+            } else {
+                std::cerr << "Unsupported format for vector conversion\n";
+                #pragma omp critical
+                {
+                    format_error = true;
+                }
+            }
+            // route gt vec
+            size_t gt_partition = metaIndex.getCurrentPartition(vec.data());
             gt_partitions[i].push_back(gt_partition);
         }
+    }
+
+    if (format_error) {
+        munmap(ptr, st.st_size);
+        close(fd);
+        return 1;
     }
 
     std::cout << "Finished computing ground truth partition assignments\n";
@@ -176,7 +214,7 @@ int main(int argc, char **argv) {
         // routing strategy: branching factor
         // branching factors: iterate
     std::cout << "Computing routing metrics for different strategies\n";
-    std::vector<int> branching_factors = {1, 2, 5, 15, 20, 25, 30};
+    std::vector<int> branching_factors = {1, 2, 5, 10, 15, 20, 25, 30, 35, 40, 50};
     for (int bf: branching_factors) {
            auto start = std::chrono::high_resolution_clock::now();
         std::vector<std::vector<size_t>> query_partitions = metaIndex.route_queries(query_vectors, RoutingMode::BranchingFactor, bf);
@@ -186,7 +224,7 @@ int main(int argc, char **argv) {
     std::cout << "Finished computing routing metrics for branching factor strategy\n";
 
         // routing stategy: recall target
-    std::vector<float> recall_targets = {0.5, 0.7, 0.8, 0.9, 0.95, .98};
+    std::vector<float> recall_targets = {0.5, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.97, 0.98, 0.99};
     for (float rt: recall_targets) {
            auto start = std::chrono::high_resolution_clock::now();
         std::vector<std::vector<size_t>> query_partitions = metaIndex.route_queries(query_vectors, RoutingMode::RecallTarget, rt);

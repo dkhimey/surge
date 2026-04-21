@@ -20,6 +20,7 @@ typedef enum {
     FVECS,
     BVECS,
     I8BIN,
+    U8BIN,
     FBIN
 } FileFormat;
 
@@ -108,6 +109,7 @@ typedef struct BenchmarkParams {
                     if (file_format == "bvecs") format = BVECS;
                     if (file_format == "fvecs") format = FVECS;
                     if (file_format == "i8bin") format = I8BIN;
+                    if (file_format == "u8bin") format = U8BIN;
                     if (file_format == "fbin") format = FBIN;
                 }
 } BenchmarkParams;
@@ -487,6 +489,7 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
 std::vector<float> readFvecs(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);
 std::vector<float> readBvecs(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);
 std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);
+std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);
 std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);
 std::vector<std::vector<int>> readGTIvecs(const std::string& filename);
 std::vector<std::vector<int>> readGTBin(const std::string& filename);

@@ -6,7 +6,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         {
             {"base_file", "TODO"},
             {"runbook", "TODO"},
-            {"queries_file", "TODO"},
+            {"query_file", "TODO"},
             {"ground_truth_dir", "TODO"},
         }
     },
@@ -15,7 +15,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         {
             {"base_file", "TODO"},
             {"runbook", "TODO"},
-            {"queries_file", "TODO"},
+            {"query_file", "TODO"},
             {"ground_truth_dir", "TODO"},
         }
     },
@@ -24,8 +24,28 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         {
             {"base_file", "TODO"},
             {"runbook", "TODO"},
-            {"queries_file", "TODO"},
+            {"query_file", "TODO"},
             {"ground_truth_dir", "TODO"},
+        }
+    },
+
+    {"sift-500M",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_500000000.u8bin"},
+            {"runbook", "TODO"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann/query.public.10K.u8bin"},
+            {"ground_truth_dir", "TODO"},
+            {"gt_file", "/dataset/big-ann-benchmarks/data/bigann/gt_computed.10.crop500M.ibin"}
+        }
+    },
+
+    {"msturing-500M",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_500000000.fbin"},
+            {"runbook", "TODO"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
+            {"ground_truth_dir", "TODO"},
+            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt_computed.10.crop_500M.ibin"}
         }
     },
 
@@ -33,7 +53,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         {
             {"base_file", "TODO"},
             {"runbook", "TODO"},
-            {"queries_file", "TODO"},
+            {"query_file", "TODO"},
             {"ground_truth_dir", "TODO"},
         }
     },
@@ -56,6 +76,8 @@ FileFormat getFileFormat(const std::string& filename) {
         return BVECS;
     } else if (filename.size() >= 6 && filename.substr(filename.size() - 6) == ".i8bin") {
         return I8BIN;
+    } else if (filename.size() >= 6 && filename.substr(filename.size() - 6) == ".u8bin") {
+        return U8BIN;
     } else if (filename.size() >= 5 && filename.substr(filename.size() - 5) == ".fbin") {
         return FBIN;
     } else {
@@ -76,6 +98,7 @@ std::pair<int, int> get_dataset_info(const std::string& base_file) {
             return {num_vectors, dim};
         }
         case I8BIN:
+        case U8BIN:
         case FBIN: {
             uint32_t num_vectors, dim;
             file.read(reinterpret_cast<char*>(&num_vectors), sizeof(uint32_t));
@@ -114,7 +137,7 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
     int header_num_pts = data_info.first;
     int header_dim = data_info.second;
 
-    if (filetype == I8BIN || filetype == FBIN) {
+    if (filetype == I8BIN || filetype == U8BIN || filetype == FBIN) {
         header_offset = 8;
     }
 
@@ -159,6 +182,15 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
                 std::vector<int8_t> vec(dim);
                 file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(int8_t));
                 for (int8_t v : vec) sample.push_back(static_cast<float>(v));
+                break;
+            }
+            case U8BIN: {
+                size_t offset = header_offset + static_cast<size_t>(idx) * dim * sizeof(uint8_t);
+                file.seekg(offset, std::ios::beg);
+
+                std::vector<uint8_t> vec(dim);
+                file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(uint8_t));
+                for (uint8_t v : vec) sample.push_back(static_cast<float>(v));
                 break;
             }
             case FBIN: {
@@ -328,6 +360,54 @@ std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int
     return vectors;
 }
 
+std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int n, int offset) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "[Coordinator]: Unable to open u8bin file " << filename << "\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return {};
+    }
+
+    uint32_t num_points, dim_in_file;
+    file.read(reinterpret_cast<char*>(&num_points), sizeof(uint32_t));
+    file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
+
+    if (dim_in_file != vector_dim) {
+        std::cerr << "[Coordinator]: Dimension mismatch: file says " << dim_in_file
+                  << ", expected " << vector_dim << "\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return {};
+    }
+
+    if (offset < 0 || static_cast<size_t>(offset) >= num_points) {
+        std::cerr << "[Coordinator]: Invalid offset\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return {};
+    }
+
+    size_t max_readable = num_points - static_cast<size_t>(offset);
+    size_t num_to_read = std::min(static_cast<size_t>(n), max_readable);
+
+    std::vector<uint8_t> buffer(num_to_read * vector_dim);
+    size_t offset_bytes = static_cast<size_t>(offset) * vector_dim * sizeof(uint8_t);
+    file.seekg(8 + offset_bytes, std::ios::beg);
+
+    file.read(reinterpret_cast<char*>(buffer.data()), buffer.size() * sizeof(uint8_t));
+    if (file.gcount() != static_cast<std::streamsize>(buffer.size() * sizeof(uint8_t))) {
+        std::cerr << "[Coordinator]: Failed to read the full data block\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return {};
+    }
+
+    std::vector<float> vectors;
+    vectors.reserve(num_to_read * vector_dim);
+    for (uint8_t val : buffer) {
+        vectors.push_back(static_cast<float>(val));
+    }
+
+    return vectors;
+}
+
 std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int n, int offset) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
@@ -449,6 +529,9 @@ std::vector<float> readVecs(const std::string& filename, size_t vector_dim, int 
             break;
         case I8BIN:
             result = readI8bin(filename, vector_dim, n, offset);
+            break;
+        case U8BIN:
+            result = readU8bin(filename, vector_dim, n, offset);
             break;
         case FBIN:
             result = readFbin(filename, vector_dim, n, offset);
