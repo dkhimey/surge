@@ -107,13 +107,16 @@ int main(int argc, char **argv) {
                 }
                 // run kmeans on sample to get initial centers
                 int num_iterations = kmeans(sample.data(), sample_size, dim, num_centers, centers.data(), center_counts.data());
+                size_t ef_construction=200;
+                size_t M=16;
+                size_t ef_search=200;
 
-                // build hnsw on centers
-                curr_hnsw = new hnswlib::HierarchicalNSW<float>(&space, num_centers);
+                curr_hnsw = new hnswlib::HierarchicalNSW<float>(&space, num_centers, M, ef_construction);
                 #pragma omp parallel for
                 for (int i = 0; i < num_centers; i++) {
                     curr_hnsw->addPoint(centers.data() + i * dim, i);
                 }
+                curr_hnsw->setEf(ef_search);
 
                 center_counts.assign(num_centers, 0); // reset counts; will be updated in insert loop below
                 cluster_sums.assign(num_centers * dim, 0.0); // reset sums; will be accumulated in insert loop below
@@ -147,7 +150,13 @@ int main(int argc, char **argv) {
             // recompute centers = cluster_sums / counts, and rebuild hnsw.
             auto rebuild_start_time = std::chrono::high_resolution_clock::now();
             delete curr_hnsw;
+
+            size_t ef_construction=200;
+            size_t M=16;
+            size_t ef_search=200;
             curr_hnsw = new hnswlib::HierarchicalNSW<float>(&space, num_centers);
+            curr_hnsw->setEf(ef_search);
+
             #pragma omp parallel for
             for (int c = 0; c < num_centers; c++) {
                 int new_count = 0;
@@ -230,7 +239,13 @@ int main(int argc, char **argv) {
             // recompute centers = cluster_sums / counts, and rebuild hnsw.
             auto rebuild_start_time = std::chrono::high_resolution_clock::now();
             delete curr_hnsw;
+
+            size_t ef_construction=200;
+            size_t M=16;
+            size_t ef_search=200;
             curr_hnsw = new hnswlib::HierarchicalNSW<float>(&space, num_centers);
+            curr_hnsw->setEf(ef_search);
+
             #pragma omp parallel for
             for (int c = 0; c < num_centers; c++) {
                 int del_count = 0;
