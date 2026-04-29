@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cerrno>
 #include <cstring>
@@ -6,6 +7,7 @@
 #include <iostream>
 #include <numeric>
 #include <chrono>
+#include <unordered_map>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -14,6 +16,52 @@
 #include <omp.h>
 
 #include "index.h"
+
+// Helper function to save cached GT vectors with metadata
+void saveCachedGTVectors(const std::string& filepath, const std::vector<float>& vectors, size_t num_vectors, size_t dim) {
+    std::ofstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for writing: " << filepath << "\n";
+        return;
+    }
+    
+    uint32_t num_vecs = static_cast<uint32_t>(num_vectors);
+    uint32_t vector_dim = static_cast<uint32_t>(dim);
+    
+    file.write(reinterpret_cast<const char*>(&num_vecs), sizeof(uint32_t));
+    file.write(reinterpret_cast<const char*>(&vector_dim), sizeof(uint32_t));
+    file.write(reinterpret_cast<const char*>(vectors.data()), vectors.size() * sizeof(float));
+    file.close();
+    
+    std::cout << "Saved cached GT vectors to " << filepath << "\n";
+}
+
+// Helper function to load cached GT vectors with metadata
+bool loadCachedGTVectors(const std::string& filepath, std::vector<float>& vectors, size_t& num_vectors, size_t& dim) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+    
+    uint32_t num_vecs, vector_dim;
+    file.read(reinterpret_cast<char*>(&num_vecs), sizeof(uint32_t));
+    file.read(reinterpret_cast<char*>(&vector_dim), sizeof(uint32_t));
+    
+    num_vectors = static_cast<size_t>(num_vecs);
+    dim = static_cast<size_t>(vector_dim);
+    
+    vectors.resize(num_vectors * dim);
+    file.read(reinterpret_cast<char*>(vectors.data()), num_vectors * dim * sizeof(float));
+    
+    if (!file) {
+        std::cerr << "Failed to read cached GT vectors from " << filepath << "\n";
+        return false;
+    }
+    
+    file.close();
+    std::cout << "Loaded cached GT vectors from " << filepath << "\n";
+    return true;
+}
 
 int main(int argc, char **argv) {
     int node, world_size;
@@ -72,69 +120,136 @@ int main(int argc, char **argv) {
     std::vector<std::vector<int>> gt_indices = readGTBin(DATASETS[dataset_name]["gt_file"]);
     std::cout << "Finished reading ground truth data\n";
 
-    std::cout << "Memory mapping dataset file " << DATASETS[dataset_name]["base_file"] << "\n";
-    int fd = open(DATASETS[dataset_name]["base_file"].c_str(), O_RDONLY);
+    // Check if cached GT vectors exist
+    std::string cache_dir = std::filesystem::path(DATASETS[dataset_name]["base_file"]).parent_path().string();
+    std::string cached_gt_path = cache_dir + "/cached_gt_vectors_" + dataset_name + ".bin";
+    
+    std::vector<float> preloaded_vecs;
+    std::vector<int> needed_indices;
+    
+    if (std::filesystem::exists(cached_gt_path)) {
+        // Load from cache
+        std::cout << "Found cached GT vectors at " << cached_gt_path << "\n";
+        size_t cached_num_vectors, cached_dim;
+        if (loadCachedGTVectors(cached_gt_path, preloaded_vecs, cached_num_vectors, cached_dim)) {
+            std::cout << "Successfully loaded " << cached_num_vectors << " vectors of dimension " << cached_dim << " from cache\n";
+            // Recreate needed_indices from gt_indices for the idx_to_buf mapping
+            needed_indices.reserve(num_queries * k);
+            for (int i = 0; i < num_queries; i++) {
+                size_t gt_k = std::min(static_cast<size_t>(k), gt_indices[i].size());
+                for (size_t j = 0; j < gt_k; j++) {
+                    int idx = gt_indices[i][j];
+                    if (idx >= 0 && idx < nvectors)
+                        needed_indices.push_back(idx);
+                }
+            }
+            std::sort(needed_indices.begin(), needed_indices.end());
+            needed_indices.erase(std::unique(needed_indices.begin(), needed_indices.end()), needed_indices.end());
+            // Update DATASETS with cache path if not already set
+            if (DATASETS[dataset_name].find("gt_vectors_path") == DATASETS[dataset_name].end()) {
+                DATASETS[dataset_name]["gt_vectors_path"] = cached_gt_path;
+            }
+        } else {
+            std::cerr << "Failed to load cached GT vectors, will regenerate\n";
+        }
+    }
+    
+    // If cache doesn't exist or failed to load, generate it
+    if (preloaded_vecs.empty()) {
+        std::cout << "Generating cached GT vectors\n";
+        
+        std::cout << "Memory mapping dataset file " << DATASETS[dataset_name]["base_file"] << "\n";
+        int fd = open(DATASETS[dataset_name]["base_file"].c_str(), O_RDONLY);
 
-    struct stat st;
-    fstat(fd, &st);
+        struct stat st;
+        fstat(fd, &st);
 
-    void* ptr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (ptr == MAP_FAILED) {
-        std::cerr << "mmap failed: " << strerror(errno) << "\n";
+        void* ptr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (ptr == MAP_FAILED) {
+            std::cerr << "mmap failed: " << strerror(errno) << "\n";
+            close(fd);
+            return 1;
+        }
+
+        std::cout << "Finished memory mapping dataset file\n";
+
+        FileFormat format = getFileFormat(DATASETS[dataset_name]["base_file"]);
+
+        // Collect unique GT indices sorted by value so the preload reads the file
+        // in roughly sequential order rather than randomly across 200GB.
+        needed_indices.clear();
+        needed_indices.reserve(num_queries * k);
+        for (int i = 0; i < num_queries; i++) {
+            size_t gt_k = std::min(static_cast<size_t>(k), gt_indices[i].size());
+            for (size_t j = 0; j < gt_k; j++) {
+                int idx = gt_indices[i][j];
+                if (idx >= 0 && idx < nvectors)
+                    needed_indices.push_back(idx);
+            }
+        }
+        std::sort(needed_indices.begin(), needed_indices.end());
+        needed_indices.erase(std::unique(needed_indices.begin(), needed_indices.end()), needed_indices.end());
+
+        std::cout << "Pre-loading " << needed_indices.size() << " unique GT vectors into memory\n";
+        preloaded_vecs.resize(needed_indices.size() * dim);
+
+        if (format == U8BIN) {
+            uint8_t* data_u8 = reinterpret_cast<uint8_t*>(static_cast<char*>(ptr) + 8);
+            for (size_t i = 0; i < needed_indices.size(); i++) {
+                int idx = needed_indices[i];
+                for (int d = 0; d < dim; d++)
+                    preloaded_vecs[i * dim + d] = static_cast<float>(data_u8[static_cast<size_t>(idx) * dim + d]);
+            }
+        } else if (format == I8BIN) {
+            int8_t* data_i8 = reinterpret_cast<int8_t*>(static_cast<char*>(ptr) + 8);
+            for (size_t i = 0; i < needed_indices.size(); i++) {
+                int idx = needed_indices[i];
+                for (int d = 0; d < dim; d++)
+                    preloaded_vecs[i * dim + d] = static_cast<float>(data_i8[static_cast<size_t>(idx) * dim + d]);
+            }
+        } else if (format == FBIN) {
+            float* data_f = reinterpret_cast<float*>(static_cast<char*>(ptr) + 8);
+            for (size_t i = 0; i < needed_indices.size(); i++) {
+                int idx = needed_indices[i];
+                std::memcpy(preloaded_vecs.data() + i * dim,
+                            data_f + static_cast<size_t>(idx) * dim,
+                            dim * sizeof(float));
+            }
+        } else {
+            std::cerr << "Unsupported format for vector conversion\n";
+            munmap(ptr, st.st_size);
+            close(fd);
+            return 1;
+        }
+        
+        // Save to cache
+        saveCachedGTVectors(cached_gt_path, preloaded_vecs, needed_indices.size(), dim);
+        
+        // Update DATASETS with cache path
+        DATASETS[dataset_name]["gt_vectors_path"] = cached_gt_path;
+        
+        munmap(ptr, st.st_size);
         close(fd);
-        return 1;
     }
 
-    std::cout << "Finished memory mapping dataset file\n";
+    std::unordered_map<int, size_t> idx_to_buf;
+    idx_to_buf.reserve(needed_indices.size());
+    for (size_t i = 0; i < needed_indices.size(); i++)
+        idx_to_buf[needed_indices[i]] = i;
 
-    // compute theoretical recall:
-    // 1. check where each of the k gt vectors is assigned
     std::cout << "Computing ground truth partition assignments\n";
     std::vector<std::vector<size_t>> gt_partitions(num_queries);
-    bool format_error = false;
-    # pragma omp parallel for
+    #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < num_queries; i++) {
         size_t gt_k = std::min(static_cast<size_t>(k), gt_indices[i].size());
         gt_partitions[i].reserve(gt_k);
         for (size_t j = 0; j < gt_k; ++j) {
             int idx = gt_indices[i][j];
-            if (idx < 0 || idx >= nvectors) {
-                std::cerr << "GT index " << idx << " out of bounds (nvectors=" << nvectors << ")\n";
-                continue;
-            }
-            std::vector<float> vec(dim);
-            if (format == U8BIN) {
-                uint8_t* data_u8 = reinterpret_cast<uint8_t*>(static_cast<char*>(ptr) + 8);
-                for (int d = 0; d < dim; d++) {
-                    vec[d] = static_cast<float>(data_u8[static_cast<size_t>(idx) * dim + d]);
-                }
-            } else if (format == I8BIN) {
-                int8_t* data_i8 = reinterpret_cast<int8_t*>(static_cast<char*>(ptr) + 8);
-                for (int d = 0; d < dim; d++) {
-                    vec[d] = static_cast<float>(data_i8[static_cast<size_t>(idx) * dim + d]);
-                }
-            } else if (format == FBIN) {
-                float* data_f = reinterpret_cast<float*>(static_cast<char*>(ptr) + 8);
-                for (int d = 0; d < dim; d++) {
-                    vec[d] = data_f[static_cast<size_t>(idx) * dim + d];
-                }
-            } else {
-                std::cerr << "Unsupported format for vector conversion\n";
-                #pragma omp critical
-                {
-                    format_error = true;
-                }
-            }
-            // route gt vec
-            size_t gt_partition = metaIndex.getCurrentPartition(vec.data());
-            gt_partitions[i].push_back(gt_partition);
+            auto it = idx_to_buf.find(idx);
+            if (it == idx_to_buf.end()) continue;
+            float* vec = preloaded_vecs.data() + it->second * dim;
+            gt_partitions[i].push_back(metaIndex.getCurrentPartition(vec));
         }
-    }
-
-    if (format_error) {
-        munmap(ptr, st.st_size);
-        close(fd);
-        return 1;
     }
 
     std::cout << "Finished computing ground truth partition assignments\n";
@@ -242,6 +357,5 @@ int main(int argc, char **argv) {
            write_metrics("nprobe", np, query_partitions, elapsed);
     }
 
-    munmap(ptr, st.st_size);
-    close(fd);
+    return 0;
 }

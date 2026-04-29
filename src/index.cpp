@@ -271,7 +271,7 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Branching_(float* vec, i
 std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int nprobe, float* dist) {
     // Mirrors visit_enforced_p: increase k until nprobe unique partitions are found,
     // then return them in the order they first appear among the nearest centers.
-    size_t cur_k = static_cast<size_t>(std::max((size_t)(nprobe * 10), (size_t)(ncenters_))); // start with a reasonably large k to reduce number of iterations; will be capped at ncenters_
+    size_t cur_k = static_cast<size_t>(std::min((size_t)(nprobe), (size_t)(ncenters_))); // start with a reasonably large k to reduce number of iterations; will be capped at ncenters_
 
     std::vector<std::pair<float, hnswlib::labeltype>> centers;
     while (true) {
