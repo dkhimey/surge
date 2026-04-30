@@ -286,7 +286,7 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int 
         if (static_cast<int>(unique_partitions.size()) >= nprobe || cur_k >= ncenters_) {
             break;
         }
-        cur_k *= 2;
+        cur_k *= 10;
     }
 
     if (dist && !centers.empty()) {
