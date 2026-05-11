@@ -14,14 +14,24 @@
 int main(int argc, char **argv) {
     int node, world_size;
 
-    if (argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <k>\n";
+    if (argc != 5) {
+        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <mode> <k>\n";
         return 1;
     }
 
     std::string dataset_name = argv[1];
     int num_partitions = std::stoi(argv[2]);
-    int k = std::stoi(argv[3]);
+    std::string mode_str = argv[3];
+    int k = std::stoi(argv[4]);
+
+    RoutingMode mode;
+    if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
+    else if (mode_str == "nprobe") mode = RoutingMode::NProbe;
+    else if (mode_str == "recall") mode = RoutingMode::RecallTarget;
+    else {
+        std::cerr << "Invalid Routing Mode: " << mode_str << "\n";
+        return 1;
+    }
 
     std::string log_id = "partition_quality_" + dataset_name + "_" + std::to_string(num_partitions);
     Log logger(log_id);
@@ -83,6 +93,8 @@ int main(int argc, char **argv) {
 
         size_t bf = 20;
         double total_recall = 0.0;
+
+        comm.broadcast_ef_search(ef_search, world_size);
 
         #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2) reduction(+:total_recall)
         for (int r = 0; r < 3; r++) {
