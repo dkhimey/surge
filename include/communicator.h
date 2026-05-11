@@ -143,6 +143,7 @@ public:
         int to_recv,
         size_t dim
     ) {
+        std::cout << "[Executor " << rank << "]--receive_vector_data()-- Expecting to receive data for " << to_recv << " vectors\n";
         MPI_Recv(vec_recv_ptr,
                 to_recv * dim,
                 MPI_FLOAT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);

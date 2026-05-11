@@ -1278,7 +1278,7 @@ void Executor::receiveData(size_t nrecv_vecs) {
 
     std::cout << "[Executor " << node_id_ << "]--receiveData()-- Receiving " << nrecv_vecs << " vectors from coordinator\n";
 
-    float* vec_recv_ptr = local_vectors_.data() + data_count_ * dim_;
+    float* vec_recv_ptr = local_vectors_.data() + (data_count_ * dim_);
     int* idx_recv_ptr = local_indices_.data() + data_count_;
 
     comm_.receive_vector_data(vec_recv_ptr, 
