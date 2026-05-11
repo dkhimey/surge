@@ -116,8 +116,11 @@ int main(int argc, char **argv) {
             32 // num_building_threads, TODO: hard coded
         );
 
-        std::string filename = "executor_" + std::to_string(node) + "_" + dataset_name + "_" + std::to_string(num_partitions) + ".json";
-        logger.sub_index_path = subIndex.save(filename);
+        std::string output_dir = dataset_name + "_" + std::to_string(num_partitions);
+        std::filesystem::create_directories(output_dir);
+
+        std::string filename_prefix = output_dir + "/executor_" + std::to_string(node) + "_" + dataset_name + "_" + std::to_string(num_partitions);
+        logger.sub_index_path = subIndex.save(filename_prefix);
         logger.saveExecutorLog(node);
     }
 

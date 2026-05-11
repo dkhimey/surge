@@ -211,6 +211,8 @@ public:
     void insert(int tag);
     void delete_vector(size_t label, int tag);
 
+    void batch_search(size_t num_queries, size_t k, int tag);
+
     void reBuild(
         int meta_size, 
         int ncenters, 

@@ -53,6 +53,14 @@ public:
         MPI_Send(vectors, num_vectors * dim, MPI_FLOAT, dest, tag, MPI_COMM_WORLD);
     }
 
+    void recv_vector_batch(float* vectors, size_t num_vectors, size_t dim, int source, int tag) {
+        MPI_Recv(vectors, num_vectors * dim, MPI_FLOAT, source, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    void send_result_batch(const int* results, size_t num_queries, size_t num_neighbors, int tag) {
+        MPI_Send(results, num_queries * num_neighbors, MPI_INT, 0, tag, MPI_COMM_WORLD);
+    }
+
     void send_result(const int* results, size_t num_neighbors, int tag) {
         MPI_Send(results, num_neighbors, MPI_INT, 0, tag, MPI_COMM_WORLD);
     }

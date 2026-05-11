@@ -794,6 +794,8 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
 void Coordinator::save(const std::string& output_dir) {
     std::shared_lock lock(graph_mutex_);
     std::cout << "[Coordinator] Saving to: " << output_dir << "\n";
+    // make output dir if it doesn't exist
+    std::filesystem::create_directories(output_dir);
 
     std::string hnsw_filename = output_dir + "/metaHNSW.bin";
     meta_HNSW_->saveIndex(hnsw_filename);
@@ -1822,6 +1824,30 @@ void Executor::search(size_t k, int tag) {
     }
 
     comm_.send_result(results, k, tag);
+}
+
+void Executor::batch_search(size_t num_queries, size_t k, int tag) {
+    float* query_vectors = new float[num_queries * dim_];
+
+    comm_.recv_vector_batch(query_vectors, num_queries, dim_, 0, tag);
+    int* results = new int[num_queries * k];
+
+    std::shared_lock lock(graph_mutex_);
+    #pragma omp parallel for
+    for (int i = 0; i < (int)num_queries; i++) {
+        float* query_vector = query_vectors + (i * dim_);
+        std::vector<std::pair<float, hnswlib::labeltype>> result = sub_HNSW_->searchKnnCloserFirst(query_vector, k);
+        for (int j = 0; j < (int)result.size(); j++) {
+            results[i * k + j] = result[j].second;
+        }
+    }
+
+    // void send_result_batch(const int* results, size_t num_queries, size_t num_neighbors, int tag)
+    comm_.send_result_batch(results, num_queries, k, tag);
+
+    delete[] query_vectors;
+    delete[] results;
+
 }
 
 void Executor::insert(int tag) {
