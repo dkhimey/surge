@@ -1273,12 +1273,12 @@ void Executor::receiveData(size_t nrecv_vecs) {
     if (local_indices_.capacity() < required_nvecs)
         local_indices_.reserve(required_nvecs * 2);
 
-    std::cout << "[Executor " << node_id_ << "] receiveData() reserved\n ";
+    // std::cout << "[Executor " << node_id_ << "] receiveData() reserved\n ";
 
     local_vectors_.resize(required_nvecs * dim_);
     local_indices_.resize(required_nvecs);
 
-    std::cout << "[Executor " << node_id_ << "]--receiveData()-- Receiving " << nrecv_vecs << " vectors from coordinator\n";
+    // std::cout << "[Executor " << node_id_ << "]--receiveData()-- Receiving " << nrecv_vecs << " vectors from coordinator\n";
 
     float* vec_recv_ptr = local_vectors_.data() + (data_count_ * dim_);
     int* idx_recv_ptr = local_indices_.data() + data_count_;

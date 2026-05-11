@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
             // recieve header
             MessageHeader recv_header;
             comm.recv_header(recv_header, 0);
-            std::cout << "[Executor " << node << "] Received header: type=" << recv_header.type << ", size=" << recv_header.size << "\n";
+            // std::cout << "[Executor " << node << "] Received header: type=" << recv_header.type << ", size=" << recv_header.size << "\n";
             if (recv_header.type == END_OF_COMMUNICATION) {
                 done = true;
             } else {

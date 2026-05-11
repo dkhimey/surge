@@ -151,17 +151,17 @@ public:
         int to_recv,
         size_t dim
     ) {
-        std::cout << "[Executor " << rank << "]--receive_vector_data()-- Expecting to receive data for " << to_recv << " vectors\n";
+        // std::cout << "[Executor " << rank << "]--receive_vector_data()-- Expecting to receive data for " << to_recv << " vectors\n";
         MPI_Recv(vec_recv_ptr,
                 to_recv * dim,
                 MPI_FLOAT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-        std::cout << "[Executor " << rank << "]--receive_vector_data() 1-- Received vector data for " << to_recv << " vectors\n";
+        // std::cout << "[Executor " << rank << "]--receive_vector_data() 1-- Received vector data for " << to_recv << " vectors\n";
 
         MPI_Recv(idx_recv_ptr,
                 to_recv,
                 MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        std::cout << "[Executor " << rank << "]--receive_vector_data() 2-- Received index data for " << to_recv << " vectors\n";
+        // std::cout << "[Executor " << rank << "]--receive_vector_data() 2-- Received index data for " << to_recv << " vectors\n";
     }
 
     void broadcast_HNSW(hnswlib::HierarchicalNSW<float>* meta_HNSW, int world_size) {
