@@ -14,15 +14,16 @@
 int main(int argc, char **argv) {
     int node, world_size;
 
-    if (argc != 5) {
-        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <mode> <k>\n";
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <mode> <param> <k>\n";
         return 1;
     }
 
     std::string dataset_name = argv[1];
     int num_partitions = std::stoi(argv[2]);
     std::string mode_str = argv[3];
-    int k = std::stoi(argv[4]);
+    float param = std::stof(argv[4]);
+    int k = std::stoi(argv[5]);
 
     RoutingMode mode;
     if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
@@ -105,8 +106,8 @@ int main(int argc, char **argv) {
                     query_vector,
                     i,
                     k,
-                    RoutingMode::BranchingFactor,
-                    bf
+                    mode,
+                    param
                 );
 
                 if (r == 0) {
