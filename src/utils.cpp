@@ -13,10 +13,10 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
 
     {"msturing-100M-clustered",
         {
-            {"base_file", "TODO"},
-            {"runbook", "TODO"},
-            {"query_file", "TODO"},
-            {"ground_truth_dir", "TODO"},
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100M-msturing-clustered.fbin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/msturing-100M-clustered_runbookfinal.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100000000/msturing-100M-clustered_runbookfinal.yaml"},
         }
     },
 

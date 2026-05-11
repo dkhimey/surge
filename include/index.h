@@ -195,7 +195,7 @@ class Executor {
 public:
     Executor(int node_id, int dim, Communicator& comm, Log* logger = nullptr);
 
-    void receiveData(size_t num_vectors);
+    void receiveData(size_t nrecv_vecs);
     void setData(float* data, int* indices, size_t count);
     void build(
         int ef_construction,

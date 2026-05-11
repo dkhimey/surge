@@ -425,7 +425,7 @@ void Coordinator::distribute_vectors(
     #pragma omp parallel num_threads(num_threads)
     {
         int tid = omp_get_thread_num();
-        std::cout << "[Coordinator] Thread " << tid << " started for distributing vectors\n";
+        // std::cout << "[Coordinator] Thread " << tid << " started for distributing vectors\n";
         int thread_start = tid * vectors_per_thread;
         int thread_end = std::min(thread_start + vectors_per_thread, total_vectors);
 
@@ -1264,20 +1264,28 @@ void Executor::setData(float* data, int* indices, size_t count) {
     std::cout << "[Executor " << node_id_ << " ] Data set with " << count << " elements\n";
 }
 
-void Executor::receiveData(size_t num_vectors) {
-    size_t required_size = data_count_ + num_vectors;
-    local_vectors_.resize(required_size * dim_);
-    local_indices_.resize(required_size);
+void Executor::receiveData(size_t nrecv_vecs) {
+    size_t required_nvecs = data_count_ + nrecv_vecs;
+    if (local_vectors_.capacity() < required_nvecs * dim_)
+        local_vectors_.reserve(required_nvecs * dim_ * 2);
+    if (local_indices_.capacity() < required_nvecs)
+        local_indices_.reserve(required_nvecs * 2);
+
+    std::cout << "[Executor " << node_id_ << "] receiveData() reserved\n ";
+
+    local_vectors_.resize(required_nvecs * dim_);
+    local_indices_.resize(required_nvecs);
+
+    std::cout << "[Executor " << node_id_ << "]--receiveData()-- Receiving " << nrecv_vecs << " vectors from coordinator\n";
 
     float* vec_recv_ptr = local_vectors_.data() + data_count_ * dim_;
     int* idx_recv_ptr = local_indices_.data() + data_count_;
-    comm_.receive_vector_data(local_vectors_, 
-                              local_indices_, 
-                              vec_recv_ptr, 
-                              idx_recv_ptr,
-                              num_vectors, dim_);
 
-    data_count_ += num_vectors;
+    comm_.receive_vector_data(vec_recv_ptr, 
+                              idx_recv_ptr,
+                              nrecv_vecs, dim_);
+
+    data_count_ += nrecv_vecs;
 
     data_ = local_vectors_.data();
     indices_ = local_indices_.data();

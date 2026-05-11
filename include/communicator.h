@@ -138,8 +138,6 @@ public:
     }
 
     void receive_vector_data(
-        std::vector<float>& local_vectors, 
-        std::vector<int>& local_indices, 
         float* vec_recv_ptr,
         int* idx_recv_ptr,
         int to_recv,
@@ -149,9 +147,12 @@ public:
                 to_recv * dim,
                 MPI_FLOAT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
+        std::cout << "[Executor " << rank << "]--receive_vector_data() 1-- Received vector data for " << to_recv << " vectors\n";
+
         MPI_Recv(idx_recv_ptr,
                 to_recv,
                 MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        std::cout << "[Executor " << rank << "]--receive_vector_data() 2-- Received index data for " << to_recv << " vectors\n";
     }
 
     void broadcast_HNSW(hnswlib::HierarchicalNSW<float>* meta_HNSW, int world_size) {

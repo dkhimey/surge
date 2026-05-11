@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
             // recieve header
             MessageHeader recv_header;
             comm.recv_header(recv_header, 0);
+            std::cout << "[Executor " << node << "] Received header: type=" << recv_header.type << ", size=" << recv_header.size << "\n";
             if (recv_header.type == END_OF_COMMUNICATION) {
                 done = true;
             } else {
@@ -103,10 +104,11 @@ int main(int argc, char **argv) {
         }
 
         logger.num_elements = num_recv;
+        std::cout << "[Executor " << node << "] Total vectors received: " << num_recv << "\n";
         subIndex.build(
             200, // ef_construction, TODO: hard coded
             16, // M_sub, TODO: hard coded
-            8 // num_building_threads, TODO: hard coded
+            32 // num_building_threads, TODO: hard coded
         );
 
         std::string filename = "executor_" + std::to_string(node) + "_" + dataset_name + "_" + std::to_string(num_partitions) + ".json";
@@ -116,3 +118,5 @@ int main(int argc, char **argv) {
 
     MPI_Finalize();
 }
+
+// mpirun -np 11 --rankfile rankfile.txt bin/partitioning_quality sift-500M 10
