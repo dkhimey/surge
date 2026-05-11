@@ -70,11 +70,11 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
 
     {"msturing-1M",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-1M/base1b.crop_nb_1000000.fbin"},
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_1000000.fbin"},
             {"runbook", "TODO"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-1M/testQuery10K.fbin"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
             {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuring-1M/msturing-gt-1M"}
+            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-1M"}
         }
 
     }
