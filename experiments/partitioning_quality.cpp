@@ -70,7 +70,12 @@ int main(int argc, char **argv) {
         double start = MPI_Wtime();
         int num_threads = 32; //TODO: hard coded
         bool log_partitions = true; //TODO: hard coded
-        metaIndex.distribute_vectors(DATASETS[dataset_name]["base_file"], nvectors, log_partitions, num_threads);
+        std::vector<int> counts_per_partition = metaIndex.distribute_vectors(
+            DATASETS[dataset_name]["base_file"], 
+            nvectors, 
+            log_partitions, 
+            num_threads
+        );
         double end = MPI_Wtime();
 
         logger.partition_time = end - start;
@@ -82,7 +87,7 @@ int main(int argc, char **argv) {
         std::string meta_dir = dataset_name + "_" + std::to_string(num_partitions);
         metaIndex.save(meta_dir);
         logger.meta_index_path = meta_dir + "/metaHNSW.bin";
-        logger.saveControllerLog();
+        logger.saveControllerLog(counts_per_partition);
     } else {
         std::cout << "[Executor " << node << "] log_id: " << log_id << "\n";
         comm.recv_dataset_info(nvectors, dim);

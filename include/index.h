@@ -47,7 +47,7 @@ public:
     // std::vector<size_t> getPartition(float* vec, int n = 1);
     // std::vector<size_t> getPartition(float* vec, int n = 1, float* dist = nullptr);
     
-    void distribute_vectors(
+    std::vector<int> distribute_vectors(
         const std::string& base_file, 
         int total_vectors, 
         bool log_partitions,

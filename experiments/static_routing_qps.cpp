@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
         std::string query_file = DATASETS[dataset_name]["query_file"];
         std::string gt_file = DATASETS[dataset_name]["gt_file"];
 
-        std::vector<float> queries = readVecs(query_file, format, dim);
+        std::vector<float> queries = readVecs(query_file, dim);
         std::vector<std::vector<int>> ground_truth_idx = readGT(gt_file, format);
 
         std::cout << "[Coordinator] Read query and ground truth files\n";
@@ -81,85 +81,122 @@ int main(int argc, char **argv) {
         size_t num_neighbors = k;
         std::cout << "  Num top vectors per query: " << gt_per_query << "\n";
 
-        std::vector<int> branching_factors = {1000};
-        std::vector<float> recall_targets = {0.7, 0.8, 0.9, 0.95, 0.99};
-        std::vector<int> nprobe_values = {1, 2, 4, 8, 16, 32, 64, 128, 256};
-
-        // std::vector<int> ef_search_values = {10, 20, 30, 40, 50, 60, 80, 100, 120, 150, 180, 200, 220, 250, 280, 300, 320, 350, 380, 400, 500};
-        // std::vector<int> ef_search_values = {200};
-        comm.broadcast_ef_search(ef_search, world_size);
-
-        std::string run_path = logger.log_dir +  "/sweep_results_all_partitions.txt";
-        std::ofstream outfile(run_path, std::ios::out | std::ios::app);
-
-        for (int bf : branching_factors) {
-            // measure recall
-            std::vector<int> access_rate(num_queries);
-            std::vector<std::atomic<int>> executor_hits(num_partitions);
-            for (auto& e : executor_hits) {
-                e.store(0);
-            }
-
-            std::atomic<size_t> correct = 0;
-            std::atomic<size_t> completed = 0;
-
-            double recalls_total = 0.0f;
-            size_t num_query_threads = NUM_COORD_THREADS;
-            if (bf < 20) {
-                num_query_threads = 600;
-            }
-
-            auto start = MPI_Wtime();
-            std::vector<std::vector<int>> per_query_results = metaIndex.handle_queries(queries, num_neighbors, bf);
-            auto end = MPI_Wtime();
-            std::cout << "Time to handle all queries: " << (end - start) << " seconds\n";
-            std::cout << "Throughput: " << (num_queries / (end - start)) << " qps\n";
-
+        size_t bf = 1;
+        #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2)
+        for (int r = 0; r < 3; r++) {
             for (int i = 0; i < num_queries; i++) {
-                std::vector<int>& results = per_query_results[i];
-                std::sort(results.begin(), results.end());
-                auto last = std::unique(results.begin(), results.end());
-                results.erase(last, results.end());
+                float* query_vector = queries.data() + (i * dim);
 
-                int relevant = 0;
-                for (int id : results) {
-                    for (int j = 0; j < k; ++j) {
-                        if (id == ground_truth_idx[i][j]) {
-                            relevant++;
-                        }
-                    }
-                }
-
-                double recall_i = (double)relevant /
-                                (double)k;
-                recalls_total += recall_i;
-
-                completed++;
+                metaIndex.handle_query(
+                    query_vector,
+                    i,
+                    k,
+                    bf
+                );
             }
-
-            double recall = recalls_total / num_queries;
-
-            // measure throughput and latency: TODO
-            std::vector<double> latencies(num_queries);
-
-            double throughput_start = MPI_Wtime();
-            #pragma omp parallel for num_threads(num_query_threads)
-            for (int r = 0; r < num_runs; r++) {
-                std::vector<std::vector<int>> per_query_results = metaIndex.handle_queries(queries, num_neighbors, bf);
-            }
-            double throughput_end = MPI_Wtime();
-
-            double qps = (num_queries * num_runs) /  (throughput_end - throughput_start);
-
-            outfile << bf << "," << recall << "," << qps << "\n";
-
-            std::cout << "  bf: " << bf << ", recall: " << recall << ", qps: " << qps << "\n";
-            
-            std::string output_id = "bf" + std::to_string(bf) + "_ef" + std::to_string(ef_search) + "_" + logger.run_id;
-            logger.logQueryLatencies(latencies, output_id);
-            logger.logExecutorHits(executor_hits, output_id);
-            logger.logAccessRate(access_rate, output_id);
         }
+
+        std::cout << "------WARMED------\n";
+
+        double throughput_start = MPI_Wtime();
+        #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2)
+        for (int r = 0; r < num_runs; r++) {
+            for (int i = 0; i < num_queries; i++) {
+                float* query_vector = queries.data() + (i * dim);
+
+                metaIndex.handle_query(
+                    query_vector,
+                    i,
+                    k,
+                    bf
+                );
+            }
+        }
+        double throughput_end = MPI_Wtime();
+
+        std::cout << "QPS: " <<  num_queries * num_runs / (throughput_end - throughput_start) << "\n";
+
+
+        // std::vector<int> branching_factors = {1, 2, 10, 15, 20, 30};
+        // std::vector<float> recall_targets = {0.7, 0.8, 0.9, 0.95, 0.99};
+        // std::vector<int> nprobe_values = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+
+        // // std::vector<int> ef_search_values = {10, 20, 30, 40, 50, 60, 80, 100, 120, 150, 180, 200, 220, 250, 280, 300, 320, 350, 380, 400, 500};
+        // // std::vector<int> ef_search_values = {200};
+        // comm.broadcast_ef_search(ef_search, world_size);
+
+        // std::string run_path = logger.log_dir +  "/sweep_results_all_partitions.txt";
+        // std::ofstream outfile(run_path, std::ios::out | std::ios::app);
+
+        // for (int bf : branching_factors) {
+        //     std::cout << "[Coordinator] searching with bf = " << bf << "\n";
+        //     // measure recall
+        //     std::vector<int> access_rate(num_queries);
+        //     std::vector<std::atomic<int>> executor_hits(num_partitions);
+        //     for (auto& e : executor_hits) {
+        //         e.store(0);
+        //     }
+
+        //     std::atomic<size_t> correct = 0;
+        //     std::atomic<size_t> completed = 0;
+
+        //     double recalls_total = 0.0f;
+        //     size_t num_query_threads = NUM_COORD_THREADS;
+        //     // if (bf < 20) {
+        //     //     num_query_threads = 600;
+        //     // }
+
+        //     auto start = MPI_Wtime();
+        //     std::vector<std::vector<int>> per_query_results = metaIndex.handle_queries(queries, num_neighbors, bf);
+        //     auto end = MPI_Wtime();
+        //     std::cout << "Time to handle all queries: " << (end - start) << " seconds\n";
+        //     std::cout << "Throughput: " << (num_queries / (end - start)) << " qps\n";
+
+        //     for (int i = 0; i < num_queries; i++) {
+        //         std::vector<int>& results = per_query_results[i];
+        //         std::sort(results.begin(), results.end());
+        //         auto last = std::unique(results.begin(), results.end());
+        //         results.erase(last, results.end());
+
+        //         int relevant = 0;
+        //         for (int id : results) {
+        //             for (int j = 0; j < k; ++j) {
+        //                 if (id == ground_truth_idx[i][j]) {
+        //                     relevant++;
+        //                 }
+        //             }
+        //         }
+
+        //         double recall_i = (double)relevant /
+        //                         (double)k;
+        //         recalls_total += recall_i;
+
+        //         completed++;
+        //     }
+
+        //     double recall = recalls_total / num_queries;
+
+        //     // measure throughput and latency: TODO
+        //     std::vector<double> latencies(num_queries);
+
+        //     double throughput_start = MPI_Wtime();
+        //     #pragma omp parallel for num_threads(num_query_threads)
+        //     for (int r = 0; r < num_runs; r++) {
+        //         std::vector<std::vector<int>> per_query_results = metaIndex.handle_queries(queries, num_neighbors, bf);
+        //     }
+        //     double throughput_end = MPI_Wtime();
+
+        //     double qps = (num_queries * num_runs) /  (throughput_end - throughput_start);
+
+        //     outfile << bf << "," << recall << "," << qps << "\n";
+
+        //     std::cout << "  bf: " << bf << ", recall: " << recall << ", qps: " << qps << "\n";
+            
+        //     std::string output_id = "bf" + std::to_string(bf) + "_ef" + std::to_string(ef_search) + "_" + logger.run_id;
+        //     logger.logQueryLatencies(latencies, output_id);
+        //     logger.logExecutorHits(executor_hits, output_id);
+        //     logger.logAccessRate(access_rate, output_id);
+        // }
 
 
         // end communication from Coordinator side
@@ -206,10 +243,16 @@ int main(int argc, char **argv) {
                     continue;
                 }
 
-                assert(header.type == QUERY_BATCH_SEND);
-                subIndex.batch_search(header.size, k, header.tag);
+                if (header.type == QUERY_BATCH_SEND) {
+                    subIndex.batch_search(header.size, k, header.tag);
+                    num_processed+= header.size;
+                }
 
-                num_processed+= header.size;
+                if (header.type == QUERY_SEND) {
+                    subIndex.search(header.size, header.tag);
+                    num_processed++;
+                }
+            
             }
         }
 

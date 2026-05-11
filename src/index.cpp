@@ -394,7 +394,7 @@ std::vector<size_t> Coordinator::getPartitionsForDelete_(size_t label) {
     return std::vector<size_t>{partition};
 }
 
-void Coordinator::distribute_vectors(
+std::vector<int> Coordinator::distribute_vectors(
         const std::string& base_file, 
         int total_vectors, 
         bool log_partitions,
@@ -421,7 +421,7 @@ void Coordinator::distribute_vectors(
     for (auto& l : locks) omp_init_lock(&l);
 
     std::cout << "num_threads = " << num_threads << ", omp_get_max_threads = " << omp_get_max_threads() << "\n";
-
+    std::vector<int> counts_per_partition(num_partitions_, 0);
     #pragma omp parallel num_threads(num_threads)
     {
         int tid = omp_get_thread_num();
@@ -467,6 +467,7 @@ void Coordinator::distribute_vectors(
                 MessageHeader header(VECTOR_SEND, vec_count);
                 {
                     omp_set_lock(&locks[p]);
+                    counts_per_partition[p-1] += vec_count;
                     MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, p, 0, MPI_COMM_WORLD);
                     MPI_Send(partition_vectors[p].data(), vec_count * dim_, MPI_FLOAT, p, 0, MPI_COMM_WORLD);
                     MPI_Send(partition_indices[p].data(), vec_count, MPI_INT, p, 0, MPI_COMM_WORLD);
@@ -480,6 +481,8 @@ void Coordinator::distribute_vectors(
         logger_->logPartitions(partition_assignments, true);
         logger_->logPartitionDists(partition_distances);
     }
+
+    return counts_per_partition;
 }
 
 std::pair<int, std::vector<int>> Coordinator::matchPartitions_(const std::vector<int>& part1, const std::vector<int>& part2) {

@@ -286,7 +286,7 @@ typedef struct Log {
         outputFile.close();
     }
 
-    void saveControllerLog() {
+    void saveControllerLog(std::vector<int> per_partition_counts) {
         std::string filename = log_dir + "/controller_build.json";
         json data;
         data["index_build_time"] = index_build_time;
@@ -311,6 +311,7 @@ typedef struct Log {
         data["edge_cut_ratio"] = edge_cut_ratio;
         data["search_time"] = search_time;
         data["send_time"] = send_time;
+        data["per_partition_counts"] = per_partition_counts;
 
         std::ofstream outputFile(filename);
         outputFile << data.dump(4);

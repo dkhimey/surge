@@ -341,7 +341,7 @@ std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file says " << dim_in_file
+        std::cerr << "[Coordinator]: Dimension mismatch: file "<< filename << " says " << dim_in_file
                   << ", expected " << vector_dim << "\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
         return {};
@@ -389,7 +389,7 @@ std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file says " << dim_in_file
+        std::cerr << "[Coordinator]: Dimension mismatch: file " << filename << " says " << dim_in_file
                   << ", expected " << vector_dim << "\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
         return {};
@@ -437,7 +437,7 @@ std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int 
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file says " << dim_in_file
+        std::cerr << "[Coordinator]: Dimension mismatch: file " << filename << " says " << dim_in_file
                   << ", expected " << vector_dim << "\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
         return {};
