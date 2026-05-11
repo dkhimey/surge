@@ -109,11 +109,20 @@ public:
     //     float* recall = nullptr
     // );
 
+    // std::vector<int> handle_query(
+    //     float* query_vector,
+    //     int query_idx,
+    //     size_t num_neighbors,
+    //     size_t branching_factor,
+    //     std::vector<std::atomic<int>>* executor_hits = nullptr
+    // );
+
     std::vector<int> handle_query(
         float* query_vector,
         int query_idx,
         size_t num_neighbors,
-        size_t branching_factor,
+        RoutingMode mode,
+        float param,
         std::vector<std::atomic<int>>* executor_hits = nullptr
     );
 

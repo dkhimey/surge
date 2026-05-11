@@ -881,14 +881,31 @@ std::vector<int> Coordinator::handle_query(
     float* query_vector,
     int query_idx,
     size_t num_neighbors,
-    size_t branching_factor,
+    RoutingMode mode,
+    float param,
     std::vector<std::atomic<int>>* executor_hits
 ) {
     if (!comm_) {
         throw std::runtime_error("[Coordinator] communicator not set");
     }
 
-    std::vector<size_t> executors = route_query(query_vector, branching_factor);
+    std::vector<size_t> executors;
+
+    switch (mode) {
+        case RoutingMode::BranchingFactor: {
+            executors = route_query(query_vector, param);
+            break;
+        }
+        case RoutingMode::NProbe: {
+            executors = route_query_nprobe(query_vector, param);
+            break;
+        }
+        case RoutingMode::RecallTarget: {
+            executors = route_query_recall_target(query_vector, param);
+            break;
+        }
+    }
+     
     if (executor_hits) {
         for (size_t idx : executors) (*executor_hits)[idx]++;
     }

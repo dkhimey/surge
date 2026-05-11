@@ -81,22 +81,39 @@ int main(int argc, char **argv) {
         size_t num_neighbors = k;
         std::cout << "  Num top vectors per query: " << gt_per_query << "\n";
 
-        size_t bf = 1;
-        #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2)
+        size_t bf = 20;
+        double total_recall = 0.0;
+
+        #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2) reduction(+:total_recall)
         for (int r = 0; r < 3; r++) {
             for (int i = 0; i < num_queries; i++) {
                 float* query_vector = queries.data() + (i * dim);
 
-                metaIndex.handle_query(
+                std::vector<int> results = metaIndex.handle_query(
                     query_vector,
                     i,
                     k,
+                    RoutingMode::BranchingFactor,
                     bf
                 );
+
+                if (r == 0) {
+                    int hits = 0;
+                    for (int j = 0; j < k; j++) {
+                        int gt_id = ground_truth_idx[i][j];
+                        for (int res_id : results) {
+                            if (gt_id == res_id) hits++;
+                        }
+                    }
+
+                    double recall = static_cast<double>(hits)/static_cast<double>(k);
+                    total_recall += recall;
+                }
             }
         }
 
         std::cout << "------WARMED------\n";
+        std::cout << "Recall @" << k << ": " << total_recall/num_queries << "\n";
 
         double throughput_start = MPI_Wtime();
         #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2)
@@ -108,6 +125,7 @@ int main(int argc, char **argv) {
                     query_vector,
                     i,
                     k,
+                    RoutingMode::BranchingFactor,
                     bf
                 );
             }
