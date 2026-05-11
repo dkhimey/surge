@@ -44,6 +44,8 @@ int main(int argc, char **argv) {
     int nvectors = data_info.first;
     int dim = data_info.second;
 
+    std::cout << "Dataset: " << dataset_name << ", num vectors: " << nvectors << ", dimension: " << dim << "\n";
+
     printf("Max threads: %d\n", omp_get_max_threads());
 
     if (node == 0) { // Coordinator
