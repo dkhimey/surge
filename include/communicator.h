@@ -175,6 +175,19 @@ public:
         }
     }
 
+    void broadcast_dataset_info(int nvectors, int dim, int world_size) {
+        for (int i = 1; i < world_size; i++) {
+            MPI_Send(&nvectors, 1, MPI_INT, i, DATASET_INFO_SEND, MPI_COMM_WORLD);
+            MPI_Send(&dim, 1, MPI_INT, i, DATASET_INFO_SEND, MPI_COMM_WORLD);
+        }
+    }
+
+    void recv_dataset_info(int& nvectors, int& dim) {
+        MPI_Status status;
+        MPI_Recv(&nvectors, 1, MPI_INT, 0, DATASET_INFO_SEND, MPI_COMM_WORLD, &status);
+        MPI_Recv(&dim, 1, MPI_INT, 0, DATASET_INFO_SEND, MPI_COMM_WORLD, &status);
+    }
+
     void recv_HNSW(
         int meta_size, 
         hnswlib::HierarchicalNSW<float>* metaHNSW, 

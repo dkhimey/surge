@@ -40,16 +40,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
-    int nvectors = data_info.first;
-    int dim = data_info.second;
-
-    std::cout << "Dataset: " << dataset_name << ", num vectors: " << nvectors << ", dimension: " << dim << "\n";
-
+    int nvectors, dim;
     printf("Max threads: %d\n", omp_get_max_threads());
 
     if (node == 0) { // Coordinator
         // take sample (just read in first sample_size elements, assume they are randomly distributed across file)
+        std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
+        int nvectors = data_info.first;
+        int dim = data_info.second;
+
+        comm.broadcast_dataset_info(nvectors, dim, world_size);
 
         size_t sample_size = 100000; //TODO: hard coded
 
@@ -85,6 +85,9 @@ int main(int argc, char **argv) {
         logger.saveControllerLog();
     } else {
         std::cout << "[Executor " << node << "] log_id: " << log_id << "\n";
+        comm.recv_dataset_info(nvectors, dim);
+        std::cout << "[Executor " << node << "] Received dataset info: num vectors = " << nvectors << ", dimension = " << dim << "\n";
+
         Executor subIndex(node, dim, comm, &logger);
 
         size_t num_recv = 0;

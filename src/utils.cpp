@@ -74,7 +74,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"runbook", "TODO"},
             {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
             {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-1M"}
+            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-1M.ibin"}
         }
 
     }
@@ -98,8 +98,13 @@ FileFormat getFileFormat(const std::string& filename) {
 }
 
 std::pair<int, int> get_dataset_info(const std::string& base_file) {
-    FileFormat format = getFileFormat(base_file);
     std::ifstream file(base_file, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "FATAL: cannot open dataset file: " << base_file << "\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    FileFormat format = getFileFormat(base_file);
     switch (format) {
         case BVECS:
         case FVECS: {

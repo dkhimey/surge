@@ -51,7 +51,8 @@ typedef enum {
     INSERT_BATCH_SEND,
     INSERT_BATCH_SUCCESS,
     DELETE_BATCH_SEND,
-    DELETE_BATCH_SUCCESS
+    DELETE_BATCH_SUCCESS,
+    DATASET_INFO_SEND
 } MessageType;
 
 typedef struct MessageHeader {
