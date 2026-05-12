@@ -257,11 +257,11 @@ int main(int argc, char **argv) {
         omp_set_num_threads(num_threads);
         #pragma omp parallel
         {
-            int tid = omp_get_thread_num();
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(tid, &cpuset);
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+            // int tid = omp_get_thread_num();
+            // cpu_set_t cpuset;
+            // CPU_ZERO(&cpuset);
+            // CPU_SET(tid, &cpuset);
+            // pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
             while (!end) {
                 MessageHeader header;
