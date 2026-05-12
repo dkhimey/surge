@@ -1,5 +1,5 @@
 build
 bin
-external/KaHIP/build
+external/KaHIP/build/*
 theoretical_partitioning_quality*
 logs*
