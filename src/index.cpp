@@ -769,6 +769,9 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
     std::cout << "[Coordinator] size of partitions: " << size << "\n";
 
     this->ncenters_ = size;
+    this->num_partitions_ = static_cast<size_t>(
+        *std::max_element(partitions.begin(), partitions.end()) + 1
+    );
 
     std::cout << "[Coordinator] Loading centers from: " << centers_path << "\n";
     std::ifstream in2(centers_path, std::ios::binary);
