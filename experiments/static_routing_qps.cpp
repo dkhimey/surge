@@ -25,7 +25,16 @@ int main(int argc, char **argv) {
     float param = std::stof(argv[4]);
     int k = std::stoi(argv[5]);
 
-    std::vector<RoutingMode> modes = {RoutingMode::BranchingFactor, RoutingMode::NProbe, RoutingMode::RecallTarget};
+    RoutingMode mode;
+    // std::vector<RoutingMode> modes = {RoutingMode::BranchingFactor, RoutingMode::NProbe, RoutingMode::RecallTarget};
+    if (mode_str == "recall") mode = RoutingMode::RecallTarget;
+    else if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
+    else if (mode_str == "nprobe") mode = RoutingMode::NProbe;
+    else {
+        std::cerr << "Invalid Routing Mode\n";
+        exit(1);
+    }
+
     std::vector<int> branching_factors = {1, 2, 5, 10, 15, 20, 25, 30};
     std::vector<int> nprobe = {1, 2, 3, 4, 5, 6, 7, 8, 9};
     std::vector<float> targets = {.6, .7, .75,.8, .85, .9, .95, .97, .98, .99};
