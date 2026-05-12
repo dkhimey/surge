@@ -14,25 +14,20 @@
 int main(int argc, char **argv) {
     int node, world_size;
 
-    if (argc != 6) {
-        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <mode> <param> <k>\n";
+    if (argc != 5) {
+        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <k> <output_file>\n";
         return 1;
     }
 
-    std::string dataset_name = argv[1];
-    int num_partitions = std::stoi(argv[2]);
-    std::string mode_str = argv[3];
-    float param = std::stof(argv[4]);
-    int k = std::stoi(argv[5]);
+    std::string dataset_name  = argv[1];
+    int num_partitions        = std::stoi(argv[2]);
+    int k                     = std::stoi(argv[3]);
+    std::string output_file   = argv[4];
 
-    RoutingMode mode;
-    if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
-    else if (mode_str == "nprobe") mode = RoutingMode::NProbe;
-    else if (mode_str == "recall") mode = RoutingMode::RecallTarget;
-    else {
-        std::cerr << "Invalid Routing Mode: " << mode_str << "\n";
-        return 1;
-    }
+    std::vector<RoutingMode> modes = {RoutingMode::BranchingFactor, RoutingMode::NProbe, RoutingMode::RecallTarget};
+    std::vector<int> branching_factors = {1, 2, 5, 10, 15, 20, 25, 30};
+    std::vector<int> nprobe = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<float> targets = {.6, .7, .75, .8, .85, .9, .95, .97, .98, .99};
 
     std::string log_id = "partition_quality_" + dataset_name + "_" + std::to_string(num_partitions);
     Log logger(log_id);
@@ -97,56 +92,98 @@ int main(int argc, char **argv) {
 
         comm.broadcast_ef_search(ef_search, world_size);
 
-        #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2) reduction(+:total_recall)
-        for (int r = 0; r < 3; r++) {
-            for (int i = 0; i < num_queries; i++) {
-                float* query_vector = queries.data() + (i * dim);
+        std::ofstream outfile(output_file, std::ios::out);
+        if (!outfile.is_open()) {
+            std::cerr << "ERROR: could not open output file: " << output_file << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        outfile << "mode,param,recall,qps\n";
+        outfile.flush();
 
-                std::vector<int> results = metaIndex.handle_query(
-                    query_vector,
-                    i,
-                    k,
-                    mode,
-                    param
-                );
+        auto mode_to_string = [](RoutingMode m) -> std::string {
+            switch (m) {
+                case RoutingMode::BranchingFactor: return "BranchingFactor";
+                case RoutingMode::NProbe:          return "NProbe";
+                case RoutingMode::RecallTarget:    return "RecallTarget";
+            }
+            return "Unknown";
+        };
 
-                if (r == 0) {
-                    int hits = 0;
-                    for (int j = 0; j < k; j++) {
-                        int gt_id = ground_truth_idx[i][j];
-                        for (int res_id : results) {
-                            if (gt_id == res_id) hits++;
+        const int num_warmup_runs = 3;
+
+        for (RoutingMode mode : modes) {
+            std::vector<float> params;
+            if (mode == RoutingMode::BranchingFactor) {
+                for (int v : branching_factors) params.push_back(static_cast<float>(v));
+            } else if (mode == RoutingMode::NProbe) {
+                for (int v : nprobe)             params.push_back(static_cast<float>(v));
+            } else if (mode == RoutingMode::RecallTarget) {
+                for (float v : targets)          params.push_back(v);
+            }
+
+            std::string mode_name = mode_to_string(mode);
+
+            for (float param : params) {
+                std::cout << "[Coordinator] sweeping mode=" << mode_name
+                        << " param=" << param << "\n";
+
+                // --- Warmup + recall measurement (recall taken from run 0) ---
+                double recall_sum = 0.0;
+                #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2) reduction(+:recall_sum)
+                for (int r = 0; r < num_warmup_runs; r++) {
+                    for (int i = 0; i < (int)num_queries; i++) {
+                        float* query_vector = queries.data() + (i * dim);
+
+                        std::vector<int> results = metaIndex.handle_query(
+                            query_vector,
+                            i,
+                            k,
+                            mode,
+                            param
+                        );
+
+                        if (r == 0) {
+                            int hits = 0;
+                            for (int j = 0; j < k; j++) {
+                                int gt_id = ground_truth_idx[i][j];
+                                for (int res_id : results) {
+                                    if (gt_id == res_id) hits++;
+                                }
+                            }
+                            recall_sum += static_cast<double>(hits) / static_cast<double>(k);
                         }
                     }
-
-                    double recall = static_cast<double>(hits)/static_cast<double>(k);
-                    total_recall += recall;
                 }
+                double recall = recall_sum / static_cast<double>(num_queries);
+
+                // --- Throughput ---
+                double t_start = MPI_Wtime();
+                #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2)
+                for (int r = 0; r < num_runs; r++) {
+                    for (int i = 0; i < (int)num_queries; i++) {
+                        float* query_vector = queries.data() + (i * dim);
+                        metaIndex.handle_query(
+                            query_vector,
+                            i,
+                            k,
+                            mode,
+                            param
+                        );
+                    }
+                }
+                double t_end = MPI_Wtime();
+                double qps = (static_cast<double>(num_queries) * num_runs) / (t_end - t_start);
+
+                outfile << mode_name << "," << param << ","
+                        << recall << "," << qps << "\n";
+                outfile.flush();
+
+                std::cout << "  recall@" << k << ": " << recall
+                        << ", qps: " << qps << "\n";
             }
         }
 
-        std::cout << "------WARMED------\n";
-        std::cout << "Recall @" << k << ": " << total_recall/num_queries << "\n";
-
-        double throughput_start = MPI_Wtime();
-        #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2)
-        for (int r = 0; r < num_runs; r++) {
-            for (int i = 0; i < num_queries; i++) {
-                float* query_vector = queries.data() + (i * dim);
-
-                metaIndex.handle_query(
-                    query_vector,
-                    i,
-                    k,
-                    RoutingMode::BranchingFactor,
-                    bf
-                );
-            }
-        }
-        double throughput_end = MPI_Wtime();
-
-        std::cout << "QPS: " <<  num_queries * num_runs / (throughput_end - throughput_start) << "\n";
-
+        outfile.close();
 
         // std::vector<int> branching_factors = {1, 2, 10, 15, 20, 30};
         // std::vector<float> recall_targets = {0.7, 0.8, 0.9, 0.95, 0.99};
