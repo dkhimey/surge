@@ -26,18 +26,13 @@ int main(int argc, char **argv) {
     int k = std::stoi(argv[5]);
 
     RoutingMode mode;
-    // std::vector<RoutingMode> modes = {RoutingMode::BranchingFactor, RoutingMode::NProbe, RoutingMode::RecallTarget};
-    if (mode_str == "recall") mode = RoutingMode::RecallTarget;
-    else if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
+    if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
     else if (mode_str == "nprobe") mode = RoutingMode::NProbe;
+    else if (mode_str == "recall") mode = RoutingMode::RecallTarget;
     else {
-        std::cerr << "Invalid Routing Mode\n";
-        exit(1);
+        std::cerr << "Invalid Routing Mode: " << mode_str << "\n";
+        return 1;
     }
-
-    std::vector<int> branching_factors = {1, 2, 5, 10, 15, 20, 25, 30};
-    std::vector<int> nprobe = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    std::vector<float> targets = {.6, .7, .75,.8, .85, .9, .95, .97, .98, .99};
 
     std::string log_id = "partition_quality_" + dataset_name + "_" + std::to_string(num_partitions);
     Log logger(log_id);
