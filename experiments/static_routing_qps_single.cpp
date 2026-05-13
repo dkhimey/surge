@@ -68,6 +68,8 @@ int main(int argc, char **argv) {
 
     int nvectors, dim;
 
+    printf("Max threads: %d\n", omp_get_max_threads());
+
     if (node == 0) { // Coordinator
         FileFormat format = getFileFormat(DATASETS[dataset_name]["base_file"]);
         std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
@@ -94,7 +96,6 @@ int main(int argc, char **argv) {
         size_t num_neighbors = k;
         std::cout << "  Num top vectors per query: " << gt_per_query << "\n";
 
-        size_t bf = 20;
         double total_recall = 0.0;
 
         comm.broadcast_ef_search(ef_search, world_size);
@@ -140,8 +141,8 @@ int main(int argc, char **argv) {
                     query_vector,
                     i,
                     k,
-                    RoutingMode::BranchingFactor,
-                    bf
+                    mode,
+                    param
                 );
             }
         }
@@ -233,7 +234,7 @@ int main(int argc, char **argv) {
 
 
         // end communication from Coordinator side
-        comm.broadcast_termination(world_size, num_threads);
+        comm.broadcast_termination(world_size, 1);
 
     } else { // Executor
         // std::string log_id;
@@ -253,47 +254,102 @@ int main(int argc, char **argv) {
         subIndex.load(filename_prefix, ef_search);
 
         std::atomic<int> num_processed = 0;
-        std::atomic<bool> end = false;
-        omp_set_num_threads(num_threads);
-        #pragma omp parallel
-        {
-            // int tid = omp_get_thread_num();
-            // cpu_set_t cpuset;
-            // CPU_ZERO(&cpuset);
-            // CPU_SET(tid, &cpuset);
-            // pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        // std::atomic<bool> end = false;
+        // omp_set_num_threads(num_threads);
+        // #pragma omp parallel
+        // {
+        //     // int tid = omp_get_thread_num();
+        //     // cpu_set_t cpuset;
+        //     // CPU_ZERO(&cpuset);
+        //     // CPU_SET(tid, &cpuset);
+        //     // pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-            while (!end) {
-                MessageHeader header;
-                MPI_Status status;
+        //     while (!end) {
+        //         MessageHeader header;
+        //         MPI_Status status;
 
-                #pragma omp critical
-                {
-                    comm.recv_header(header, 0);
-                    if (header.type == END_OF_COMMUNICATION) {
-                        end = true;
-                    }
-                }
+        //         #pragma omp critical
+        //         {
+        //             comm.recv_header(header, 0);
+        //             if (header.type == END_OF_COMMUNICATION) {
+        //                 end = true;
+        //             }
+        //         }
 
-                if (end) break;
+        //         if (end) break;
     
+        //         if (header.type == SET_EF_SEARCH) {
+        //             subIndex.setEfSearch(header.size);
+        //             continue;
+        //         }
+
+        //         if (header.type == QUERY_BATCH_SEND) {
+        //             subIndex.batch_search(header.size, k, header.tag);
+        //             num_processed+= header.size;
+        //         }
+
+        //         if (header.type == QUERY_SEND) {
+        //             subIndex.search(header.size, header.tag);
+        //             num_processed++;
+        //         }
+            
+        //     }
+        // }
+
+        std::queue<MessageHeader> work_queue;
+        std::mutex queue_mutex;
+        std::condition_variable cv;
+        std::atomic<bool> end = false;
+
+        // One dedicated receiver thread
+        std::thread receiver([&]() {
+            while (true) {
+                MessageHeader header;
+                comm.recv_header(header, 0);
+                
+                if (header.type == END_OF_COMMUNICATION) {
+                    end = true;
+                    cv.notify_all();
+                    break;
+                }
+                
                 if (header.type == SET_EF_SEARCH) {
                     subIndex.setEfSearch(header.size);
                     continue;
                 }
+                
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    work_queue.push(header);
+                }
+                cv.notify_one();
+            }
+        });
 
+        // Worker threads (num_threads - 1 to leave room for receiver)
+        #pragma omp parallel num_threads(num_threads - 1)
+        {
+            while (true) {
+                MessageHeader header;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    cv.wait(lock, [&]{ return !work_queue.empty() || end; });
+                    if (end && work_queue.empty()) break;
+                    header = work_queue.front();
+                    work_queue.pop();
+                }
+                
                 if (header.type == QUERY_BATCH_SEND) {
                     subIndex.batch_search(header.size, k, header.tag);
-                    num_processed+= header.size;
-                }
-
-                if (header.type == QUERY_SEND) {
+                    num_processed += header.size;
+                } else if (header.type == QUERY_SEND) {
                     subIndex.search(header.size, header.tag);
                     num_processed++;
                 }
-            
             }
         }
+
+        receiver.join();
 
         std::cout << "[Executor " << node << "] proccessed: " << num_processed << " queries\n";
     }

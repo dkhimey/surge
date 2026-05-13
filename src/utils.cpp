@@ -122,7 +122,7 @@ std::pair<int, int> get_dataset_info(const std::string& base_file) {
             return {num_vectors, dim};
         }
         default:
-            std::cerr << "Unsupported file format\n";
+            std::cerr << "Unsupported file format " << base_file << "\n";
             exit(1);
     }
 }
@@ -224,7 +224,7 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
                 break;
             }
             default:
-                std::cerr << "Unsupported file format\n";
+                std::cerr << "Unsupported file format " << filename << "\n";
                 MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
@@ -553,7 +553,7 @@ std::vector<float> readVecs(const std::string& filename, size_t vector_dim, int 
             result = readFbin(filename, vector_dim, n, offset);
             break;
         default:
-            std::cerr << "Unsupported file format\n";
+            std::cerr << "Unsupported file format " << filename << "\n";
             exit(1);
     }
     return result;
@@ -566,12 +566,13 @@ std::vector<std::vector<int>> readGT(const std::string& filename, FileFormat for
         case FVECS:
             gt = readGTIvecs(filename);
             break;
+        case U8BIN:
         case I8BIN:
         case FBIN:
             gt = readGTBin(filename);
             break;
         default:
-            std::cerr << "Unsupported file format\n";
+            std::cerr << "Unsupported file format " << filename << "\n";
             exit(1);
     }
     return gt;
