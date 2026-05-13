@@ -17,7 +17,7 @@
 int main(int argc, char **argv) {
     int node, world_size;
 
-    if (argc != 6) {
+    if (argc != 7) {
         std::cerr << "Usage: " << argv[0]
                   << " <dataset> <num_partitions> <k> <output_file> <num_coord_threads> <window_size>\n";
         return 1;
