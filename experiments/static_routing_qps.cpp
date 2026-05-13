@@ -1,5 +1,6 @@
 #include <iostream>
 #include <algorithm>
+#include <fstream>
 
 #include <mpi.h>
 #include <pthread.h>
@@ -10,15 +11,15 @@
 
 #include <omp.h>
 
-#define NUM_COORD_THREADS 350
 #define num_runs 3
 #define ef_search 200
 
 int main(int argc, char **argv) {
     int node, world_size;
 
-    if (argc != 5) {
-        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <k> <output_file>\n";
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <dataset> <num_partitions> <k> <output_file> <num_coord_threads> <window_size>\n";
         return 1;
     }
 
@@ -26,26 +27,8 @@ int main(int argc, char **argv) {
     int num_partitions        = std::stoi(argv[2]);
     int k                     = std::stoi(argv[3]);
     std::string output_file   = argv[4];
-
-    // if (argc != 6) {
-    //     std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <mode> <param> <k>\n";
-    //     return 1;
-    // }
-
-    // std::string dataset_name = argv[1];
-    // int num_partitions = std::stoi(argv[2]);
-    // std::string mode_str = argv[3];
-    // float param = std::stof(argv[4]);
-    // int k = std::stoi(argv[5]);
-
-    // RoutingMode mode;
-    // if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
-    // else if (mode_str == "nprobe") mode = RoutingMode::NProbe;
-    // else if (mode_str == "recall") mode = RoutingMode::RecallTarget;
-    // else {
-    //     std::cerr << "Invalid Routing Mode: " << mode_str << "\n";
-    //     return 1;
-    // }
+    int num_coord_threads     = std::stoi(argv[5]);
+    int window_size           = std::stoi(argv[6]);
 
     std::string log_id = "partition_quality_" + dataset_name + "_" + std::to_string(num_partitions);
     Log logger(log_id);
@@ -62,12 +45,9 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     Communicator comm;
 
-    int num_threads = 32; //TODO: hard coded
-
-    // std::cout << "RUN: Hello from #" << node << std::endl;
+    int num_threads = 32; // executor worker threads
 
     if (world_size == 1) {
-        // TODO
         std::cerr << "Not Implemented: Single Node SURGE";
         return 1;
     }
@@ -80,10 +60,18 @@ int main(int argc, char **argv) {
     int nvectors, dim;
 
     if (node == 0) { // Coordinator
-        std::vector<RoutingMode> modes = {RoutingMode::BranchingFactor, RoutingMode::NProbe, RoutingMode::RecallTarget};
-        std::vector<int> branching_factor_params = {1, 2, 5, 10, 15, 20, 25, 30};
-        std::vector<int> nprobe_params = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-        std::vector<float> target_params = {.6, .7, .75,.8, .85, .9, .95, .97, .98, .99};
+
+        std::cout << "[Coordinator] num_coord_threads=" << num_coord_threads
+                  << " window_size=" << window_size << "\n";
+
+        std::vector<RoutingMode> modes = {
+            RoutingMode::BranchingFactor,
+            RoutingMode::NProbe,
+            RoutingMode::RecallTarget
+        };
+        std::vector<int>   branching_factor_params = {1, 2, 5, 10, 15, 20, 25, 30};
+        std::vector<int>   nprobe_params           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+        std::vector<float> target_params           = {.6, .7, .75, .8, .85, .9, .95, .97, .98, .99};
 
         FileFormat format = getFileFormat(DATASETS[dataset_name]["base_file"]);
         std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
@@ -96,21 +84,18 @@ int main(int argc, char **argv) {
 
         std::string meta_dir = dataset_name + "_" + std::to_string(num_partitions);
         metaIndex.load(meta_dir, ef_search);
-        
+
         std::string query_file = DATASETS[dataset_name]["query_file"];
-        std::string gt_file = DATASETS[dataset_name]["gt_file"];
+        std::string gt_file    = DATASETS[dataset_name]["gt_file"];
 
         std::vector<float> queries = readVecs(query_file, dim);
         std::vector<std::vector<int>> ground_truth_idx = readGT(gt_file, format);
 
         std::cout << "[Coordinator] Read query and ground truth files\n";
 
-        size_t num_queries = queries.size() / dim;
+        size_t num_queries  = queries.size() / dim;
         size_t gt_per_query = ground_truth_idx[0].size();
-        size_t num_neighbors = k;
         std::cout << "  Num top vectors per query: " << gt_per_query << "\n";
-
-        double total_recall = 0.0;
 
         comm.broadcast_ef_search(ef_search, world_size);
 
@@ -131,12 +116,33 @@ int main(int argc, char **argv) {
             return "Unknown";
         };
 
+        // C++17 semaphore: single OMP thread dispatches tasks into the pool,
+        // blocking when window_size queries are already in-flight.
+        // Workers call release() on completion, unblocking the dispatcher.
+        struct CountingSemaphore {
+            explicit CountingSemaphore(int count) : count_(count) {}
+            void acquire() {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [&]{ return count_ > 0; });
+                --count_;
+            }
+            void release() {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++count_;
+                cv_.notify_one();
+            }
+        private:
+            std::mutex mutex_;
+            std::condition_variable cv_;
+            int count_;
+        } sem(window_size);
+
         const int num_warmup_runs = 3;
 
         for (RoutingMode mode : modes) {
             std::vector<float> params;
             if (mode == RoutingMode::BranchingFactor) {
-                for (int v : branching_factor_params) 
+                for (int v : branching_factor_params)
                     params.push_back(static_cast<float>(v));
             } else if (mode == RoutingMode::NProbe) {
                 for (int v : nprobe_params)
@@ -150,52 +156,68 @@ int main(int argc, char **argv) {
 
             for (float param : params) {
                 std::cout << "[Coordinator] sweeping mode=" << mode_name
-                        << " param=" << param << "\n";
+                          << " param=" << param << "\n";
 
-                // --- Warmup + recall measurement (recall taken from run 0) ---
-                double recall_sum = 0.0;
-                #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2) reduction(+:recall_sum)
-                for (int r = 0; r < num_warmup_runs; r++) {
-                    for (int i = 0; i < (int)num_queries; i++) {
-                        float* query_vector = queries.data() + (i * dim);
+                // Per-query recall stored atomically so tasks can write concurrently
+                std::vector<std::atomic<double>> per_query_recall(num_queries);
+                for (auto& v : per_query_recall) v.store(0.0);
 
-                        std::vector<int> results = metaIndex.handle_query(
-                            query_vector,
-                            i,
-                            k,
-                            mode,
-                            param
-                        );
+                // --- Warmup + recall measurement ---
+                #pragma omp parallel num_threads(num_coord_threads)
+                #pragma omp single
+                {
+                    for (int r = 0; r < num_warmup_runs; r++) {
+                        for (int i = 0; i < (int)num_queries; i++) {
+                            sem.acquire();
+                            float* query_vector = queries.data() + (i * dim);
 
-                        if (r == 0) {
-                            int hits = 0;
-                            for (int j = 0; j < k; j++) {
-                                int gt_id = ground_truth_idx[i][j];
-                                for (int res_id : results) {
-                                    if (gt_id == res_id) hits++;
+                            #pragma omp task firstprivate(i, r, query_vector)
+                            {
+                                std::vector<int> results = metaIndex.handle_query(
+                                    query_vector, i, k, mode, param
+                                );
+                                sem.release();
+
+                                if (r == 0) {
+                                    int hits = 0;
+                                    for (int j = 0; j < k; j++)
+                                        for (int res_id : results)
+                                            if (ground_truth_idx[i][j] == res_id) hits++;
+                                    per_query_recall[i].store(
+                                        static_cast<double>(hits) / static_cast<double>(k)
+                                    );
                                 }
                             }
-                            recall_sum += static_cast<double>(hits) / static_cast<double>(k);
                         }
                     }
+                    #pragma omp taskwait
                 }
+
+                double recall_sum = 0.0;
+                for (auto& v : per_query_recall) recall_sum += v.load();
                 double recall = recall_sum / static_cast<double>(num_queries);
 
                 // --- Throughput ---
                 double t_start = MPI_Wtime();
-                #pragma omp parallel for num_threads(NUM_COORD_THREADS) collapse(2)
-                for (int r = 0; r < num_runs; r++) {
-                    for (int i = 0; i < (int)num_queries; i++) {
-                        float* query_vector = queries.data() + (i * dim);
-                        metaIndex.handle_query(
-                            query_vector,
-                            i,
-                            k,
-                            mode,
-                            param
-                        );
+
+                #pragma omp parallel num_threads(num_coord_threads)
+                #pragma omp single
+                {
+                    for (int r = 0; r < num_runs; r++) {
+                        for (int i = 0; i < (int)num_queries; i++) {
+                            sem.acquire();
+                            float* query_vector = queries.data() + (i * dim);
+
+                            #pragma omp task firstprivate(i, query_vector)
+                            {
+                                metaIndex.handle_query(query_vector, i, k, mode, param);
+                                sem.release();
+                            }
+                        }
                     }
+                    #pragma omp taskwait
                 }
+
                 double t_end = MPI_Wtime();
                 double qps = (static_cast<double>(num_queries) * num_runs) / (t_end - t_start);
 
@@ -204,75 +226,83 @@ int main(int argc, char **argv) {
                 outfile.flush();
 
                 std::cout << "  recall@" << k << ": " << recall
-                        << ", qps: " << qps << "\n";
+                          << ", qps: " << qps << "\n";
             }
         }
 
-        // end communication from Coordinator side
-        comm.broadcast_termination(world_size, num_threads);
+        comm.broadcast_termination(world_size, 1);
 
     } else { // Executor
-        // std::string log_id;
-        // comm.recv_log_id(log_id);
-        
-        // Config config(argv[1], false, log_id);
 
-        // std::cout << "[Executor " << node << "] log_id: " << config.log_id << "\n";
         std::cout << "[Executor " << node << "] log_id: " << log_id << "\n";
         comm.recv_dataset_info(nvectors, dim);
-        std::cout << "[Executor " << node << "] Received dataset info: num vectors = " << nvectors << ", dimension = " << dim << "\n";
+        std::cout << "[Executor " << node << "] Received dataset info: num vectors = "
+                  << nvectors << ", dimension = " << dim << "\n";
 
         Executor subIndex(node, dim, comm, &logger);
 
         std::string output_dir = dataset_name + "_" + std::to_string(num_partitions);
-        std::string filename_prefix = output_dir + "/executor_" + std::to_string(node) + "_" + dataset_name + "_" + std::to_string(num_partitions);
+        std::string filename_prefix = output_dir + "/executor_" + std::to_string(node)
+                                    + "_" + dataset_name + "_" + std::to_string(num_partitions);
         subIndex.load(filename_prefix, ef_search);
 
         std::atomic<int> num_processed = 0;
+        std::queue<MessageHeader> work_queue;
+        std::mutex queue_mutex;
+        std::condition_variable cv;
         std::atomic<bool> end = false;
-        omp_set_num_threads(num_threads);
-        #pragma omp parallel
-        {
-            
-            int tid = omp_get_thread_num();
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(tid, &cpuset);
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-            while (!end) {
+        // Single dedicated receiver — no critical section contention
+        std::thread receiver([&]() {
+            while (true) {
                 MessageHeader header;
-                MPI_Status status;
+                comm.recv_header(header, 0);
 
-                #pragma omp critical
-                {
-                    comm.recv_header(header, 0);
-                    if (header.type == END_OF_COMMUNICATION) {
-                        end = true;
-                    }
+                if (header.type == END_OF_COMMUNICATION) {
+                    end = true;
+                    cv.notify_all();
+                    break;
                 }
 
-                if (end) break;
-    
                 if (header.type == SET_EF_SEARCH) {
                     subIndex.setEfSearch(header.size);
                     continue;
                 }
 
-                if (header.type == QUERY_BATCH_SEND) {
-                    subIndex.batch_search(header.size, k, header.tag);
-                    num_processed+= header.size;
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    work_queue.push(header);
+                }
+                cv.notify_one();
+            }
+        });
+
+        // Worker threads consume from the queue
+        #pragma omp parallel num_threads(num_threads - 1)
+        {
+            while (true) {
+                MessageHeader header;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    cv.wait(lock, [&]{ return !work_queue.empty() || end; });
+                    if (end && work_queue.empty()) break;
+                    header = work_queue.front();
+                    work_queue.pop();
                 }
 
-                if (header.type == QUERY_SEND) {
+                if (header.type == QUERY_BATCH_SEND) {
+                    subIndex.batch_search(header.size, k, header.tag);
+                    num_processed += header.size;
+                } else if (header.type == QUERY_SEND) {
                     subIndex.search(header.size, header.tag);
                     num_processed++;
                 }
-            
             }
         }
 
-        std::cout << "[Executor " << node << "] proccessed: " << num_processed << " queries\n";
+        receiver.join();
+
+        std::cout << "[Executor " << node << "] processed: " << num_processed << " queries\n";
     }
 
     MPI_Finalize();
