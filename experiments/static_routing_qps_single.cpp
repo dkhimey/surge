@@ -9,16 +9,15 @@
 
 #include <omp.h>
 
-#define NUM_COORD_THREADS 350  // OMP thread pool size; tune to match old sweet spot
-#define WINDOW_SIZE 512        // max in-flight queries; tune independently of thread count
 #define num_runs 3
 #define ef_search 200
 
 int main(int argc, char **argv) {
     int node, world_size;
 
-    if (argc != 6) {
-        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <mode> <param> <k>\n";
+    if (argc != 8) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <dataset> <num_partitions> <mode> <param> <k> <num_coord_threads> <window_size>\n";
         return 1;
     }
 
@@ -27,6 +26,8 @@ int main(int argc, char **argv) {
     std::string mode_str = argv[3];
     float param = std::stof(argv[4]);
     int k = std::stoi(argv[5]);
+    int num_coord_threads = std::stoi(argv[6]);
+    int window_size       = std::stoi(argv[7]);
 
     RoutingMode mode;
     if (mode_str == "branching") mode = RoutingMode::BranchingFactor;
@@ -69,6 +70,9 @@ int main(int argc, char **argv) {
     printf("Max threads: %d\n", omp_get_max_threads());
 
     if (node == 0) { // Coordinator
+
+        std::cout << "[Coordinator] num_coord_threads=" << num_coord_threads
+                  << " window_size=" << window_size << "\n";
 
         FileFormat format = getFileFormat(DATASETS[dataset_name]["base_file"]);
         std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
@@ -116,7 +120,7 @@ int main(int argc, char **argv) {
             std::mutex mutex_;
             std::condition_variable cv_;
             int count_;
-        } sem(WINDOW_SIZE);
+        } sem(window_size);
 
         // ------------------------------------------------------------------
         // Warmup phase: 3 passes, recall measured on first pass
@@ -124,7 +128,7 @@ int main(int argc, char **argv) {
         std::vector<std::atomic<double>> per_query_recall(num_queries);
         for (auto& v : per_query_recall) v.store(0.0);
 
-        #pragma omp parallel num_threads(NUM_COORD_THREADS)
+        #pragma omp parallel num_threads(num_coord_threads)
         #pragma omp single
         {
             for (int r = 0; r < 3; r++) {
@@ -165,7 +169,7 @@ int main(int argc, char **argv) {
         // ------------------------------------------------------------------
         double throughput_start = MPI_Wtime();
 
-        #pragma omp parallel num_threads(NUM_COORD_THREADS)
+        #pragma omp parallel num_threads(num_coord_threads)
         #pragma omp single
         {
             for (int r = 0; r < num_runs; r++) {
