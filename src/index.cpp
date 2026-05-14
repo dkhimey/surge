@@ -312,7 +312,7 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int 
 
 std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, float recall_target, float* dist) {
     // search with a recall target
-    size_t knn = std::min<size_t>(100, ncenters_);
+    size_t knn = std::min<size_t>(50, ncenters_);
     std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, knn);
 
     if (centers.empty()) {

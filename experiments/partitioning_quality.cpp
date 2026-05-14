@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
         // assign vectors to workers
         double start = MPI_Wtime();
         int num_threads = 32; //TODO: hard coded
-        bool log_partitions = true; //TODO: hard coded
+        bool log_partitions = false; //TODO: hard coded
         std::vector<int> counts_per_partition = metaIndex.distribute_vectors(
             DATASETS[dataset_name]["base_file"], 
             nvectors, 
