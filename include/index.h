@@ -47,7 +47,7 @@ public:
     // std::vector<size_t> getPartition(float* vec, int n = 1);
     // std::vector<size_t> getPartition(float* vec, int n = 1, float* dist = nullptr);
     
-    void distribute_vectors(
+    std::vector<int> distribute_vectors(
         const std::string& base_file, 
         int total_vectors, 
         bool log_partitions,
@@ -109,11 +109,20 @@ public:
     //     float* recall = nullptr
     // );
 
+    // std::vector<int> handle_query(
+    //     float* query_vector,
+    //     int query_idx,
+    //     size_t num_neighbors,
+    //     size_t branching_factor,
+    //     std::vector<std::atomic<int>>* executor_hits = nullptr
+    // );
+
     std::vector<int> handle_query(
         float* query_vector,
         int query_idx,
         size_t num_neighbors,
-        size_t branching_factor,
+        RoutingMode mode,
+        float param,
         std::vector<std::atomic<int>>* executor_hits = nullptr
     );
 
@@ -195,7 +204,7 @@ class Executor {
 public:
     Executor(int node_id, int dim, Communicator& comm, Log* logger = nullptr);
 
-    void receiveData(size_t num_vectors);
+    void receiveData(size_t nrecv_vecs);
     void setData(float* data, int* indices, size_t count);
     void build(
         int ef_construction,
@@ -210,6 +219,8 @@ public:
     void search(size_t k, int tag);
     void insert(int tag);
     void delete_vector(size_t label, int tag);
+
+    void batch_search(size_t num_queries, size_t k, int tag);
 
     void reBuild(
         int meta_size, 

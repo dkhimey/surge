@@ -394,7 +394,7 @@ std::vector<size_t> Coordinator::getPartitionsForDelete_(size_t label) {
     return std::vector<size_t>{partition};
 }
 
-void Coordinator::distribute_vectors(
+std::vector<int> Coordinator::distribute_vectors(
         const std::string& base_file, 
         int total_vectors, 
         bool log_partitions,
@@ -421,11 +421,11 @@ void Coordinator::distribute_vectors(
     for (auto& l : locks) omp_init_lock(&l);
 
     std::cout << "num_threads = " << num_threads << ", omp_get_max_threads = " << omp_get_max_threads() << "\n";
-
+    std::vector<int> counts_per_partition(num_partitions_, 0);
     #pragma omp parallel num_threads(num_threads)
     {
         int tid = omp_get_thread_num();
-        std::cout << "[Coordinator] Thread " << tid << " started for distributing vectors\n";
+        // std::cout << "[Coordinator] Thread " << tid << " started for distributing vectors\n";
         int thread_start = tid * vectors_per_thread;
         int thread_end = std::min(thread_start + vectors_per_thread, total_vectors);
 
@@ -467,6 +467,7 @@ void Coordinator::distribute_vectors(
                 MessageHeader header(VECTOR_SEND, vec_count);
                 {
                     omp_set_lock(&locks[p]);
+                    counts_per_partition[p-1] += vec_count;
                     MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, p, 0, MPI_COMM_WORLD);
                     MPI_Send(partition_vectors[p].data(), vec_count * dim_, MPI_FLOAT, p, 0, MPI_COMM_WORLD);
                     MPI_Send(partition_indices[p].data(), vec_count, MPI_INT, p, 0, MPI_COMM_WORLD);
@@ -480,6 +481,8 @@ void Coordinator::distribute_vectors(
         logger_->logPartitions(partition_assignments, true);
         logger_->logPartitionDists(partition_distances);
     }
+
+    return counts_per_partition;
 }
 
 std::pair<int, std::vector<int>> Coordinator::matchPartitions_(const std::vector<int>& part1, const std::vector<int>& part2) {
@@ -794,6 +797,8 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
 void Coordinator::save(const std::string& output_dir) {
     std::shared_lock lock(graph_mutex_);
     std::cout << "[Coordinator] Saving to: " << output_dir << "\n";
+    // make output dir if it doesn't exist
+    std::filesystem::create_directories(output_dir);
 
     std::string hnsw_filename = output_dir + "/metaHNSW.bin";
     meta_HNSW_->saveIndex(hnsw_filename);
@@ -876,14 +881,31 @@ std::vector<int> Coordinator::handle_query(
     float* query_vector,
     int query_idx,
     size_t num_neighbors,
-    size_t branching_factor,
+    RoutingMode mode,
+    float param,
     std::vector<std::atomic<int>>* executor_hits
 ) {
     if (!comm_) {
         throw std::runtime_error("[Coordinator] communicator not set");
     }
 
-    std::vector<size_t> executors = route_query(query_vector, branching_factor);
+    std::vector<size_t> executors;
+
+    switch (mode) {
+        case RoutingMode::BranchingFactor: {
+            executors = route_query(query_vector, param);
+            break;
+        }
+        case RoutingMode::NProbe: {
+            executors = route_query_nprobe(query_vector, param);
+            break;
+        }
+        case RoutingMode::RecallTarget: {
+            executors = route_query_recall_target(query_vector, param);
+            break;
+        }
+    }
+     
     if (executor_hits) {
         for (size_t idx : executors) (*executor_hits)[idx]++;
     }
@@ -1264,20 +1286,28 @@ void Executor::setData(float* data, int* indices, size_t count) {
     std::cout << "[Executor " << node_id_ << " ] Data set with " << count << " elements\n";
 }
 
-void Executor::receiveData(size_t num_vectors) {
-    size_t required_size = data_count_ + num_vectors;
-    local_vectors_.resize(required_size * dim_);
-    local_indices_.resize(required_size);
+void Executor::receiveData(size_t nrecv_vecs) {
+    size_t required_nvecs = data_count_ + nrecv_vecs;
+    if (local_vectors_.capacity() < required_nvecs * dim_)
+        local_vectors_.reserve(required_nvecs * dim_ * 2);
+    if (local_indices_.capacity() < required_nvecs)
+        local_indices_.reserve(required_nvecs * 2);
 
-    float* vec_recv_ptr = local_vectors_.data() + data_count_ * dim_;
+    // std::cout << "[Executor " << node_id_ << "] receiveData() reserved\n ";
+
+    local_vectors_.resize(required_nvecs * dim_);
+    local_indices_.resize(required_nvecs);
+
+    // std::cout << "[Executor " << node_id_ << "]--receiveData()-- Receiving " << nrecv_vecs << " vectors from coordinator\n";
+
+    float* vec_recv_ptr = local_vectors_.data() + (data_count_ * dim_);
     int* idx_recv_ptr = local_indices_.data() + data_count_;
-    comm_.receive_vector_data(local_vectors_, 
-                              local_indices_, 
-                              vec_recv_ptr, 
-                              idx_recv_ptr,
-                              num_vectors, dim_);
 
-    data_count_ += num_vectors;
+    comm_.receive_vector_data(vec_recv_ptr, 
+                              idx_recv_ptr,
+                              nrecv_vecs, dim_);
+
+    data_count_ += nrecv_vecs;
 
     data_ = local_vectors_.data();
     indices_ = local_indices_.data();
@@ -1814,6 +1844,30 @@ void Executor::search(size_t k, int tag) {
     }
 
     comm_.send_result(results, k, tag);
+}
+
+void Executor::batch_search(size_t num_queries, size_t k, int tag) {
+    float* query_vectors = new float[num_queries * dim_];
+
+    comm_.recv_vector_batch(query_vectors, num_queries, dim_, 0, tag);
+    int* results = new int[num_queries * k];
+
+    std::shared_lock lock(graph_mutex_);
+    #pragma omp parallel for
+    for (int i = 0; i < (int)num_queries; i++) {
+        float* query_vector = query_vectors + (i * dim_);
+        std::vector<std::pair<float, hnswlib::labeltype>> result = sub_HNSW_->searchKnnCloserFirst(query_vector, k);
+        for (int j = 0; j < (int)result.size(); j++) {
+            results[i * k + j] = result[j].second;
+        }
+    }
+
+    // void send_result_batch(const int* results, size_t num_queries, size_t num_neighbors, int tag)
+    comm_.send_result_batch(results, num_queries, k, tag);
+
+    delete[] query_vectors;
+    delete[] results;
+
 }
 
 void Executor::insert(int tag) {

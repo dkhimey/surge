@@ -40,14 +40,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
-    int nvectors = data_info.first;
-    int dim = data_info.second;
-
+    int nvectors, dim;
     printf("Max threads: %d\n", omp_get_max_threads());
 
     if (node == 0) { // Coordinator
         // take sample (just read in first sample_size elements, assume they are randomly distributed across file)
+        std::pair<int,int> data_info = get_dataset_info(DATASETS[dataset_name]["base_file"]);
+        int nvectors = data_info.first;
+        int dim = data_info.second;
+
+        comm.broadcast_dataset_info(nvectors, dim, world_size);
 
         size_t sample_size = 100000; //TODO: hard coded
 
@@ -68,7 +70,12 @@ int main(int argc, char **argv) {
         double start = MPI_Wtime();
         int num_threads = 32; //TODO: hard coded
         bool log_partitions = true; //TODO: hard coded
-        metaIndex.distribute_vectors(DATASETS[dataset_name]["base_file"], nvectors, log_partitions, num_threads);
+        std::vector<int> counts_per_partition = metaIndex.distribute_vectors(
+            DATASETS[dataset_name]["base_file"], 
+            nvectors, 
+            log_partitions, 
+            num_threads
+        );
         double end = MPI_Wtime();
 
         logger.partition_time = end - start;
@@ -80,9 +87,12 @@ int main(int argc, char **argv) {
         std::string meta_dir = dataset_name + "_" + std::to_string(num_partitions);
         metaIndex.save(meta_dir);
         logger.meta_index_path = meta_dir + "/metaHNSW.bin";
-        logger.saveControllerLog();
+        logger.saveControllerLog(counts_per_partition);
     } else {
         std::cout << "[Executor " << node << "] log_id: " << log_id << "\n";
+        comm.recv_dataset_info(nvectors, dim);
+        std::cout << "[Executor " << node << "] Received dataset info: num vectors = " << nvectors << ", dimension = " << dim << "\n";
+
         Executor subIndex(node, dim, comm, &logger);
 
         size_t num_recv = 0;
@@ -92,6 +102,7 @@ int main(int argc, char **argv) {
             // recieve header
             MessageHeader recv_header;
             comm.recv_header(recv_header, 0);
+            // std::cout << "[Executor " << node << "] Received header: type=" << recv_header.type << ", size=" << recv_header.size << "\n";
             if (recv_header.type == END_OF_COMMUNICATION) {
                 done = true;
             } else {
@@ -103,16 +114,22 @@ int main(int argc, char **argv) {
         }
 
         logger.num_elements = num_recv;
+        std::cout << "[Executor " << node << "] Total vectors received: " << num_recv << "\n";
         subIndex.build(
             200, // ef_construction, TODO: hard coded
             16, // M_sub, TODO: hard coded
-            8 // num_building_threads, TODO: hard coded
+            32 // num_building_threads, TODO: hard coded
         );
 
-        std::string filename = "executor_" + std::to_string(node) + "_" + dataset_name + "_" + std::to_string(num_partitions) + ".json";
-        logger.sub_index_path = subIndex.save(filename);
+        std::string output_dir = dataset_name + "_" + std::to_string(num_partitions);
+        std::filesystem::create_directories(output_dir);
+
+        std::string filename_prefix = output_dir + "/executor_" + std::to_string(node) + "_" + dataset_name + "_" + std::to_string(num_partitions);
+        logger.sub_index_path = subIndex.save(filename_prefix);
         logger.saveExecutorLog(node);
     }
 
     MPI_Finalize();
 }
+
+// mpirun -np 11 --rankfile rankfile.txt bin/partitioning_quality sift-500M 10

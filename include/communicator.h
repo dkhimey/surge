@@ -53,6 +53,14 @@ public:
         MPI_Send(vectors, num_vectors * dim, MPI_FLOAT, dest, tag, MPI_COMM_WORLD);
     }
 
+    void recv_vector_batch(float* vectors, size_t num_vectors, size_t dim, int source, int tag) {
+        MPI_Recv(vectors, num_vectors * dim, MPI_FLOAT, source, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    void send_result_batch(const int* results, size_t num_queries, size_t num_neighbors, int tag) {
+        MPI_Send(results, num_queries * num_neighbors, MPI_INT, 0, tag, MPI_COMM_WORLD);
+    }
+
     void send_result(const int* results, size_t num_neighbors, int tag) {
         MPI_Send(results, num_neighbors, MPI_INT, 0, tag, MPI_COMM_WORLD);
     }
@@ -138,20 +146,22 @@ public:
     }
 
     void receive_vector_data(
-        std::vector<float>& local_vectors, 
-        std::vector<int>& local_indices, 
         float* vec_recv_ptr,
         int* idx_recv_ptr,
         int to_recv,
         size_t dim
     ) {
+        // std::cout << "[Executor " << rank << "]--receive_vector_data()-- Expecting to receive data for " << to_recv << " vectors\n";
         MPI_Recv(vec_recv_ptr,
                 to_recv * dim,
                 MPI_FLOAT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
+        // std::cout << "[Executor " << rank << "]--receive_vector_data() 1-- Received vector data for " << to_recv << " vectors\n";
+
         MPI_Recv(idx_recv_ptr,
                 to_recv,
                 MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // std::cout << "[Executor " << rank << "]--receive_vector_data() 2-- Received index data for " << to_recv << " vectors\n";
     }
 
     void broadcast_HNSW(hnswlib::HierarchicalNSW<float>* meta_HNSW, int world_size) {
@@ -171,6 +181,19 @@ public:
         for (int i = 1; i < world_size; i++) {
             MPI_Send(partitions.data(), partitions.size(), MPI_INT, i, META_PARTITIONS_SEND, MPI_COMM_WORLD);
         }
+    }
+
+    void broadcast_dataset_info(int nvectors, int dim, int world_size) {
+        for (int i = 1; i < world_size; i++) {
+            MPI_Send(&nvectors, 1, MPI_INT, i, DATASET_INFO_SEND, MPI_COMM_WORLD);
+            MPI_Send(&dim, 1, MPI_INT, i, DATASET_INFO_SEND, MPI_COMM_WORLD);
+        }
+    }
+
+    void recv_dataset_info(int& nvectors, int& dim) {
+        MPI_Status status;
+        MPI_Recv(&nvectors, 1, MPI_INT, 0, DATASET_INFO_SEND, MPI_COMM_WORLD, &status);
+        MPI_Recv(&dim, 1, MPI_INT, 0, DATASET_INFO_SEND, MPI_COMM_WORLD, &status);
     }
 
     void recv_HNSW(

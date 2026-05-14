@@ -13,10 +13,10 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
 
     {"msturing-100M-clustered",
         {
-            {"base_file", "TODO"},
-            {"runbook", "TODO"},
-            {"query_file", "TODO"},
-            {"ground_truth_dir", "TODO"},
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100M-msturing-clustered.fbin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/msturing-100M-clustered_runbookfinal.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100000000/msturing-100M-clustered_runbookfinal.yaml"},
         }
     },
 
@@ -66,6 +66,17 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-30M-clustered/29998994/final_runbook.yaml"},
             {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuring-30M-clustered/clu_msturing30M_gt100"},
         }
+    },
+
+    {"msturing-1M",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_1000000.fbin"},
+            {"runbook", "TODO"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
+            {"ground_truth_dir", "TODO"},
+            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-1M.ibin"}
+        }
+
     }
 };
 
@@ -87,8 +98,13 @@ FileFormat getFileFormat(const std::string& filename) {
 }
 
 std::pair<int, int> get_dataset_info(const std::string& base_file) {
-    FileFormat format = getFileFormat(base_file);
     std::ifstream file(base_file, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "FATAL: cannot open dataset file: " << base_file << "\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    FileFormat format = getFileFormat(base_file);
     switch (format) {
         case BVECS:
         case FVECS: {
@@ -325,7 +341,7 @@ std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file says " << dim_in_file
+        std::cerr << "[Coordinator]: Dimension mismatch: file "<< filename << " says " << dim_in_file
                   << ", expected " << vector_dim << "\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
         return {};
@@ -373,7 +389,7 @@ std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file says " << dim_in_file
+        std::cerr << "[Coordinator]: Dimension mismatch: file " << filename << " says " << dim_in_file
                   << ", expected " << vector_dim << "\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
         return {};
@@ -421,7 +437,7 @@ std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int 
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file says " << dim_in_file
+        std::cerr << "[Coordinator]: Dimension mismatch: file " << filename << " says " << dim_in_file
                   << ", expected " << vector_dim << "\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
         return {};
