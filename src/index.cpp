@@ -312,7 +312,7 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int 
 
 std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, float recall_target, float* dist) {
     // search with a recall target
-    size_t knn = std::min<size_t>(100, ncenters_);
+    size_t knn = std::min<size_t>(50, ncenters_);
     std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, knn);
 
     if (centers.empty()) {
@@ -769,6 +769,9 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
     std::cout << "[Coordinator] size of partitions: " << size << "\n";
 
     this->ncenters_ = size;
+    this->num_partitions_ = static_cast<size_t>(
+        *std::max_element(partitions.begin(), partitions.end()) + 1
+    );
 
     std::cout << "[Coordinator] Loading centers from: " << centers_path << "\n";
     std::ifstream in2(centers_path, std::ios::binary);
