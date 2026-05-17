@@ -52,7 +52,8 @@ typedef enum {
     INSERT_BATCH_SUCCESS,
     DELETE_BATCH_SEND,
     DELETE_BATCH_SUCCESS,
-    DATASET_INFO_SEND
+    DATASET_INFO_SEND,
+    SIZE_REQUEST   // coordinator asks an executor for its current element count
 } MessageType;
 
 typedef struct MessageHeader {

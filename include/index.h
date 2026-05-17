@@ -40,6 +40,33 @@ public:
     void load(const std::string& dir_path, int ef_search);
     void save(const std::string& output_dir);
 
+    // ── Accessors for shared_batch_experiment ──────────────────────────────
+    // Expose routing state so the experiment can replicate it on all ranks.
+    hnswlib::HierarchicalNSW<float>* getMetaHNSW() { return meta_HNSW_; }
+    const std::vector<int>& getPartitions() const { return partitions; }
+    const std::unordered_map<int,int>& getLabelToCenter() const { return label_to_center_; }
+
+    // Two-phase, lock-minimal center updates for batch insert/delete steps.
+    // Phase 1 accumulates per-center sums in parallel; Phase 2 applies all
+    // updates under a single write lock.  Called by coordinator after the
+    // Allgatherv that populates label_to_center on all ranks.
+    void updateCentersForInsertBatch_(const std::vector<float>& vecs,
+                                      const std::vector<int>& center_ids);
+
+    // Check whether a rebuild is needed without executing it.  Runs
+    // rePartition, caches the result (new meta-HNSW, new partitions,
+    // serialised buffer).  Returns 0 = no rebuild, 1 = full, 2 = partial.
+    // Must be followed by doRebuildSimple() if the return value is non-zero.
+    int checkNeedRebuild(int full_threshold, int partial_threshold,
+                         int ef_construction, int M_meta);
+
+    // Execute the cached rebuild prepared by checkNeedRebuild().  Sends
+    // FULL/PARTIAL_REBUILD_REQUEST + meta-HNSW + partitions to every
+    // executor, waits for REBUILD_SUCCESS from each, then swaps the new
+    // meta-HNSW and partitions into the Coordinator's internal state.
+    // Safe to call only in serial (non-concurrent) rebuild scenarios.
+    void doRebuildSimple(int world_size);
+
     void load_gp(const std::string& prefix, int ef_search);
     void setEfSearch(int ef_search);
 
@@ -184,6 +211,12 @@ private:
     void updateCentersForDelete_(std::vector<float>& vec, int closest_center_label);
     void updateCentersForDeleteBatch_(const std::vector<float>& vecs, const std::vector<int>& closest_center_labels);
 
+    // Cached materials for the checkNeedRebuild / doRebuildSimple split.
+    hnswlib::HierarchicalNSW<float>* cached_new_meta_HNSW_  = nullptr;
+    std::vector<int>                 cached_new_partitions_;
+    std::vector<char>                cached_hnsw_buffer_;
+    int                              cached_rebuild_type_    = 0; // 0=none,1=full,2=partial
+
     // during insert, check if rebuild is already in progress, if so, just add to rebuild log
     std::atomic<bool> rebuild_pending_ = false; // indicates a rebuild must occur after the current one
     
@@ -218,7 +251,28 @@ public:
 
     void search(size_t k, int tag);
     void insert(int tag);
+    void insert_batch(size_t num_vecs, int tag);
     void delete_vector(size_t label, int tag);
+
+    // ── Direct (MPI-free) operations for shared_batch_experiment ──────────
+    // Insert a batch of vectors received via AllToAllV without going through
+    // the MPI message protocol.  Acquires an exclusive lock for the full batch.
+    void insertLocalBatch(const std::vector<float>& vecs,
+                          const std::vector<int>&   labels);
+
+    // Mark a single vector as deleted.  Silently ignores labels not present
+    // in this shard.  Uses a shared lock (markDelete is internally atomic).
+    void markDeleteLocal(int label);
+
+    // Search a batch of query vectors received via AllToAllV.  Returns one
+    // result vector per query; each result is sorted nearest-first.
+    std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>
+    searchLocalBatch(const std::vector<float>& queries,
+                     size_t                     num_queries,
+                     size_t                     k);
+
+    // Returns the number of active (non-deleted) elements in the sub-HNSW.
+    size_t getElementCount() const;
 
     void batch_search(size_t num_queries, size_t k, int tag);
 

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <functional>
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <unordered_set>
 #include <cmath>
@@ -228,6 +229,52 @@ void Coordinator::updateCentersForInsert_(float* vec, size_t label, size_t close
     }
 }
 
+void Coordinator::updateCentersForInsertBatch_(const std::vector<float>& vecs,
+                                               const std::vector<int>& center_ids) {
+    // Phase 1 – parallel accumulation.  Each OMP thread builds a thread-local
+    // map of (center_id → {sum_vector, count}).  No lock is held here.
+    const int n = static_cast<int>(center_ids.size());
+    using Accum = std::unordered_map<int, std::pair<std::vector<float>, int>>;
+    Accum global;
+
+    #pragma omp parallel
+    {
+        Accum local;
+
+        #pragma omp for nowait schedule(static)
+        for (int i = 0; i < n; i++) {
+            int cid = center_ids[i];
+            auto& [sum, cnt] = local[cid];
+            if (sum.empty()) sum.assign(dim_, 0.0f);
+            const float* v = vecs.data() + static_cast<size_t>(i) * dim_;
+            for (size_t d = 0; d < dim_; d++) sum[d] += v[d];
+            cnt++;
+        }
+
+        // Merge thread-local map into global under a critical section.
+        #pragma omp critical
+        for (auto& [cid, p] : local) {
+            auto& [lsum, lcnt] = p;
+            auto& [gsum, gcnt] = global[cid];
+            if (gsum.empty()) gsum.assign(dim_, 0.0f);
+            for (size_t d = 0; d < dim_; d++) gsum[d] += lsum[d];
+            gcnt += lcnt;
+        }
+    }
+
+    // Phase 2 – single write lock, one pass over only the touched centers.
+    std::unique_lock<std::shared_mutex> lk(center_mutex_);
+    for (auto& [cid, p] : global) {
+        auto& [sum, new_k] = p;
+        const int old_n  = center_counts_[cid];
+        const int total_n = old_n + new_k;
+        float* c = centers_.data() + static_cast<size_t>(cid) * dim_;
+        for (size_t d = 0; d < dim_; d++)
+            c[d] = (old_n * c[d] + sum[d]) / static_cast<float>(total_n);
+        center_counts_[cid] = total_n;
+    }
+}
+
 void Coordinator::updateCentersForDelete_(std::vector<float>& vec, int closest_center_label) {
     int closest_center_idx = closest_center_label * dim_;
 
@@ -243,21 +290,52 @@ void Coordinator::updateCentersForDelete_(std::vector<float>& vec, int closest_c
     }
 }
 
-void Coordinator::updateCentersForDeleteBatch_(const std::vector<float>& vecs, const std::vector<int>& closest_center_labels) {
-    // TODO: can parallelize or can compute the average vector and do a single update instead of multiple updates.
-    {
-        std::unique_lock lock(center_mutex_);
-        for (size_t i = 0; i < closest_center_labels.size(); i++) {
-            int closest_center_label = closest_center_labels[i];
+void Coordinator::updateCentersForDeleteBatch_(const std::vector<float>& vecs,
+                                               const std::vector<int>& closest_center_labels) {
+    // Phase 1 – parallel accumulation of deleted-vector sums per center.
+    const int n = static_cast<int>(closest_center_labels.size());
+    using Accum = std::unordered_map<int, std::pair<std::vector<float>, int>>;
+    Accum global;
 
-            int closest_center_idx = closest_center_label * dim_;
-            int count = center_counts_[closest_center_label];
-            for (int d = 0; d < dim_; d++) {
-                float orig_center_d = centers_[closest_center_idx + d];
-                centers_[closest_center_idx + d] = (orig_center_d * count - vecs[i * dim_ + d]) / (count - 1);
-            }
-            center_counts_[closest_center_label]--;
+    #pragma omp parallel
+    {
+        Accum local;
+
+        #pragma omp for nowait schedule(static)
+        for (int i = 0; i < n; i++) {
+            int cid = closest_center_labels[i];
+            auto& [sum, cnt] = local[cid];
+            if (sum.empty()) sum.assign(dim_, 0.0f);
+            const float* v = vecs.data() + static_cast<size_t>(i) * dim_;
+            for (size_t d = 0; d < dim_; d++) sum[d] += v[d];
+            cnt++;
         }
+
+        #pragma omp critical
+        for (auto& [cid, p] : local) {
+            auto& [lsum, lcnt] = p;
+            auto& [gsum, gcnt] = global[cid];
+            if (gsum.empty()) gsum.assign(dim_, 0.0f);
+            for (size_t d = 0; d < dim_; d++) gsum[d] += lsum[d];
+            gcnt += lcnt;
+        }
+    }
+
+    // Phase 2 – single write lock, subtract accumulated sums.
+    std::unique_lock<std::shared_mutex> lk(center_mutex_);
+    for (auto& [cid, p] : global) {
+        auto& [sum, del_k] = p;
+        const int old_n = center_counts_[cid];
+        const int new_n = old_n - del_k;
+        float* c = centers_.data() + static_cast<size_t>(cid) * dim_;
+        if (new_n > 0) {
+            for (size_t d = 0; d < dim_; d++)
+                c[d] = (old_n * c[d] - sum[d]) / static_cast<float>(new_n);
+        }
+        // If new_n == 0 the center is now empty; leave coordinates as-is.
+        // The meta-HNSW still routes to it but it will receive no further
+        // vectors until the next rebuild reassigns it.
+        center_counts_[cid] = std::max(new_n, 0);
     }
 }
 
@@ -713,9 +791,105 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
         return reBuild(world_size, full_threshold, partial_threshold);
     }
 
-    if (rebuild_type == FULL_REBUILD_REQUEST) 
+    if (rebuild_type == FULL_REBUILD_REQUEST)
         return 1;
     return 2;
+}
+
+// ── checkNeedRebuild ─────────────────────────────────────────────────────────
+// Runs rePartition, caches the result, and returns the rebuild type without
+// sending any MPI messages or modifying internal state.  Returns 0 if no
+// rebuild is needed, 1 for a full rebuild, 2 for a partial rebuild.
+// Must be followed by doRebuildSimple() when the return value is non-zero.
+int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
+                                   int ef_construction, int M_meta) {
+    // Discard any stale cached rebuild from a previous call.
+    if (cached_new_meta_HNSW_) {
+        delete cached_new_meta_HNSW_;
+        cached_new_meta_HNSW_ = nullptr;
+    }
+    cached_new_partitions_.clear();
+    cached_hnsw_buffer_.clear();
+    cached_rebuild_type_ = 0;
+
+    if (full_threshold >= ncenters_ ||
+        partial_threshold >= ncenters_) {
+        return 0;
+    }
+    hnswlib::HierarchicalNSW<float>* new_meta = nullptr;
+    std::vector<int>                 new_parts;
+    const int to_move = rePartition(new_parts, new_meta, ef_construction, M_meta);
+
+    // No rebuild needed: to_move is below both thresholds.
+    // A threshold >= ncenters effectively disables that rebuild type.
+    // A threshold of 0 triggers a rebuild on every check.
+    if (to_move < full_threshold && to_move < partial_threshold) {
+        delete new_meta;
+        return 0;
+    }
+
+    // Cache materials needed for doRebuildSimple().
+    cached_new_meta_HNSW_    = new_meta;
+    cached_new_partitions_   = std::move(new_parts);
+
+    cached_new_meta_HNSW_->saveIndex("tmp_hnsw.bin");
+    {
+        std::ifstream f("tmp_hnsw.bin", std::ios::binary);
+        cached_hnsw_buffer_.assign(std::istreambuf_iterator<char>(f), {});
+    }
+
+    cached_rebuild_type_ = (to_move >= full_threshold) ? 1 : 2;
+    return cached_rebuild_type_;
+}
+
+// ── doRebuildSimple ──────────────────────────────────────────────────────────
+// Executes the rebuild prepared by checkNeedRebuild().  Sends the appropriate
+// FULL/PARTIAL_REBUILD_REQUEST header + serialised meta-HNSW + new partitions
+// to every executor, then blocks until each replies with REBUILD_SUCCESS.
+// Finally swaps the new meta-HNSW and partitions into the Coordinator's
+// internal state.  Safe only in serial (non-concurrent) contexts; it does not
+// update rebuild_state or drain the insert/delete logs.
+void Coordinator::doRebuildSimple(int world_size) {
+    assert(cached_new_meta_HNSW_ != nullptr && "doRebuildSimple called without a cached rebuild");
+
+    const MessageType rebuild_type = (cached_rebuild_type_ == 1)
+                                     ? FULL_REBUILD_REQUEST
+                                     : PARTIAL_REBUILD_REQUEST;
+    const int meta_size = static_cast<int>(cached_hnsw_buffer_.size());
+
+    // Send header + HNSW bytes + partitions to every executor.
+    for (int i = 1; i < world_size; i++) {
+        MessageHeader hdr;
+        hdr.type = rebuild_type;
+        hdr.size = static_cast<size_t>(meta_size);
+        hdr.tag  = 0;
+        MPI_Send(&hdr, sizeof(MessageHeader), MPI_BYTE, i, 0, MPI_COMM_WORLD);
+        MPI_Send(cached_hnsw_buffer_.data(), meta_size, MPI_BYTE,
+                 i, META_HNSW_SEND, MPI_COMM_WORLD);
+        MPI_Send(cached_new_partitions_.data(), static_cast<int>(ncenters_), MPI_INT,
+                 i, META_PARTITIONS_SEND, MPI_COMM_WORLD);
+    }
+
+    // Wait for REBUILD_SUCCESS from every executor.
+    for (int i = 1; i < world_size; i++) {
+        MessageHeader resp;
+        MPI_Recv(&resp, sizeof(MessageHeader), MPI_BYTE,
+                 i, REBUILD_SUCCESS, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    // Swap in the new meta-HNSW and partitions.
+    {
+        std::unique_lock<std::shared_mutex> lk(graph_mutex_);
+        if (meta_HNSW_) delete meta_HNSW_;
+        meta_HNSW_ = cached_new_meta_HNSW_;
+        partitions  = cached_new_partitions_;
+    }
+
+    // Clear the cache.
+    cached_new_meta_HNSW_ = nullptr;
+    cached_new_partitions_.clear();
+    cached_hnsw_buffer_.clear();
+    cached_rebuild_type_ = 0;
 }
 
 void Coordinator::load_gp(const std::string& prefix, int ef_search) {
@@ -1871,6 +2045,101 @@ void Executor::batch_search(size_t num_queries, size_t k, int tag) {
     delete[] query_vectors;
     delete[] results;
 
+}
+
+size_t Executor::getElementCount() const {
+    std::shared_lock lock(graph_mutex_);
+    // cur_element_count includes soft-deleted entries; subtract them for the
+    // live count.  Both accessors are thread-safe atomics in hnswlib.
+    size_t total   = sub_HNSW_->getCurrentElementCount();
+    size_t deleted = sub_HNSW_->getDeletedCount();
+    return (total > deleted) ? (total - deleted) : 0;
+}
+
+// ── insertLocalBatch ─────────────────────────────────────────────────────────
+// Insert a batch of vectors (received via AllToAllV in shared_batch_experiment)
+// directly into the local sub-HNSW without going through the MPI message
+// protocol.  Resizes the index if capacity would be exceeded.
+void Executor::insertLocalBatch(const std::vector<float>& vecs,
+                                const std::vector<int>&   labels) {
+    if (labels.empty()) return;
+    const size_t incoming = labels.size();
+
+    std::unique_lock<std::shared_mutex> lk(graph_mutex_);
+    const size_t current = sub_HNSW_->getCurrentElementCount();
+    if (current + incoming > sub_HNSW_->getMaxElements()) {
+        const size_t new_max = std::max(
+            current + incoming,
+            sub_HNSW_->getMaxElements() + sub_HNSW_->getMaxElements() / 2);
+        sub_HNSW_->resizeIndex(new_max);
+    }
+    for (size_t i = 0; i < incoming; i++)
+        sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i]);
+}
+
+// ── markDeleteLocal ──────────────────────────────────────────────────────────
+// Mark a single vector deleted without MPI.  Ignores labels not present in
+// this shard (the label may have been routed to a different executor).
+void Executor::markDeleteLocal(int label) {
+    std::unique_lock<std::shared_mutex> lk(graph_mutex_);
+    try {
+        sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(label));
+    } catch (...) {
+        // Label not found in this shard – silently skip.
+    }
+}
+
+// ── searchLocalBatch ─────────────────────────────────────────────────────────
+// Search a batch of query vectors (received via AllToAllV phase-1) and return
+// results without MPI.  Each result vector is sorted nearest-first.
+std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>
+Executor::searchLocalBatch(const std::vector<float>& queries,
+                            size_t                     num_queries,
+                            size_t                     k) {
+    std::vector<std::vector<std::pair<float, hnswlib::labeltype>>> results(num_queries);
+    if (num_queries == 0 || sub_HNSW_->getCurrentElementCount() == 0)
+        return results;
+
+    const size_t k_eff = std::min(k, sub_HNSW_->getCurrentElementCount());
+
+    std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_queries; i++) {
+        const float* q = queries.data() + i * dim_;
+        auto pq = sub_HNSW_->searchKnn(q, k_eff);
+        auto& res = results[i];
+        res.reserve(pq.size());
+        // searchKnn returns a max-heap (farthest on top); pop to get all, then
+        // reverse so the result vector is sorted nearest-first.
+        while (!pq.empty()) { res.push_back(pq.top()); pq.pop(); }
+        std::reverse(res.begin(), res.end());
+    }
+    return results;
+}
+
+void Executor::insert_batch(size_t num_vecs, int tag) {
+    // Receive the vector data and labels sent by Coordinator::handle_inserts.
+    // The coordinator sends: num_vecs*dim floats (tag), then num_vecs ints (tag).
+    std::vector<float> vecs(num_vecs * dim_);
+    MPI_Recv(vecs.data(), num_vecs * dim_, MPI_FLOAT, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    std::vector<int> labels(num_vecs);
+    MPI_Recv(labels.data(), num_vecs, MPI_INT, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    // Resize if needed, then insert all vectors.
+    {
+        std::unique_lock write_lock(graph_mutex_);
+        size_t current = sub_HNSW_->getCurrentElementCount();
+        if (current + num_vecs > sub_HNSW_->getMaxElements()) {
+            sub_HNSW_->resizeIndex((current + num_vecs) * 2);
+        }
+        for (size_t i = 0; i < num_vecs; i++) {
+            sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i]);
+        }
+    }
+
+    comm_.send_ack(INSERT_BATCH_SUCCESS, 0, tag);
 }
 
 void Executor::insert(int tag) {
