@@ -229,7 +229,7 @@ void Coordinator::updateCentersForInsert_(float* vec, size_t label, size_t close
     }
 }
 
-void Coordinator::updateCentersForInsertBatch_(const std::vector<float>& vecs,
+void Coordinator::updateCentersForInsertBatch(const std::vector<float>& vecs,
                                                const std::vector<int>& center_ids) {
     // Phase 1 – parallel accumulation.  Each OMP thread builds a thread-local
     // map of (center_id → {sum_vector, count}).  No lock is held here.
@@ -290,7 +290,7 @@ void Coordinator::updateCentersForDelete_(std::vector<float>& vec, int closest_c
     }
 }
 
-void Coordinator::updateCentersForDeleteBatch_(const std::vector<float>& vecs,
+void Coordinator::updateCentersForDeleteBatch(const std::vector<float>& vecs,
                                                const std::vector<int>& closest_center_labels) {
     // Phase 1 – parallel accumulation of deleted-vector sums per center.
     const int n = static_cast<int>(closest_center_labels.size());
@@ -1411,9 +1411,9 @@ void Coordinator::handle_deletes(const std::vector<int>& labels, int world_size)
 
         comm_->recv_delete_batch_results(per_executor_vecs[idx].data(), dim_, idx, tag);
 
-        updateCentersForDeleteBatch_(per_executor_vecs[idx], per_executor_centerids[idx]);
+        updateCentersForDeleteBatch(per_executor_vecs[idx], per_executor_centerids[idx]);
         // two options: run in the parallel loop per executor, 
-        // or aggregate all vectors and run a single updateCentersForDeleteBatch_ after the loop.
+        // or aggregate all vectors and run a single updateCentersForDeleteBatch after the loop.
         // - requires sorting received vectors by label
     }
     

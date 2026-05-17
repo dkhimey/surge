@@ -22,7 +22,7 @@
 //           i%world_size subset via local routing_hnsw; Phase-1 Alltoallv
 //           distributes (label,vec) pairs to target executor shards; executors
 //           call insertLocalBatch; MPI_Allgatherv syncs label_to_center;
-//           coordinator calls updateCentersForInsertBatch_.
+//           coordinator calls updateCentersForInsertBatch.
 //
 //  DELETE : all ranks scan the delete range; each rank marks deleted labels it
 //           owns (via routing_partitions + label_to_center); all ranks erase
@@ -46,7 +46,7 @@
 //
 // ─── Center consistency ──────────────────────────────────────────────────────
 //  centers_[] and center_counts_[] live only on the coordinator (Coordinator
-//  object).  They are kept current via updateCentersForInsertBatch_ /
+//  object).  They are kept current via updateCentersForInsertBatch /
 //  updateCentersForDeleteBatch_ after every step, using the full batch vectors
 //  read from shared storage and the Allgatherv-synchronised label_to_center.
 //
@@ -515,7 +515,7 @@ int main(int argc, char** argv)
                     std::vector<int> cids(n_insert);
                     for (int i = 0; i < n_insert; i++)
                         cids[i] = label_to_center[step.start + i];
-                    metaIndex.updateCentersForInsertBatch_(batch, cids);
+                    metaIndex.updateCentersForInsertBatch(batch, cids);
                 }
 
                 // Rebuild check.
@@ -586,7 +586,7 @@ int main(int argc, char** argv)
                         valid_cids.push_back(del_center_ids[i]);
                     }
                     if (!valid_cids.empty())
-                        metaIndex.updateCentersForDeleteBatch_(valid_vecs, valid_cids);
+                        metaIndex.updateCentersForDeleteBatch(valid_vecs, valid_cids);
                 }
 
                 // Rebuild check.

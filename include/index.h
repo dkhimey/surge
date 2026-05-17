@@ -50,9 +50,11 @@ public:
     // Phase 1 accumulates per-center sums in parallel; Phase 2 applies all
     // updates under a single write lock.  Called by coordinator after the
     // Allgatherv that populates label_to_center on all ranks.
-    void updateCentersForInsertBatch_(const std::vector<float>& vecs,
+    void updateCentersForInsertBatch(const std::vector<float>& vecs,
                                       const std::vector<int>& center_ids);
 
+    void updateCentersForDeleteBatch(const std::vector<float>& vecs, 
+                                     const std::vector<int>& closest_center_labels);
     // Check whether a rebuild is needed without executing it.  Runs
     // rePartition, caches the result (new meta-HNSW, new partitions,
     // serialised buffer).  Returns 0 = no rebuild, 1 = full, 2 = partial.
@@ -209,7 +211,6 @@ private:
     std::vector<size_t> convertCentersToPartitions_(const std::vector<std::pair<float, hnswlib::labeltype>>& centers, float* dist);
     void updateCentersForInsert_(float* vec, size_t label, size_t closest_center_label);
     void updateCentersForDelete_(std::vector<float>& vec, int closest_center_label);
-    void updateCentersForDeleteBatch_(const std::vector<float>& vecs, const std::vector<int>& closest_center_labels);
 
     // Cached materials for the checkNeedRebuild / doRebuildSimple split.
     hnswlib::HierarchicalNSW<float>* cached_new_meta_HNSW_  = nullptr;
