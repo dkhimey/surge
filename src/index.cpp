@@ -849,12 +849,14 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
 // Finally swaps the new meta-HNSW and partitions into the Coordinator's
 // internal state.  Safe only in serial (non-concurrent) contexts; it does not
 // update rebuild_state or drain the insert/delete logs.
-void Coordinator::doRebuildSimple(int world_size) {
+void Coordinator::doRebuildSimple(int world_size, bool incremental) {
     assert(cached_new_meta_HNSW_ != nullptr && "doRebuildSimple called without a cached rebuild");
 
-    const MessageType rebuild_type = (cached_rebuild_type_ == 1)
-                                     ? FULL_REBUILD_REQUEST
-                                     : PARTIAL_REBUILD_REQUEST;
+    const MessageType rebuild_type = incremental
+                                     ? INCREMENTAL_REBUILD_REQUEST
+                                     : (cached_rebuild_type_ == 1)
+                                           ? FULL_REBUILD_REQUEST
+                                           : PARTIAL_REBUILD_REQUEST;
     const int meta_size = static_cast<int>(cached_hnsw_buffer_.size());
 
     // Send header + HNSW bytes + partitions to every executor.

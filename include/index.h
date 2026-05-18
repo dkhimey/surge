@@ -67,7 +67,7 @@ public:
     // executor, waits for REBUILD_SUCCESS from each, then swaps the new
     // meta-HNSW and partitions into the Coordinator's internal state.
     // Safe to call only in serial (non-concurrent) rebuild scenarios.
-    void doRebuildSimple(int world_size);
+    void doRebuildSimple(int world_size, bool incremental = false);
 
     void load_gp(const std::string& prefix, int ef_search);
     void setEfSearch(int ef_search);

@@ -36,6 +36,7 @@ typedef enum {
     END_OF_COMMUNICATION,
     PARTIAL_REBUILD_REQUEST,
     FULL_REBUILD_REQUEST,
+    INCREMENTAL_REBUILD_REQUEST,
     CHECKPOINT_REQUEST,
     META_HNSW_SEND,
     META_PARTITIONS_SEND,
@@ -471,6 +472,7 @@ typedef struct Log {
 
         std::string type;
         if (rebuild_type == FULL_REBUILD_REQUEST) type = "FULL REBUILD";
+        else if (rebuild_type == INCREMENTAL_REBUILD_REQUEST) type = "INCREMENTAL REBUILD";
         else type = "PARTIAL REBUILD";
 
         std::cout << "[Coordinator] - rebuild type: " << type << "\n";

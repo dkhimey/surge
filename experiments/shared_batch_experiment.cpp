@@ -351,21 +351,26 @@ static void bcastRoutingState(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    if (argc != 9) {
+    if (argc < 9 || argc > 10) {
         std::cerr
             << "Usage: " << argv[0]
             << " <dataset> <num_partitions>"
             << " <full_threshold>"
             << " <query_mode> <query_param> <k>"
-            << " <gt_prefix> <output_file>\n"
+            << " <gt_prefix> <output_file>"
+            << " [rebuild_mode]\n"
             << "\n"
-            << "  full_threshold : min centers to migrate to trigger a full rebuild;\n"
+            << "  full_threshold : min centers to migrate to trigger a rebuild;\n"
             << "                   set >= ncenters (default " << NCENTERS << ") to disable\n"
             << "  query_mode     : BranchingFactor | NProbe | RecallTarget\n"
             << "  query_param    : branching factor (int), nprobe (int),"
                " or recall target (float in [0,1])\n"
             << "  gt_prefix      : directory with per-step GT files (step<N>.gt100),"
-               " or \"\" to use only the static GT\n";
+               " or \"\" to use only the static GT\n"
+            << "  rebuild_mode   : \"full\" (default) or \"incremental\"\n"
+            << "                   incremental: mark-delete departing elements and\n"
+            << "                   insert arriving ones into the existing local index\n"
+            << "                   instead of rebuilding it from scratch\n";
         return 1;
     }
 
@@ -381,6 +386,8 @@ int main(int argc, char** argv)
     const int         k                  = std::stoi(argv[6]);
     const std::string gt_prefix          = argv[7];
     const std::string output_file        = argv[8];
+    const bool        incremental_rebuild = (argc == 10 &&
+                                             std::string(argv[9]) == "incremental");
 
     const RoutingMode query_mode = parse_routing_mode(query_mode_str);
 
@@ -653,10 +660,11 @@ int main(int argc, char** argv)
                     full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 if (rb_type > 0) {
-                    metaIndex.doRebuildSimple(world_size);
+                    metaIndex.doRebuildSimple(world_size, incremental_rebuild);
                     sync_routing_after_rebuild();
                     std::cout << "[Shared] Step " << step.step_num
-                              << "  rebuild type=" << rb_type << "\n";
+                              << "  rebuild type=" << rb_type
+                              << (incremental_rebuild ? " (incremental)" : " (full)") << "\n";
                 }
 
                 const double throughput = (max_t > 0.0)
@@ -724,10 +732,11 @@ int main(int argc, char** argv)
                     full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 if (rb_type > 0) {
-                    metaIndex.doRebuildSimple(world_size);
+                    metaIndex.doRebuildSimple(world_size, incremental_rebuild);
                     sync_routing_after_rebuild();
                     std::cout << "[Shared] Step " << step.step_num
-                              << "  rebuild type=" << rb_type << "\n";
+                              << "  rebuild type=" << rb_type
+                              << (incremental_rebuild ? " (incremental)" : " (full)") << "\n";
                 }
 
                 const double throughput = (max_t > 0.0)
@@ -1061,15 +1070,21 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                // Rebuild (full only — partial rebuilds are not used in this experiment).
+                // Rebuild dispatch: full or incremental depending on header type.
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 if (rb_type > 0) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
-                                     world_size, EF_CONSTRUCTION, M_SUB,
-                                     NUM_BUILDING_THREADS);
+                    if (hdr.type == INCREMENTAL_REBUILD_REQUEST) {
+                        subIndex.reBuildReplace(static_cast<int>(hdr.size), NCENTERS,
+                                                world_size, EF_CONSTRUCTION,
+                                                NUM_BUILDING_THREADS);
+                    } else {
+                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                                         world_size, EF_CONSTRUCTION, M_SUB,
+                                         NUM_BUILDING_THREADS);
+                    }
                     // Sync updated routing state.
                     bcastRoutingState(rank, dim,
                                       nullptr, nullptr, nullptr,
@@ -1120,15 +1135,21 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                // Rebuild (full only).
+                // Rebuild dispatch: full or incremental depending on header type.
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 if (rb_type > 0) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
-                                     world_size, EF_CONSTRUCTION, M_SUB,
-                                     NUM_BUILDING_THREADS);
+                    if (hdr.type == INCREMENTAL_REBUILD_REQUEST) {
+                        subIndex.reBuildReplace(static_cast<int>(hdr.size), NCENTERS,
+                                                world_size, EF_CONSTRUCTION,
+                                                NUM_BUILDING_THREADS);
+                    } else {
+                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                                         world_size, EF_CONSTRUCTION, M_SUB,
+                                         NUM_BUILDING_THREADS);
+                    }
                     bcastRoutingState(rank, dim,
                                       nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
