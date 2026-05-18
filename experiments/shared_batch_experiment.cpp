@@ -39,10 +39,12 @@
 //
 //  REBUILD: coordinator calls checkNeedRebuild (runs rePartition, caches
 //           result), broadcasts rb_type to all ranks.  If non-zero: coordinator
-//           calls doRebuildSimple (sends FULL/PARTIAL_REBUILD_REQUEST to
-//           executors, waits for REBUILD_SUCCESS); executors receive the header
-//           and call subIndex.reBuild / partialReBuild.  All ranks then sync
-//           updated routing_hnsw + routing_partitions via MPI_Bcast.
+//           calls doRebuildSimple (sends FULL_REBUILD_REQUEST to executors,
+//           waits for REBUILD_SUCCESS); executors receive the header and call
+//           subIndex.reBuild.  All ranks then sync updated routing_hnsw +
+//           routing_partitions via MPI_Bcast.
+//           Partial rebuilds are not used; partial_threshold is set equal to
+//           full_threshold so only full rebuilds can trigger.
 //
 // ─── Center consistency ──────────────────────────────────────────────────────
 //  centers_[] and center_counts_[] live only on the coordinator (Coordinator
@@ -62,11 +64,13 @@
 //
 // ─── Usage ───────────────────────────────────────────────────────────────────
 //  mpirun -np <P+1> ./shared_batch_experiment \
-//      <dataset> <num_partitions> <full_threshold> <partial_threshold> \
+//      <dataset> <num_partitions> <full_threshold> \
 //      <nprobe> <k> <gt_prefix> <output_file>
 //
-//  nprobe      : number of nearest centroid clusters to probe per query
-//  gt_prefix   : directory containing per-step GT files, or "" for static GT
+//  full_threshold : min centers to migrate to trigger a full rebuild;
+//                   set >= ncenters to disable rebuilds entirely
+//  nprobe         : number of nearest centroid clusters to probe per query
+//  gt_prefix      : directory containing per-step GT files, or "" for static GT
 //
 // ─── Output CSV columns ──────────────────────────────────────────────────────
 //  step, operation, range_start, range_end,
@@ -248,30 +252,33 @@ static void bcastRoutingState(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    if (argc != 9) {
+    if (argc != 8) {
         std::cerr
             << "Usage: " << argv[0]
             << " <dataset> <num_partitions>"
-            << " <full_threshold> <partial_threshold>"
+            << " <full_threshold>"
             << " <nprobe> <k>"
             << " <gt_prefix> <output_file>\n"
             << "\n"
-            << "  nprobe     : nearest centroid clusters probed per query\n"
-            << "  gt_prefix  : directory with per-step GT files (step<N>.gt100),"
-               " or \"\" to use only the static GT\n"
-            << "  full/partial_threshold : min centers to migrate to trigger rebuild;"
-               " both 0 disables maintenance\n";
+            << "  full_threshold : min centers to migrate to trigger a full rebuild;\n"
+            << "                   set >= ncenters (default " << NCENTERS << ") to disable\n"
+            << "  nprobe         : nearest centroid clusters probed per query\n"
+            << "  gt_prefix      : directory with per-step GT files (step<N>.gt100),"
+               " or \"\" to use only the static GT\n";
         return 1;
     }
 
-    const std::string dataset_name      = argv[1];
-    const int         num_partitions    = std::stoi(argv[2]);
-    const int         full_threshold    = std::stoi(argv[3]);
-    const int         partial_threshold = std::stoi(argv[4]);
-    const int         nprobe            = std::stoi(argv[5]);
-    const int         k                 = std::stoi(argv[6]);
-    const std::string gt_prefix         = argv[7];
-    const std::string output_file       = argv[8];
+    const std::string dataset_name   = argv[1];
+    const int         num_partitions = std::stoi(argv[2]);
+    const int         full_threshold = std::stoi(argv[3]);
+    // Partial rebuilds are disabled in this experiment: set partial_threshold
+    // equal to full_threshold so the condition (to_move >= partial_threshold)
+    // is never strictly weaker than the full-rebuild condition.
+    const int         partial_threshold = full_threshold;
+    const int         nprobe          = std::stoi(argv[4]);
+    const int         k               = std::stoi(argv[5]);
+    const std::string gt_prefix       = argv[6];
+    const std::string output_file     = argv[7];
 
     // ── MPI init ─────────────────────────────────────────────────────────────
     int provided;
@@ -887,20 +894,15 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                // Rebuild.
+                // Rebuild (full only — partial rebuilds are not used in this experiment).
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 if (rb_type > 0) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    if (hdr.type == FULL_REBUILD_REQUEST)
-                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
-                                         world_size, EF_CONSTRUCTION, M_SUB,
-                                         NUM_BUILDING_THREADS);
-                    else
-                        subIndex.partialReBuild(static_cast<int>(hdr.size), NCENTERS,
-                                                world_size, EF_CONSTRUCTION,
-                                                NUM_BUILDING_THREADS);
+                    subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                                     world_size, EF_CONSTRUCTION, M_SUB,
+                                     NUM_BUILDING_THREADS);
                     // Sync updated routing state.
                     bcastRoutingState(rank, dim,
                                       nullptr, nullptr, nullptr,
@@ -949,20 +951,15 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                // Rebuild.
+                // Rebuild (full only).
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 if (rb_type > 0) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    if (hdr.type == FULL_REBUILD_REQUEST)
-                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
-                                         world_size, EF_CONSTRUCTION, M_SUB,
-                                         NUM_BUILDING_THREADS);
-                    else
-                        subIndex.partialReBuild(static_cast<int>(hdr.size), NCENTERS,
-                                                world_size, EF_CONSTRUCTION,
-                                                NUM_BUILDING_THREADS);
+                    subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                                     world_size, EF_CONSTRUCTION, M_SUB,
+                                     NUM_BUILDING_THREADS);
                     bcastRoutingState(rank, dim,
                                       nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
