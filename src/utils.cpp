@@ -5,7 +5,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
     {"bigann-100M-clustered",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/bigann-clustered/bigann-100M-clustered.u8bin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-clustered/runbook-bigann-100M.yaml "},
+            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-clustered/runbook-bigann-100M.yaml"},
             {"query_file", "/dataset/big-ann-benchmarks/data/bigann-clustered/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-clustered/100000000/runbook-bigann-100M.yaml"},
         }
