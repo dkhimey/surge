@@ -595,7 +595,8 @@ std::pair<int, std::vector<int>> Coordinator::matchPartitions_(const std::vector
     return {ncenters_ - score, assignment};
 }
 
-int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::HierarchicalNSW<float>*& new_meta_HNSW, int ef_construction, int M_meta) {
+int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::HierarchicalNSW<float>*& new_meta_HNSW, int ef_construction, int M_meta,
+                              double* out_hnsw_s, double* out_bottom_s, double* out_kaffpa_s, double* out_relabel_s) {
     double start = MPI_Wtime();
     new_meta_HNSW = new hnswlib::HierarchicalNSW<float>(space_, ncenters_, M_meta, ef_construction);
     {
@@ -640,6 +641,11 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     double partition_relabel = end-start;
 
     logger_->logRepartition(hnsw_time, bottom_layer, partition_time, partition_relabel);
+
+    if (out_hnsw_s)    *out_hnsw_s    = hnsw_time;
+    if (out_bottom_s)  *out_bottom_s  = bottom_layer;
+    if (out_kaffpa_s)  *out_kaffpa_s  = partition_time;
+    if (out_relabel_s) *out_relabel_s = partition_relabel;
 
     return to_move;
 }
@@ -810,15 +816,25 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
     }
     cached_new_partitions_.clear();
     cached_hnsw_buffer_.clear();
-    cached_rebuild_type_ = 0;
+    cached_rebuild_type_    = 0;
+    cached_elements_moved_  = 0;
+    cached_centers_moved_   = 0;
+    cached_repart_hnsw_s_   = 0.0;
+    cached_repart_bottom_s_ = 0.0;
+    cached_repart_kaffpa_s_ = 0.0;
+    cached_repart_relabel_s_= 0.0;
 
-    if (full_threshold >= ncenters_ ||
-        partial_threshold >= ncenters_) {
+    if (full_threshold >= static_cast<int>(ncenters_) ||
+        partial_threshold >= static_cast<int>(ncenters_)) {
         return 0;
     }
     hnswlib::HierarchicalNSW<float>* new_meta = nullptr;
     std::vector<int>                 new_parts;
-    const int to_move = rePartition(new_parts, new_meta, ef_construction, M_meta);
+    const int to_move = rePartition(new_parts, new_meta, ef_construction, M_meta,
+                                    &cached_repart_hnsw_s_,
+                                    &cached_repart_bottom_s_,
+                                    &cached_repart_kaffpa_s_,
+                                    &cached_repart_relabel_s_);
 
     // No rebuild needed: to_move is below both thresholds.
     // A threshold >= ncenters effectively disables that rebuild type.
@@ -826,6 +842,21 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
     if (to_move < full_threshold && to_move < partial_threshold) {
         delete new_meta;
         return 0;
+    }
+
+    // Count centers and elements that will physically move between shards.
+    // new_parts is already relabeled by matchPartitions_ so it is directly
+    // comparable with the current partitions[] array.
+    {
+        int centers = 0, elems = 0;
+        for (size_t c = 0; c < new_parts.size(); c++) {
+            if (new_parts[c] != partitions[c]) {
+                centers++;
+                elems += center_counts_[c];
+            }
+        }
+        cached_centers_moved_  = centers;
+        cached_elements_moved_ = elems;
     }
 
     // Cache materials needed for doRebuildSimple().
@@ -1855,6 +1886,12 @@ void Executor::reBuild(
         free(sub_HNSW_);
         sub_HNSW_ = next_sub_HNSW;
     }
+
+    // Cache per-phase timings before notifying coordinator (so getters are
+    // valid as soon as reBuild() returns on the experiment side).
+    last_rebuild_iterate_s_  = end_iter     - start_iter;
+    last_rebuild_exchange_s_ = end_exchange - start_exchange;
+    last_rebuild_graph_s_    = end_hnsw     - start_hnsw;
 
     MessageHeader header; header.type = REBUILD_SUCCESS;
     MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS, MPI_COMM_WORLD);

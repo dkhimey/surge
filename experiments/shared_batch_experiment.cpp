@@ -74,10 +74,15 @@
 //  gt_prefix      : directory containing per-step GT files, or "" for static GT
 //
 // ─── Output CSV columns ──────────────────────────────────────────────────────
-//  step, operation, range_start, range_end,
-//  time_s, throughput, recall@<k>,
-//  avg_parts_searched,   (mean shards routed per query; -1 for non-search steps)
-//  shard_0_size, …, shard_<P-1>_size
+//  All rows:
+//    step, operation, range_start, range_end,
+//    time_s, throughput, recall@<k>, avg_parts_searched
+//  Rebuild rows (operation="rebuild") additionally populate:
+//    centers_moved, elements_moved,
+//    repart_hnsw_s, repart_bottom_s, repart_kaffpa_s, repart_relabel_s,
+//    exec_iterate_s, exec_exchange_s, exec_graph_s, dorebuild_wall_s
+//  (non-rebuild rows carry -1 in those rebuild-specific columns)
+//  All rows end with shard_0_size, …, shard_<P-1>_size
 
 #include <algorithm>
 #include <atomic>
@@ -487,24 +492,54 @@ int main(int argc, char** argv)
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         csv << "step,operation,range_start,range_end,time_s,throughput,recall@" << k
-            << ",avg_parts_searched";
+            << ",avg_parts_searched"
+            // rebuild-specific columns (-1 on non-rebuild rows)
+            << ",centers_moved,elements_moved"
+            << ",repart_hnsw_s,repart_bottom_s,repart_kaffpa_s,repart_relabel_s"
+            << ",exec_iterate_s,exec_exchange_s,exec_graph_s,dorebuild_wall_s";
         for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_size";
         csv << "\n";
 
+        // ── Rebuild statistics (populated only on "rebuild" rows) ─────────────
+        struct RebuildStats {
+            int    centers_moved    = -1;
+            int    elements_moved   = -1;
+            double repart_hnsw_s    = -1.0;
+            double repart_bottom_s  = -1.0;
+            double repart_kaffpa_s  = -1.0;
+            double repart_relabel_s = -1.0;
+            double exec_iterate_s   = -1.0;
+            double exec_exchange_s  = -1.0;
+            double exec_graph_s     = -1.0;
+            double dorebuild_wall_s = -1.0;
+        };
+        static const RebuildStats kNoRebuild{};
+
         // ── Helper: write one CSV row ─────────────────────────────────────────
-        // avg_parts: average number of partitions (shards) routed per query;
-        //            -1.0 for non-search steps.
+        // avg_parts: mean shards searched per query; -1 for non-search rows.
+        // rb:        rebuild statistics; use kNoRebuild for non-rebuild rows.
         auto write_row = [&](int step_num, const std::string& op,
                              int rs, int re,
                              double time_s, double throughput, double recall,
                              double avg_parts,
+                             const RebuildStats& rb,
                              const std::vector<unsigned long long>& sizes)
         {
             csv << step_num << "," << op
                 << "," << rs << "," << re
                 << "," << time_s << "," << throughput
                 << "," << recall
-                << "," << avg_parts;
+                << "," << avg_parts
+                << "," << rb.centers_moved
+                << "," << rb.elements_moved
+                << "," << rb.repart_hnsw_s
+                << "," << rb.repart_bottom_s
+                << "," << rb.repart_kaffpa_s
+                << "," << rb.repart_relabel_s
+                << "," << rb.exec_iterate_s
+                << "," << rb.exec_exchange_s
+                << "," << rb.exec_graph_s
+                << "," << rb.dorebuild_wall_s;
             for (auto sz : sizes) csv << "," << sz;
             csv << "\n";
             csv.flush();
@@ -538,7 +573,7 @@ int main(int argc, char** argv)
         {
             auto sizes = collect_sizes();
             write_row(init.step_num, "insert", init.start, init.end,
-                      0.0, 0.0, -1.0, -1.0, sizes);
+                      0.0, 0.0, -1.0, -1.0, kNoRebuild, sizes);
         }
 
         // ══════════════════════════════════════════════════════════════════════
@@ -658,18 +693,62 @@ int main(int argc, char** argv)
                 int rb_type = metaIndex.checkNeedRebuild(
                     full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                RebuildStats rb_stats;
                 if (rb_type > 0) {
+                    // Capture repartition stats (set by checkNeedRebuild).
+                    rb_stats.centers_moved    = metaIndex.getCachedCentersMoved();
+                    rb_stats.elements_moved   = metaIndex.getCachedElementsMoved();
+                    rb_stats.repart_hnsw_s    = metaIndex.getCachedRepartHnswS();
+                    rb_stats.repart_bottom_s  = metaIndex.getCachedRepartBottomS();
+                    rb_stats.repart_kaffpa_s  = metaIndex.getCachedRepartKaffpaS();
+                    rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
+
+                    // Time doRebuildSimple (send meta-HNSW + wait for REBUILD_SUCCESS).
+                    const double t_rb0 = MPI_Wtime();
                     metaIndex.doRebuildSimple(world_size);
+                    rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
+
                     sync_routing_after_rebuild();
+
+                    // Collect executor per-phase timings via MPI_Reduce(MAX).
+                    // Executors contribute after bcastRoutingState in their path.
+                    double exec_send[3] = {0.0, 0.0, 0.0}; // coordinator has no shard
+                    double exec_recv[3] = {0.0, 0.0, 0.0};
+                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0, MPI_COMM_WORLD);
+                    rb_stats.exec_iterate_s  = exec_recv[0];
+                    rb_stats.exec_exchange_s = exec_recv[1];
+                    rb_stats.exec_graph_s    = exec_recv[2];
+
+                    const double total_rb_s = rb_stats.repart_hnsw_s
+                                           + rb_stats.repart_bottom_s
+                                           + rb_stats.repart_kaffpa_s
+                                           + rb_stats.repart_relabel_s
+                                           + rb_stats.dorebuild_wall_s;
                     std::cout << "[Shared] Step " << step.step_num
-                              << "  rebuild type=" << rb_type << "\n";
+                              << "  rebuild type=" << rb_type
+                              << "  centers_moved=" << rb_stats.centers_moved
+                              << "  elements_moved=" << rb_stats.elements_moved
+                              << "  total_rebuild_s=" << total_rb_s << "\n";
                 }
 
                 const double throughput = (max_t > 0.0)
                     ? static_cast<double>(n_insert) / max_t : 0.0;
                 auto sizes = collect_sizes();
+                // Regular insert row.
                 write_row(step.step_num, "insert",
-                          step.start, step.end, max_t, throughput, -1.0, -1.0, sizes);
+                          step.start, step.end, max_t, throughput, -1.0, -1.0,
+                          kNoRebuild, sizes);
+                // Dedicated rebuild row (omitted when no rebuild occurred).
+                if (rb_type > 0) {
+                    const double total_rb_s = rb_stats.repart_hnsw_s
+                                           + rb_stats.repart_bottom_s
+                                           + rb_stats.repart_kaffpa_s
+                                           + rb_stats.repart_relabel_s
+                                           + rb_stats.dorebuild_wall_s;
+                    write_row(step.step_num, "rebuild", -1, -1,
+                              total_rb_s, -1.0, -1.0, -1.0, rb_stats, sizes);
+                }
 
             // ── DELETE ────────────────────────────────────────────────────────
             } else if (step.operation == "delete") {
@@ -729,18 +808,56 @@ int main(int argc, char** argv)
                 int rb_type = metaIndex.checkNeedRebuild(
                     full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                RebuildStats rb_stats;
                 if (rb_type > 0) {
+                    rb_stats.centers_moved    = metaIndex.getCachedCentersMoved();
+                    rb_stats.elements_moved   = metaIndex.getCachedElementsMoved();
+                    rb_stats.repart_hnsw_s    = metaIndex.getCachedRepartHnswS();
+                    rb_stats.repart_bottom_s  = metaIndex.getCachedRepartBottomS();
+                    rb_stats.repart_kaffpa_s  = metaIndex.getCachedRepartKaffpaS();
+                    rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
+
+                    const double t_rb0 = MPI_Wtime();
                     metaIndex.doRebuildSimple(world_size);
+                    rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
+
                     sync_routing_after_rebuild();
+
+                    double exec_send[3] = {0.0, 0.0, 0.0};
+                    double exec_recv[3] = {0.0, 0.0, 0.0};
+                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0, MPI_COMM_WORLD);
+                    rb_stats.exec_iterate_s  = exec_recv[0];
+                    rb_stats.exec_exchange_s = exec_recv[1];
+                    rb_stats.exec_graph_s    = exec_recv[2];
+
+                    const double total_rb_s = rb_stats.repart_hnsw_s
+                                           + rb_stats.repart_bottom_s
+                                           + rb_stats.repart_kaffpa_s
+                                           + rb_stats.repart_relabel_s
+                                           + rb_stats.dorebuild_wall_s;
                     std::cout << "[Shared] Step " << step.step_num
-                              << "  rebuild type=" << rb_type << "\n";
+                              << "  rebuild type=" << rb_type
+                              << "  centers_moved=" << rb_stats.centers_moved
+                              << "  elements_moved=" << rb_stats.elements_moved
+                              << "  total_rebuild_s=" << total_rb_s << "\n";
                 }
 
                 const double throughput = (max_t > 0.0)
                     ? static_cast<double>(n_delete) / max_t : 0.0;
                 auto sizes = collect_sizes();
                 write_row(step.step_num, "delete",
-                          step.start, step.end, max_t, throughput, -1.0, -1.0, sizes);
+                          step.start, step.end, max_t, throughput, -1.0, -1.0,
+                          kNoRebuild, sizes);
+                if (rb_type > 0) {
+                    const double total_rb_s = rb_stats.repart_hnsw_s
+                                           + rb_stats.repart_bottom_s
+                                           + rb_stats.repart_kaffpa_s
+                                           + rb_stats.repart_relabel_s
+                                           + rb_stats.dorebuild_wall_s;
+                    write_row(step.step_num, "rebuild", -1, -1,
+                              total_rb_s, -1.0, -1.0, -1.0, rb_stats, sizes);
+                }
 
             // ── SEARCH ────────────────────────────────────────────────────────
             } else if (step.operation == "search") {
@@ -900,7 +1017,7 @@ int main(int argc, char** argv)
 
                 auto sizes = collect_sizes();
                 write_row(step.step_num, "search", 0, static_cast<int>(nq),
-                          max_t, qps, recall, avg_partitions, sizes);
+                          max_t, qps, recall, avg_partitions, kNoRebuild, sizes);
 
             } else {
                 std::cerr << "[Shared] Unknown operation '" << step.operation
@@ -1096,6 +1213,15 @@ int main(int argc, char** argv)
                                       nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
                                       &meta_space, /*include_ltc=*/false);
+                    // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
+                    double exec_send[3] = {
+                        subIndex.getLastRebuildIterateS(),
+                        subIndex.getLastRebuildExchangeS(),
+                        subIndex.getLastRebuildGraphS()
+                    };
+                    double exec_recv[3]; // unused on non-root ranks
+                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0, MPI_COMM_WORLD);
                 }
 
                 // Shard size gather.
@@ -1154,6 +1280,15 @@ int main(int argc, char** argv)
                                       nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
                                       &meta_space, /*include_ltc=*/false);
+                    // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
+                    double exec_send[3] = {
+                        subIndex.getLastRebuildIterateS(),
+                        subIndex.getLastRebuildExchangeS(),
+                        subIndex.getLastRebuildGraphS()
+                    };
+                    double exec_recv[3];
+                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0, MPI_COMM_WORLD);
                 }
 
                 // Shard size gather.

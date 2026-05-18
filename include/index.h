@@ -69,6 +69,16 @@ public:
     // Safe to call only in serial (non-concurrent) rebuild scenarios.
     void doRebuildSimple(int world_size);
 
+    // Returns statistics from the most recent checkNeedRebuild() call that
+    // returned non-zero.  All return 0 when no rebuild was needed or before
+    // checkNeedRebuild() is first called.
+    int    getCachedElementsMoved()  const { return cached_elements_moved_; }
+    int    getCachedCentersMoved()   const { return cached_centers_moved_; }
+    double getCachedRepartHnswS()    const { return cached_repart_hnsw_s_; }
+    double getCachedRepartBottomS()  const { return cached_repart_bottom_s_; }
+    double getCachedRepartKaffpaS()  const { return cached_repart_kaffpa_s_; }
+    double getCachedRepartRelabelS() const { return cached_repart_relabel_s_; }
+
     void load_gp(const std::string& prefix, int ef_search);
     void setEfSearch(int ef_search);
 
@@ -85,10 +95,14 @@ public:
     );
 
     int rePartition(
-        std::vector<int>& new_partitions, 
-        hnswlib::HierarchicalNSW<float>*& new_meta_HNSW, 
-        int ef_construction, 
-        int M_meta
+        std::vector<int>& new_partitions,
+        hnswlib::HierarchicalNSW<float>*& new_meta_HNSW,
+        int ef_construction,
+        int M_meta,
+        double* out_hnsw_s    = nullptr,  // time to build new meta-HNSW
+        double* out_bottom_s  = nullptr,  // time to extract bottom layer
+        double* out_kaffpa_s  = nullptr,  // time to run kaffpa
+        double* out_relabel_s = nullptr   // time to relabel partitions
     );
 
     int reBuild(int world_size, int ef_construction, int M_meta, int full_threshold = 0, int partial_threshold = 0);
@@ -216,7 +230,13 @@ private:
     hnswlib::HierarchicalNSW<float>* cached_new_meta_HNSW_  = nullptr;
     std::vector<int>                 cached_new_partitions_;
     std::vector<char>                cached_hnsw_buffer_;
-    int                              cached_rebuild_type_    = 0; // 0=none,1=full,2=partial
+    int                              cached_rebuild_type_    = 0;   // 0=none,1=full,2=partial
+    int                              cached_elements_moved_  = 0;   // sum of center_counts_ for moved centers
+    int                              cached_centers_moved_   = 0;   // number of centers that changed shard
+    double                           cached_repart_hnsw_s_   = 0.0; // time to build new meta-HNSW
+    double                           cached_repart_bottom_s_ = 0.0; // time to extract bottom layer
+    double                           cached_repart_kaffpa_s_ = 0.0; // time to run kaffpa
+    double                           cached_repart_relabel_s_= 0.0; // time for partition relabeling
 
     // during insert, check if rebuild is already in progress, if so, just add to rebuild log
     std::atomic<bool> rebuild_pending_ = false; // indicates a rebuild must occur after the current one
@@ -281,6 +301,13 @@ public:
     // Returns the number of active (non-deleted) elements in the sub-HNSW.
     size_t getElementCount() const;
 
+    // Per-phase wall-clock times from the most recent reBuild() call.
+    // These are set before REBUILD_SUCCESS is sent, so they are valid
+    // as soon as reBuild() returns.  All return 0.0 before the first rebuild.
+    double getLastRebuildIterateS()  const { return last_rebuild_iterate_s_; }
+    double getLastRebuildExchangeS() const { return last_rebuild_exchange_s_; }
+    double getLastRebuildGraphS()    const { return last_rebuild_graph_s_; }
+
     void batch_search(size_t num_queries, size_t k, int tag);
 
     void reBuild(
@@ -329,4 +356,9 @@ private:
     float* data_;
     int* indices_;
     size_t data_count_ = 0;
+
+    // Per-phase timing from the most recent reBuild() call.
+    double last_rebuild_iterate_s_  = 0.0; // routing existing elements to new partitions
+    double last_rebuild_exchange_s_ = 0.0; // MPI point-to-point vector exchange
+    double last_rebuild_graph_s_    = 0.0; // inserting received vectors into new sub-HNSW
 };
