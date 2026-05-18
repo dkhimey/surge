@@ -559,23 +559,42 @@ int main(int argc, char** argv)
                 std::vector<float> batch =
                     readVecs(base_file, dim, n_insert, step.start);
 
-                // Route the coordinator's i%world_size subset.
+                // Route the coordinator's i%world_size subset — parallelised.
+                // routing_hnsw->searchKnn is read-only and thread-safe.
                 std::vector<std::vector<int>>   send_ids(world_size);
                 std::vector<std::vector<float>> send_vecs(world_size);
                 std::vector<std::pair<int,int>>  my_assignments; // (label, center_id)
 
-                for (int i = 0; i < n_insert; i++) {
-                    if (i % world_size != rank) continue;
-                    const int   label = step.start + i;
-                    float*      vec   = batch.data() + static_cast<size_t>(i) * dim;
-                    // Route via coordinator's own meta-HNSW (no copy needed).
-                    auto pq     = routing_hnsw->searchKnn(vec, 1);
-                    int cid     = static_cast<int>(pq.top().second);
-                    int shard   = routing_partitions[cid];
-                    int tgt     = shard + 1;            // executor rank
-                    send_ids[tgt].push_back(label);
-                    send_vecs[tgt].insert(send_vecs[tgt].end(), vec, vec + dim);
-                    my_assignments.push_back({label, cid});
+                #pragma omp parallel
+                {
+                    std::vector<std::vector<int>>   local_ids(world_size);
+                    std::vector<std::vector<float>> local_vecs(world_size);
+                    std::vector<std::pair<int,int>> local_assign;
+
+                    #pragma omp for nowait schedule(static)
+                    for (int i = 0; i < n_insert; i++) {
+                        if (i % world_size != rank) continue;
+                        const int label = step.start + i;
+                        float*    vec   = batch.data() + static_cast<size_t>(i) * dim;
+                        auto pq   = routing_hnsw->searchKnn(vec, 1);
+                        int cid   = static_cast<int>(pq.top().second);
+                        int tgt   = routing_partitions[cid] + 1;
+                        local_ids[tgt].push_back(label);
+                        local_vecs[tgt].insert(local_vecs[tgt].end(), vec, vec + dim);
+                        local_assign.push_back({label, cid});
+                    }
+
+                    #pragma omp critical
+                    {
+                        for (int r = 0; r < world_size; r++) {
+                            send_ids[r].insert(send_ids[r].end(),
+                                               local_ids[r].begin(), local_ids[r].end());
+                            send_vecs[r].insert(send_vecs[r].end(),
+                                                local_vecs[r].begin(), local_vecs[r].end());
+                        }
+                        my_assignments.insert(my_assignments.end(),
+                                              local_assign.begin(), local_assign.end());
+                    }
                 }
 
                 MPI_Barrier(MPI_COMM_WORLD);
@@ -728,17 +747,33 @@ int main(int argc, char** argv)
                 const size_t my_qs  = static_cast<size_t>(rank) * chunk;
                 const size_t my_qe  = std::min(my_qs + chunk, nq);
 
-                // Route this rank's query chunk via the chosen routing mode.
+                // Route this rank's query chunk via the chosen routing mode — parallelised.
                 std::vector<std::vector<uint32_t>> send_qids(world_size);
                 std::vector<std::vector<float>>    send_qvecs(world_size);
-                for (size_t q = my_qs; q < my_qe; q++) {
-                    float* Q = queries.data() + q * dim;
-                    std::set<int> targets = routeQuery(
-                        Q, routing_hnsw, routing_partitions,
-                        num_partitions, query_mode, query_param);
-                    for (int tgt : targets) {
-                        send_qids[tgt].push_back(static_cast<uint32_t>(q));
-                        send_qvecs[tgt].insert(send_qvecs[tgt].end(), Q, Q + dim);
+
+                #pragma omp parallel
+                {
+                    std::vector<std::vector<uint32_t>> local_qids(world_size);
+                    std::vector<std::vector<float>>    local_qvecs(world_size);
+
+                    #pragma omp for nowait schedule(static)
+                    for (size_t q = my_qs; q < my_qe; q++) {
+                        float* Q = queries.data() + q * dim;
+                        std::set<int> targets = routeQuery(
+                            Q, routing_hnsw, routing_partitions,
+                            num_partitions, query_mode, query_param);
+                        for (int tgt : targets) {
+                            local_qids[tgt].push_back(static_cast<uint32_t>(q));
+                            local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
+                        }
+                    }
+
+                    #pragma omp critical
+                    for (int r = 0; r < world_size; r++) {
+                        send_qids[r].insert(send_qids[r].end(),
+                                            local_qids[r].begin(), local_qids[r].end());
+                        send_qvecs[r].insert(send_qvecs[r].end(),
+                                             local_qvecs[r].begin(), local_qvecs[r].end());
                     }
                 }
 
@@ -930,22 +965,41 @@ int main(int argc, char** argv)
                 // All ranks read the full insert batch from shared storage.
                 std::vector<float> batch = readVecs(base_file, dim, n_insert, range_start);
 
-                // Route i%world_size subset via local routing_hnsw.
+                // Route i%world_size subset via local routing_hnsw — parallelised.
                 std::vector<std::vector<int>>   send_ids(world_size);
                 std::vector<std::vector<float>> send_vecs(world_size);
                 std::vector<std::pair<int,int>>  my_assignments;
 
-                for (int i = 0; i < n_insert; i++) {
-                    if (i % world_size != rank) continue;
-                    const int label = range_start + i;
-                    float*    vec   = batch.data() + static_cast<size_t>(i) * dim;
-                    auto pq   = routing_hnsw->searchKnn(vec, 1);
-                    int cid   = static_cast<int>(pq.top().second);
-                    int shard = routing_partitions[cid];
-                    int tgt   = shard + 1;
-                    send_ids[tgt].push_back(label);
-                    send_vecs[tgt].insert(send_vecs[tgt].end(), vec, vec + dim);
-                    my_assignments.push_back({label, cid});
+                #pragma omp parallel
+                {
+                    std::vector<std::vector<int>>   local_ids(world_size);
+                    std::vector<std::vector<float>> local_vecs(world_size);
+                    std::vector<std::pair<int,int>> local_assign;
+
+                    #pragma omp for nowait schedule(static)
+                    for (int i = 0; i < n_insert; i++) {
+                        if (i % world_size != rank) continue;
+                        const int label = range_start + i;
+                        float*    vec   = batch.data() + static_cast<size_t>(i) * dim;
+                        auto pq   = routing_hnsw->searchKnn(vec, 1);
+                        int cid   = static_cast<int>(pq.top().second);
+                        int tgt   = routing_partitions[cid] + 1;
+                        local_ids[tgt].push_back(label);
+                        local_vecs[tgt].insert(local_vecs[tgt].end(), vec, vec + dim);
+                        local_assign.push_back({label, cid});
+                    }
+
+                    #pragma omp critical
+                    {
+                        for (int r = 0; r < world_size; r++) {
+                            send_ids[r].insert(send_ids[r].end(),
+                                               local_ids[r].begin(), local_ids[r].end());
+                            send_vecs[r].insert(send_vecs[r].end(),
+                                                local_vecs[r].begin(), local_vecs[r].end());
+                        }
+                        my_assignments.insert(my_assignments.end(),
+                                              local_assign.begin(), local_assign.end());
+                    }
                 }
 
                 MPI_Barrier(MPI_COMM_WORLD);
@@ -1045,17 +1099,19 @@ int main(int argc, char** argv)
                 MPI_Barrier(MPI_COMM_WORLD);
                 const double t0_del = MPI_Wtime();
 
-                // Mark deletes this executor owns; erase from label_to_center.
+                // Collect labels owned by this executor, then mark them deleted
+                // in parallel.  label_to_center erasure is kept sequential
+                // (unordered_map is not safe for concurrent writes).
+                std::vector<int> my_delete_labels;
                 for (int i = 0; i < n_delete; i++) {
                     const int label = range_start + i;
                     const int cid   = del_center_ids[i];
                     if (cid == -1) continue;
-                    const int shard      = routing_partitions[cid];
-                    const int owner_rank = shard + 1;
-                    if (owner_rank == rank)
-                        subIndex.markDeleteLocal(label);
+                    if (routing_partitions[cid] + 1 == rank)
+                        my_delete_labels.push_back(label);
                     label_to_center.erase(label);
                 }
+                subIndex.markDeleteLocalBatch(my_delete_labels);
 
                 // Timing reduce.
                 {
@@ -1095,17 +1151,33 @@ int main(int argc, char** argv)
                 const size_t my_qs = static_cast<size_t>(rank) * chunk;
                 const size_t my_qe = std::min(my_qs + chunk, nq);
 
-                // Route this executor's query chunk via the chosen routing mode.
+                // Route this executor's query chunk via the chosen routing mode — parallelised.
                 std::vector<std::vector<uint32_t>> send_qids(world_size);
                 std::vector<std::vector<float>>    send_qvecs(world_size);
-                for (size_t q = my_qs; q < my_qe; q++) {
-                    float* Q  = queries.data() + q * dim;
-                    std::set<int> targets = routeQuery(
-                        Q, routing_hnsw, routing_partitions,
-                        num_partitions, query_mode, query_param);
-                    for (int tgt : targets) {
-                        send_qids[tgt].push_back(static_cast<uint32_t>(q));
-                        send_qvecs[tgt].insert(send_qvecs[tgt].end(), Q, Q + dim);
+
+                #pragma omp parallel
+                {
+                    std::vector<std::vector<uint32_t>> local_qids(world_size);
+                    std::vector<std::vector<float>>    local_qvecs(world_size);
+
+                    #pragma omp for nowait schedule(static)
+                    for (size_t q = my_qs; q < my_qe; q++) {
+                        float* Q  = queries.data() + q * dim;
+                        std::set<int> targets = routeQuery(
+                            Q, routing_hnsw, routing_partitions,
+                            num_partitions, query_mode, query_param);
+                        for (int tgt : targets) {
+                            local_qids[tgt].push_back(static_cast<uint32_t>(q));
+                            local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
+                        }
+                    }
+
+                    #pragma omp critical
+                    for (int r = 0; r < world_size; r++) {
+                        send_qids[r].insert(send_qids[r].end(),
+                                            local_qids[r].begin(), local_qids[r].end());
+                        send_qvecs[r].insert(send_qvecs[r].end(),
+                                             local_qvecs[r].begin(), local_qvecs[r].end());
                     }
                 }
 
