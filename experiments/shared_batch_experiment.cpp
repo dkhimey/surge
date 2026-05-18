@@ -899,6 +899,18 @@ int main(int argc, char** argv)
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
+        // ── Participate in the initial-row size gather ────────────────────────
+        // Coordinator calls collect_sizes() (MPI_Gather) right after
+        // bcastRoutingState to write the initial insert CSV row.  All executor
+        // ranks must participate in this gather before entering the streaming
+        // loop, otherwise coordinator blocks on MPI_Gather while executors
+        // call MPI_Bcast — a guaranteed deadlock.
+        {
+            unsigned long long my_size = subIndex.getElementCount();
+            MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
+                       nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+        }
+
         // ══════════════════════════════════════════════════════════════════════
         //                 EXECUTOR STREAMING LOOP
         // ══════════════════════════════════════════════════════════════════════
