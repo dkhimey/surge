@@ -76,6 +76,7 @@
 // ─── Output CSV columns ──────────────────────────────────────────────────────
 //  step, operation, range_start, range_end,
 //  time_s, throughput, recall@<k>,
+//  avg_parts_searched,   (mean shards routed per query; -1 for non-search steps)
 //  shard_0_size, …, shard_<P-1>_size
 
 #include <algorithm>
@@ -485,20 +486,25 @@ int main(int argc, char** argv)
             std::cerr << "ERROR: cannot open output file: " << output_file << "\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        csv << "step,operation,range_start,range_end,time_s,throughput,recall@" << k;
+        csv << "step,operation,range_start,range_end,time_s,throughput,recall@" << k
+            << ",avg_parts_searched";
         for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_size";
         csv << "\n";
 
         // ── Helper: write one CSV row ─────────────────────────────────────────
+        // avg_parts: average number of partitions (shards) routed per query;
+        //            -1.0 for non-search steps.
         auto write_row = [&](int step_num, const std::string& op,
                              int rs, int re,
                              double time_s, double throughput, double recall,
+                             double avg_parts,
                              const std::vector<unsigned long long>& sizes)
         {
             csv << step_num << "," << op
                 << "," << rs << "," << re
                 << "," << time_s << "," << throughput
-                << "," << recall;
+                << "," << recall
+                << "," << avg_parts;
             for (auto sz : sizes) csv << "," << sz;
             csv << "\n";
             csv.flush();
@@ -532,7 +538,7 @@ int main(int argc, char** argv)
         {
             auto sizes = collect_sizes();
             write_row(init.step_num, "insert", init.start, init.end,
-                      0.0, 0.0, -1.0, sizes);
+                      0.0, 0.0, -1.0, -1.0, sizes);
         }
 
         // ══════════════════════════════════════════════════════════════════════
@@ -663,7 +669,7 @@ int main(int argc, char** argv)
                     ? static_cast<double>(n_insert) / max_t : 0.0;
                 auto sizes = collect_sizes();
                 write_row(step.step_num, "insert",
-                          step.start, step.end, max_t, throughput, -1.0, sizes);
+                          step.start, step.end, max_t, throughput, -1.0, -1.0, sizes);
 
             // ── DELETE ────────────────────────────────────────────────────────
             } else if (step.operation == "delete") {
@@ -734,7 +740,7 @@ int main(int argc, char** argv)
                     ? static_cast<double>(n_delete) / max_t : 0.0;
                 auto sizes = collect_sizes();
                 write_row(step.step_num, "delete",
-                          step.start, step.end, max_t, throughput, -1.0, sizes);
+                          step.start, step.end, max_t, throughput, -1.0, -1.0, sizes);
 
             // ── SEARCH ────────────────────────────────────────────────────────
             } else if (step.operation == "search") {
@@ -750,11 +756,13 @@ int main(int argc, char** argv)
                 // Route this rank's query chunk via the chosen routing mode — parallelised.
                 std::vector<std::vector<uint32_t>> send_qids(world_size);
                 std::vector<std::vector<float>>    send_qvecs(world_size);
+                long long my_total_parts = 0; // sum of targets.size() over all queries
 
                 #pragma omp parallel
                 {
                     std::vector<std::vector<uint32_t>> local_qids(world_size);
                     std::vector<std::vector<float>>    local_qvecs(world_size);
+                    long long thread_parts = 0;
 
                     #pragma omp for nowait schedule(static)
                     for (size_t q = my_qs; q < my_qe; q++) {
@@ -762,6 +770,7 @@ int main(int argc, char** argv)
                         std::set<int> targets = routeQuery(
                             Q, routing_hnsw, routing_partitions,
                             num_partitions, query_mode, query_param);
+                        thread_parts += static_cast<long long>(targets.size());
                         for (int tgt : targets) {
                             local_qids[tgt].push_back(static_cast<uint32_t>(q));
                             local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
@@ -769,11 +778,14 @@ int main(int argc, char** argv)
                     }
 
                     #pragma omp critical
-                    for (int r = 0; r < world_size; r++) {
-                        send_qids[r].insert(send_qids[r].end(),
-                                            local_qids[r].begin(), local_qids[r].end());
-                        send_qvecs[r].insert(send_qvecs[r].end(),
-                                             local_qvecs[r].begin(), local_qvecs[r].end());
+                    {
+                        for (int r = 0; r < world_size; r++) {
+                            send_qids[r].insert(send_qids[r].end(),
+                                                local_qids[r].begin(), local_qids[r].end());
+                            send_qvecs[r].insert(send_qvecs[r].end(),
+                                                 local_qvecs[r].begin(), local_qvecs[r].end());
+                        }
+                        my_total_parts += thread_parts;
                     }
                 }
 
@@ -806,6 +818,14 @@ int main(int argc, char** argv)
                     double elapsed = t1 - t0;
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
+
+                // Partition-count reduce: outside the timing window, minimal overhead.
+                long long global_parts = 0;
+                MPI_Reduce(&my_total_parts, &global_parts, 1, MPI_LONG_LONG,
+                           MPI_SUM, 0, MPI_COMM_WORLD);
+                const double avg_partitions =
+                    (nq > 0) ? static_cast<double>(global_parts) / static_cast<double>(nq)
+                             : -1.0;
 
                 // Merge results for coordinator's query chunk.
                 using KNNVec = std::vector<std::pair<float, uint32_t>>;
@@ -871,7 +891,8 @@ int main(int argc, char** argv)
 
                 std::cout << "[Shared] Step " << step.step_num
                           << "  recall@" << k << "=" << recall
-                          << "  qps=" << qps << "\n";
+                          << "  qps=" << qps
+                          << "  avg_parts=" << avg_partitions << "\n";
 
                 // No rebuild after search.
                 int rb_type = 0;
@@ -879,7 +900,7 @@ int main(int argc, char** argv)
 
                 auto sizes = collect_sizes();
                 write_row(step.step_num, "search", 0, static_cast<int>(nq),
-                          max_t, qps, recall, sizes);
+                          max_t, qps, recall, avg_partitions, sizes);
 
             } else {
                 std::cerr << "[Shared] Unknown operation '" << step.operation
@@ -1154,11 +1175,13 @@ int main(int argc, char** argv)
                 // Route this executor's query chunk via the chosen routing mode — parallelised.
                 std::vector<std::vector<uint32_t>> send_qids(world_size);
                 std::vector<std::vector<float>>    send_qvecs(world_size);
+                long long my_total_parts = 0;
 
                 #pragma omp parallel
                 {
                     std::vector<std::vector<uint32_t>> local_qids(world_size);
                     std::vector<std::vector<float>>    local_qvecs(world_size);
+                    long long thread_parts = 0;
 
                     #pragma omp for nowait schedule(static)
                     for (size_t q = my_qs; q < my_qe; q++) {
@@ -1166,6 +1189,7 @@ int main(int argc, char** argv)
                         std::set<int> targets = routeQuery(
                             Q, routing_hnsw, routing_partitions,
                             num_partitions, query_mode, query_param);
+                        thread_parts += static_cast<long long>(targets.size());
                         for (int tgt : targets) {
                             local_qids[tgt].push_back(static_cast<uint32_t>(q));
                             local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
@@ -1173,11 +1197,14 @@ int main(int argc, char** argv)
                     }
 
                     #pragma omp critical
-                    for (int r = 0; r < world_size; r++) {
-                        send_qids[r].insert(send_qids[r].end(),
-                                            local_qids[r].begin(), local_qids[r].end());
-                        send_qvecs[r].insert(send_qvecs[r].end(),
-                                             local_qvecs[r].begin(), local_qvecs[r].end());
+                    {
+                        for (int r = 0; r < world_size; r++) {
+                            send_qids[r].insert(send_qids[r].end(),
+                                                local_qids[r].begin(), local_qids[r].end());
+                            send_qvecs[r].insert(send_qvecs[r].end(),
+                                                 local_qvecs[r].begin(), local_qvecs[r].end());
+                        }
+                        my_total_parts += thread_parts;
                     }
                 }
 
@@ -1235,6 +1262,13 @@ int main(int argc, char** argv)
                     double elapsed = MPI_Wtime() - t0_srch;
                     double max_t   = 0.0;
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                }
+
+                // Partition-count reduce: contribute this rank's query routing stats.
+                {
+                    long long global_parts_ex = 0;
+                    MPI_Reduce(&my_total_parts, &global_parts_ex, 1, MPI_LONG_LONG,
+                               MPI_SUM, 0, MPI_COMM_WORLD);
                 }
 
                 // Merge results for this executor's query chunk.
