@@ -57,7 +57,7 @@ static constexpr int    EF_SEARCH            = 200;
 static constexpr size_t SAMPLE_SIZE          = 100000;
 
 // ─── Sweep parameter grids (visible to all ranks so loop counts agree) ───────
-static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 15, 20, 25, 30};
+static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 20, 40, 80};
 static const std::vector<int>   NPROBE_PARAMS           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 static const std::vector<float> TARGET_PARAMS           = {.6f, .7f, .75f, .8f, .85f,
                                                             .9f, .95f, .97f, .98f, .99f};
