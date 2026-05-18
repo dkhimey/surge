@@ -2065,14 +2065,24 @@ void Executor::insertLocalBatch(const std::vector<float>& vecs,
     if (labels.empty()) return;
     const size_t incoming = labels.size();
 
-    std::unique_lock<std::shared_mutex> lk(graph_mutex_);
-    const size_t current = sub_HNSW_->getCurrentElementCount();
-    if (current + incoming > sub_HNSW_->getMaxElements()) {
-        const size_t new_max = std::max(
-            current + incoming,
-            sub_HNSW_->getMaxElements() + sub_HNSW_->getMaxElements() / 2);
-        sub_HNSW_->resizeIndex(new_max);
+    // Phase 1: capacity check and resize under exclusive lock.
+    {
+        std::unique_lock<std::shared_mutex> lk(graph_mutex_);
+        const size_t current = sub_HNSW_->getCurrentElementCount();
+        if (current + incoming > sub_HNSW_->getMaxElements()) {
+            const size_t new_max = std::max(
+                current + incoming,
+                sub_HNSW_->getMaxElements() + sub_HNSW_->getMaxElements() / 2);
+            sub_HNSW_->resizeIndex(new_max);
+        }
     }
+
+    // Phase 2: parallel inserts under shared lock.
+    // hnswlib addPoint is internally thread-safe (per-element locks), so
+    // multiple threads can insert concurrently as long as resizeIndex is
+    // not called at the same time.
+    std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+    #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < incoming; i++)
         sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i]);
 }
@@ -2086,6 +2096,26 @@ void Executor::markDeleteLocal(int label) {
         sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(label));
     } catch (...) {
         // Label not found in this shard – silently skip.
+    }
+}
+
+// ── markDeleteLocalBatch ─────────────────────────────────────────────────────
+// Mark a batch of vectors deleted in parallel.  hnswlib's markDelete is
+// internally thread-safe for distinct labels — it uses per-label
+// label_op_locks_, a separate label_lookup_lock for the lookup table, and
+// atomic num_deleted_ — so concurrent calls on different labels are safe under
+// a shared (reader) lock on graph_mutex_.  Labels absent from this shard are
+// silently skipped.
+void Executor::markDeleteLocalBatch(const std::vector<int>& labels) {
+    if (labels.empty()) return;
+    std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < labels.size(); i++) {
+        try {
+            sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(labels[i]));
+        } catch (...) {
+            // Label not found in this shard – silently skip.
+        }
     }
 }
 

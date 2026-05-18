@@ -262,8 +262,14 @@ public:
                           const std::vector<int>&   labels);
 
     // Mark a single vector as deleted.  Silently ignores labels not present
-    // in this shard.  Uses a shared lock (markDelete is internally atomic).
+    // in this shard.  Uses an exclusive lock.
     void markDeleteLocal(int label);
+
+    // Mark a batch of vectors deleted in parallel.  hnswlib markDelete is
+    // internally thread-safe for distinct labels (per-element label_op_locks_,
+    // atomic num_deleted_, deleted_elements_lock), so only a shared lock is
+    // needed here.  Labels not present in this shard are silently skipped.
+    void markDeleteLocalBatch(const std::vector<int>& labels);
 
     // Search a batch of query vectors received via AllToAllV.  Returns one
     // result vector per query; each result is sorted nearest-first.
