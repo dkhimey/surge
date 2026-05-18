@@ -65,11 +65,12 @@
 // ─── Usage ───────────────────────────────────────────────────────────────────
 //  mpirun -np <P+1> ./shared_batch_experiment \
 //      <dataset> <num_partitions> <full_threshold> \
-//      <nprobe> <k> <gt_prefix> <output_file>
+//      <query_mode> <query_param> <k> <gt_prefix> <output_file>
 //
 //  full_threshold : min centers to migrate to trigger a full rebuild;
 //                   set >= ncenters to disable rebuilds entirely
-//  nprobe         : number of nearest centroid clusters to probe per query
+//  query_mode     : BranchingFactor | NProbe | RecallTarget
+//  query_param    : branching factor (int), nprobe (int), or recall target (float)
 //  gt_prefix      : directory containing per-step GT files, or "" for static GT
 //
 // ─── Output CSV columns ──────────────────────────────────────────────────────
@@ -141,6 +142,104 @@ static std::vector<RunbookStep> parse_runbook(const std::string& path,
     result.reserve(step_map.size());
     for (auto& [k, v] : step_map) result.push_back(v);
     return result;
+}
+
+// ─── Routing mode helpers ─────────────────────────────────────────────────────
+static RoutingMode parse_routing_mode(const std::string& s) {
+    if (s == "BranchingFactor") return RoutingMode::BranchingFactor;
+    if (s == "NProbe")          return RoutingMode::NProbe;
+    if (s == "RecallTarget")    return RoutingMode::RecallTarget;
+    throw std::invalid_argument(
+        "Unknown query_mode '" + s + "'. Use BranchingFactor, NProbe, or RecallTarget.");
+}
+
+// Route a single query vector to a set of executor ranks (1-indexed).
+// Mirrors Coordinator::getPartitionsForSearch_* but operates on a local
+// routing_hnsw + routing_partitions so all ranks can call it identically.
+static std::set<int> routeQuery(
+    float*                              vec,
+    hnswlib::HierarchicalNSW<float>*    hnsw,
+    const std::vector<int>&             partitions,
+    int                                 num_partitions,
+    RoutingMode                         mode,
+    float                               param)
+{
+    std::set<int> target_ranks; // executor ranks (shard+1)
+
+    if (mode == RoutingMode::BranchingFactor) {
+        // Return the partitions of the `param` nearest centroids, deduplicated.
+        int bf = static_cast<int>(param);
+        auto pq = hnsw->searchKnnCloserFirst(vec, static_cast<size_t>(bf));
+        std::unordered_set<int> seen;
+        for (auto& [dist, cid] : pq) {
+            int shard = partitions[static_cast<int>(cid)];
+            if (seen.insert(shard).second)
+                target_ranks.insert(shard + 1);
+        }
+
+    } else if (mode == RoutingMode::NProbe) {
+        // Expand search until `param` unique partitions are collected.
+        int nprobe   = static_cast<int>(param);
+        size_t cur_k = static_cast<size_t>(nprobe);
+        const size_t ncenters = hnsw->getCurrentElementCount();
+        std::vector<std::pair<float, hnswlib::labeltype>> centers;
+        while (true) {
+            cur_k   = std::min(cur_k, ncenters);
+            centers = hnsw->searchKnnCloserFirst(vec, cur_k);
+            std::unordered_set<int> unique_parts;
+            for (auto& [d, cid] : centers)
+                unique_parts.insert(partitions[static_cast<int>(cid)]);
+            if (static_cast<int>(unique_parts.size()) >= nprobe || cur_k >= ncenters)
+                break;
+            cur_k *= 10;
+        }
+        std::unordered_set<int> seen;
+        for (auto& [d, cid] : centers) {
+            int shard = partitions[static_cast<int>(cid)];
+            if (seen.insert(shard).second) {
+                target_ranks.insert(shard + 1);
+                if (static_cast<int>(target_ranks.size()) == nprobe) break;
+            }
+        }
+
+    } else { // RecallTarget
+        float recall_target = std::clamp(param, 0.0f, 1.0f);
+        const size_t ncenters = hnsw->getCurrentElementCount();
+        size_t knn = std::min<size_t>(50, ncenters);
+        auto centers = hnsw->searchKnnCloserFirst(vec, knn);
+        if (centers.empty()) return target_ranks;
+
+        std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
+        for (size_t r = 0; r < centers.size(); r++) {
+            const float d  = centers[r].first;
+            const int   pid = partitions[static_cast<int>(centers[r].second)];
+            const double w  = 1.0 / std::pow(static_cast<double>(d) + 1e-5, 3.0);
+            part_probs[static_cast<size_t>(pid)] += w / static_cast<double>(r + 1);
+        }
+        double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
+        if (prob_sum <= 0.0) {
+            target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
+            return target_ranks;
+        }
+        for (double& p : part_probs) p /= prob_sum;
+
+        std::vector<int> ordered(num_partitions);
+        std::iota(ordered.begin(), ordered.end(), 0);
+        std::sort(ordered.begin(), ordered.end(),
+                  [&](int a, int b){ return part_probs[a] > part_probs[b]; });
+
+        double acc = 0.0;
+        for (int pid : ordered) {
+            if (part_probs[static_cast<size_t>(pid)] <= 0.0) break;
+            target_ranks.insert(pid + 1);
+            acc += part_probs[static_cast<size_t>(pid)];
+            if (acc >= recall_target) break;
+        }
+        if (target_ranks.empty())
+            target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
+    }
+
+    return target_ranks;
 }
 
 // ─── Generic AllToAllV helper (adapted from distributed_insert_bench.cpp) ─────
@@ -252,17 +351,19 @@ static void bcastRoutingState(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    if (argc != 8) {
+    if (argc != 9) {
         std::cerr
             << "Usage: " << argv[0]
             << " <dataset> <num_partitions>"
             << " <full_threshold>"
-            << " <nprobe> <k>"
+            << " <query_mode> <query_param> <k>"
             << " <gt_prefix> <output_file>\n"
             << "\n"
             << "  full_threshold : min centers to migrate to trigger a full rebuild;\n"
             << "                   set >= ncenters (default " << NCENTERS << ") to disable\n"
-            << "  nprobe         : nearest centroid clusters probed per query\n"
+            << "  query_mode     : BranchingFactor | NProbe | RecallTarget\n"
+            << "  query_param    : branching factor (int), nprobe (int),"
+               " or recall target (float in [0,1])\n"
             << "  gt_prefix      : directory with per-step GT files (step<N>.gt100),"
                " or \"\" to use only the static GT\n";
         return 1;
@@ -274,11 +375,14 @@ int main(int argc, char** argv)
     // Partial rebuilds are disabled in this experiment: set partial_threshold
     // equal to full_threshold so the condition (to_move >= partial_threshold)
     // is never strictly weaker than the full-rebuild condition.
-    const int         partial_threshold = full_threshold;
-    const int         nprobe          = std::stoi(argv[4]);
-    const int         k               = std::stoi(argv[5]);
-    const std::string gt_prefix       = argv[6];
-    const std::string output_file     = argv[7];
+    const int         partial_threshold  = full_threshold;
+    const std::string query_mode_str     = argv[4];
+    const float       query_param        = std::stof(argv[5]);
+    const int         k                  = std::stoi(argv[6]);
+    const std::string gt_prefix          = argv[7];
+    const std::string output_file        = argv[8];
+
+    const RoutingMode query_mode = parse_routing_mode(query_mode_str);
 
     // ── MPI init ─────────────────────────────────────────────────────────────
     int provided;
@@ -624,17 +728,14 @@ int main(int argc, char** argv)
                 const size_t my_qs  = static_cast<size_t>(rank) * chunk;
                 const size_t my_qe  = std::min(my_qs + chunk, nq);
 
-                // Route this rank's query chunk.
+                // Route this rank's query chunk via the chosen routing mode.
                 std::vector<std::vector<uint32_t>> send_qids(world_size);
                 std::vector<std::vector<float>>    send_qvecs(world_size);
                 for (size_t q = my_qs; q < my_qe; q++) {
                     float* Q = queries.data() + q * dim;
-                    auto pq  = routing_hnsw->searchKnn(Q, nprobe);
-                    std::set<int> targets;
-                    while (!pq.empty()) {
-                        targets.insert(routing_partitions[pq.top().second] + 1);
-                        pq.pop();
-                    }
+                    std::set<int> targets = routeQuery(
+                        Q, routing_hnsw, routing_partitions,
+                        num_partitions, query_mode, query_param);
                     for (int tgt : targets) {
                         send_qids[tgt].push_back(static_cast<uint32_t>(q));
                         send_qvecs[tgt].insert(send_qvecs[tgt].end(), Q, Q + dim);
@@ -982,17 +1083,14 @@ int main(int argc, char** argv)
                 const size_t my_qs = static_cast<size_t>(rank) * chunk;
                 const size_t my_qe = std::min(my_qs + chunk, nq);
 
-                // Route this executor's query chunk.
+                // Route this executor's query chunk via the chosen routing mode.
                 std::vector<std::vector<uint32_t>> send_qids(world_size);
                 std::vector<std::vector<float>>    send_qvecs(world_size);
                 for (size_t q = my_qs; q < my_qe; q++) {
                     float* Q  = queries.data() + q * dim;
-                    auto pq   = routing_hnsw->searchKnn(Q, nprobe);
-                    std::set<int> targets;
-                    while (!pq.empty()) {
-                        targets.insert(routing_partitions[pq.top().second] + 1);
-                        pq.pop();
-                    }
+                    std::set<int> targets = routeQuery(
+                        Q, routing_hnsw, routing_partitions,
+                        num_partitions, query_mode, query_param);
                     for (int tgt : targets) {
                         send_qids[tgt].push_back(static_cast<uint32_t>(q));
                         send_qvecs[tgt].insert(send_qvecs[tgt].end(), Q, Q + dim);
