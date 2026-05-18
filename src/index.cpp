@@ -624,7 +624,7 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     // run partitioning algo
     start = MPI_Wtime();
     kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(), 
-           &w_partitions_int, &imbalance, true, seed, FAST, &edge_cut, new_partitions.data());
+           &w_partitions_int, &imbalance, true, seed, ECO, &edge_cut, new_partitions.data());
     end = MPI_Wtime();
     double partition_time = end-start;
 
