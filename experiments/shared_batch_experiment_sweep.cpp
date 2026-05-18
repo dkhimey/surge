@@ -176,13 +176,21 @@ static std::set<int> routeQuery(
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
+        // Size prior: count how many centers belong to each partition
+        std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
+        for (int p : partitions) part_size[static_cast<size_t>(p)]++;
+
+        // Scale-invariant weights: normalize by nearest-center distance
+        const double d0 = static_cast<double>(centers[0].first) + 1e-10;
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
-            const float d   = centers[r].first;
-            const int   pid = partitions[static_cast<int>(centers[r].second)];
-            const double w  = 1.0 / std::pow(static_cast<double>(d) + 1e-5, 1.0);
-            part_probs[static_cast<size_t>(pid)] += w / static_cast<double>(r + 1);
+            const double rel_d     = static_cast<double>(centers[r].first) / d0;
+            const int    pid       = partitions[static_cast<int>(centers[r].second)];
+            const double w         = std::exp(-3.0 * rel_d);
+            const double size_wt   = static_cast<double>(part_size[static_cast<size_t>(pid)]);
+            part_probs[static_cast<size_t>(pid)] += w * size_wt;
         }
+
         double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
         if (prob_sum <= 0.0) {
             target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
@@ -193,7 +201,7 @@ static std::set<int> routeQuery(
         std::vector<int> ordered(num_partitions);
         std::iota(ordered.begin(), ordered.end(), 0);
         std::sort(ordered.begin(), ordered.end(),
-                  [&](int a, int b){ return part_probs[a] > part_probs[b]; });
+                [&](int a, int b){ return part_probs[a] > part_probs[b]; });
 
         double acc = 0.0;
         for (int pid : ordered) {
