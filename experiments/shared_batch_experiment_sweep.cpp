@@ -180,7 +180,7 @@ static std::set<int> routeQuery(
         for (size_t r = 0; r < centers.size(); r++) {
             const float d   = centers[r].first;
             const int   pid = partitions[static_cast<int>(centers[r].second)];
-            const double w  = 1.0 / std::pow(static_cast<double>(d) + 1e-5, 2.0);
+            const double w  = 1.0 / std::pow(static_cast<double>(d) + 1e-5, 1.0);
             part_probs[static_cast<size_t>(pid)] += w / static_cast<double>(r + 1);
         }
         double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
