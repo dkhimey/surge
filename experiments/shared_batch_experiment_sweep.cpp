@@ -186,7 +186,7 @@ static std::set<int> routeQuery(
         for (size_t r = 0; r < centers.size(); r++) {
             const double rel_d     = static_cast<double>(centers[r].first) / d0;
             const int    pid       = partitions[static_cast<int>(centers[r].second)];
-            const double w         = std::exp(-3.0 * rel_d);
+            const double w         = std::exp(-1.0 * rel_d);
             const double size_wt   = static_cast<double>(part_size[static_cast<size_t>(pid)]);
             part_probs[static_cast<size_t>(pid)] += w * size_wt;
         }
