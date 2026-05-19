@@ -49,7 +49,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
-    {"sift-100M"
+    {"sift-100M",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_100000000.u8bin"},
             {"runbook", "TODO"},
@@ -59,7 +59,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
-    {"msturing-100M"
+    {"msturing-100M",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_100000000.fbin"},
             {"runbook", "TODO"},
