@@ -49,6 +49,27 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
+    {"sift-100M"
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_100000000.u8bin"},
+            {"runbook", "TODO"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann/query.public.10K.u8bin"},
+            {"ground_truth_dir", "TODO"},
+            {"gt_file", "/dataset/big-ann-benchmarks/data/bigann/bigann-100M.ibin"}
+        }
+    },
+
+    {"msturing-100M"
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_100000000.fbin"},
+            {"runbook", "TODO"},
+            {"query_file", "dataset/big-ann-benchmarks/data/MSTuringANNS/query10K.fbin"},
+            {"ground_truth_dir", "TODO"},
+            {"gt_file", "dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-100M.query10K.bin"}
+        }
+    },
+
+
     {"msturing-500M-clustered",
         {
             {"base_file", "TODO"},
