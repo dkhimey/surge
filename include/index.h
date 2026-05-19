@@ -69,6 +69,12 @@ public:
     // Safe to call only in serial (non-concurrent) rebuild scenarios.
     void doRebuildSimple(int world_size);
 
+    // Delta-rebuild variant: sends INPLACE_REBUILD_REQUEST so executors
+    // mark-delete departing elements and insert arriving ones without
+    // reconstructing the graph from scratch.  Same protocol and caching
+    // contract as doRebuildSimple().
+    void doRebuildDelta(int world_size);
+
     // Returns statistics from the most recent checkNeedRebuild() call that
     // returned non-zero.  All return 0 when no rebuild was needed or before
     // checkNeedRebuild() is first called.
@@ -308,6 +314,12 @@ public:
     double getLastRebuildExchangeS() const { return last_rebuild_exchange_s_; }
     double getLastRebuildGraphS()    const { return last_rebuild_graph_s_; }
 
+    // Number of deleted slots that were not yet reused by incoming insertions
+    // after the most recent reBuildDelta() call.  Equal to
+    // sub_HNSW_->deleted_elements.size() immediately after the call.
+    // Returns 0 before the first delta rebuild.
+    size_t getLastRebuildRemainingDeleted() const { return last_rebuild_remaining_deleted_; }
+
     void batch_search(size_t num_queries, size_t k, int tag);
 
     void reBuild(
@@ -324,6 +336,18 @@ public:
         int ncenters,
         int world_size,
         int ef_construction,
+        int num_building_threads = -1
+    );
+
+    // Delta rebuild: mark-delete elements that migrated away, receive and
+    // insert elements that migrated in.  Uses replace_deleted=true so
+    // incoming insertions preferentially reuse the freed slots.
+    // Does NOT rebuild the graph from scratch; the existing graph topology
+    // is retained for staying elements.
+    void reBuildDelta(
+        int meta_size,
+        int ncenters,
+        int world_size,
         int num_building_threads = -1
     );
     
@@ -357,8 +381,13 @@ private:
     int* indices_;
     size_t data_count_ = 0;
 
-    // Per-phase timing from the most recent reBuild() call.
+    // Per-phase timing from the most recent reBuild() / reBuildDelta() call.
     double last_rebuild_iterate_s_  = 0.0; // routing existing elements to new partitions
     double last_rebuild_exchange_s_ = 0.0; // MPI point-to-point vector exchange
     double last_rebuild_graph_s_    = 0.0; // inserting received vectors into new sub-HNSW
+
+    // Count of deleted slots still unreplaced after the most recent reBuildDelta().
+    // With allow_replace_deleted=true, this equals sub_HNSW_->deleted_elements.size()
+    // immediately after all insertions complete.
+    size_t last_rebuild_remaining_deleted_ = 0;
 };

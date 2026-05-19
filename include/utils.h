@@ -53,7 +53,8 @@ typedef enum {
     DELETE_BATCH_SEND,
     DELETE_BATCH_SUCCESS,
     DATASET_INFO_SEND,
-    SIZE_REQUEST   // coordinator asks an executor for its current element count
+    SIZE_REQUEST,          // coordinator asks an executor for its current element count
+    INPLACE_REBUILD_REQUEST // delta rebuild: mark-delete departing + insert arriving
 } MessageType;
 
 typedef struct MessageHeader {

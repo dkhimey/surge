@@ -357,21 +357,26 @@ static void bcastRoutingState(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    if (argc != 9) {
+    if (argc != 9 && argc != 10) {
         std::cerr
             << "Usage: " << argv[0]
             << " <dataset> <num_partitions>"
             << " <full_threshold>"
             << " <query_mode> <query_param> <k>"
-            << " <gt_prefix> <output_file>\n"
+            << " <gt_prefix> <output_file>"
+            << " [rebuild_mode]\n"
             << "\n"
-            << "  full_threshold : min centers to migrate to trigger a full rebuild;\n"
+            << "  full_threshold : min centers to migrate to trigger a rebuild;\n"
             << "                   set >= ncenters (default " << NCENTERS << ") to disable\n"
             << "  query_mode     : BranchingFactor | NProbe | RecallTarget\n"
             << "  query_param    : branching factor (int), nprobe (int),"
                " or recall target (float in [0,1])\n"
             << "  gt_prefix      : directory with per-step GT files (step<N>.gt100),"
-               " or \"\" to use only the static GT\n";
+               " or \"\" to use only the static GT\n"
+            << "  rebuild_mode   : \"full\" (default) or \"delta\"\n"
+            << "                   full  – discard and reconstruct each shard's index\n"
+            << "                   delta – mark-delete departing elements and insert\n"
+            << "                           arriving ones in-place (keeps graph topology)\n";
         return 1;
     }
 
@@ -387,6 +392,8 @@ int main(int argc, char** argv)
     const int         k                  = std::stoi(argv[6]);
     const std::string gt_prefix          = argv[7];
     const std::string output_file        = argv[8];
+    const std::string rebuild_mode       = (argc == 10) ? argv[9] : "full";
+    const bool        use_delta_rebuild  = (rebuild_mode == "delta");
 
     const RoutingMode query_mode = parse_routing_mode(query_mode_str);
 
@@ -496,22 +503,28 @@ int main(int argc, char** argv)
             // rebuild-specific columns (-1 on non-rebuild rows)
             << ",centers_moved,elements_moved"
             << ",repart_hnsw_s,repart_bottom_s,repart_kaffpa_s,repart_relabel_s"
-            << ",exec_iterate_s,exec_exchange_s,exec_graph_s,dorebuild_wall_s";
+            << ",exec_iterate_s,exec_exchange_s,exec_graph_s,dorebuild_wall_s"
+            // delta-rebuild specific: total unreplaced tombstone slots across shards
+            // (-1 for full rebuilds; 0+ for delta rebuilds)
+            << ",remaining_deleted_slots";
         for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_size";
         csv << "\n";
 
         // ── Rebuild statistics (populated only on "rebuild" rows) ─────────────
         struct RebuildStats {
-            int    centers_moved    = -1;
-            int    elements_moved   = -1;
-            double repart_hnsw_s    = -1.0;
-            double repart_bottom_s  = -1.0;
-            double repart_kaffpa_s  = -1.0;
-            double repart_relabel_s = -1.0;
-            double exec_iterate_s   = -1.0;
-            double exec_exchange_s  = -1.0;
-            double exec_graph_s     = -1.0;
-            double dorebuild_wall_s = -1.0;
+            int       centers_moved             = -1;
+            int       elements_moved            = -1;
+            double    repart_hnsw_s             = -1.0;
+            double    repart_bottom_s           = -1.0;
+            double    repart_kaffpa_s           = -1.0;
+            double    repart_relabel_s          = -1.0;
+            double    exec_iterate_s            = -1.0;
+            double    exec_exchange_s           = -1.0;
+            double    exec_graph_s              = -1.0;
+            double    dorebuild_wall_s          = -1.0;
+            // Sum of remaining unreplaced deleted slots across all shards.
+            // Populated only for delta rebuilds; -1 for full rebuilds.
+            long long remaining_deleted_slots   = -1;
         };
         static const RebuildStats kNoRebuild{};
 
@@ -539,7 +552,8 @@ int main(int argc, char** argv)
                 << "," << rb.exec_iterate_s
                 << "," << rb.exec_exchange_s
                 << "," << rb.exec_graph_s
-                << "," << rb.dorebuild_wall_s;
+                << "," << rb.dorebuild_wall_s
+                << "," << rb.remaining_deleted_slots;
             for (auto sz : sizes) csv << "," << sz;
             csv << "\n";
             csv.flush();
@@ -703,9 +717,12 @@ int main(int argc, char** argv)
                     rb_stats.repart_kaffpa_s  = metaIndex.getCachedRepartKaffpaS();
                     rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
 
-                    // Time doRebuildSimple (send meta-HNSW + wait for REBUILD_SUCCESS).
+                    // Dispatch to the chosen rebuild variant.
                     const double t_rb0 = MPI_Wtime();
-                    metaIndex.doRebuildSimple(world_size);
+                    if (use_delta_rebuild)
+                        metaIndex.doRebuildDelta(world_size);
+                    else
+                        metaIndex.doRebuildSimple(world_size);
                     rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
                     sync_routing_after_rebuild();
@@ -720,16 +737,32 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
+                    // Delta rebuild only: collect total remaining deleted slots
+                    // (sum across all shards).  Executors contribute their own
+                    // count; coordinator contributes 0.
+                    if (use_delta_rebuild) {
+                        long long del_send = 0LL;
+                        long long del_recv = 0LL;
+                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                        rb_stats.remaining_deleted_slots = del_recv;
+                    }
+
                     const double total_rb_s = rb_stats.repart_hnsw_s
                                            + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s
                                            + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
                     std::cout << "[Shared] Step " << step.step_num
-                              << "  rebuild type=" << rb_type
+                              << "  rebuild mode=" << rebuild_mode
+                              << "  type=" << rb_type
                               << "  centers_moved=" << rb_stats.centers_moved
                               << "  elements_moved=" << rb_stats.elements_moved
-                              << "  total_rebuild_s=" << total_rb_s << "\n";
+                              << "  total_rebuild_s=" << total_rb_s;
+                    if (use_delta_rebuild)
+                        std::cout << "  remaining_deleted_slots="
+                                  << rb_stats.remaining_deleted_slots;
+                    std::cout << "\n";
                 }
 
                 const double throughput = (max_t > 0.0)
@@ -818,7 +851,10 @@ int main(int argc, char** argv)
                     rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
 
                     const double t_rb0 = MPI_Wtime();
-                    metaIndex.doRebuildSimple(world_size);
+                    if (use_delta_rebuild)
+                        metaIndex.doRebuildDelta(world_size);
+                    else
+                        metaIndex.doRebuildSimple(world_size);
                     rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
                     sync_routing_after_rebuild();
@@ -831,16 +867,29 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
+                    if (use_delta_rebuild) {
+                        long long del_send = 0LL;
+                        long long del_recv = 0LL;
+                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                        rb_stats.remaining_deleted_slots = del_recv;
+                    }
+
                     const double total_rb_s = rb_stats.repart_hnsw_s
                                            + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s
                                            + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
                     std::cout << "[Shared] Step " << step.step_num
-                              << "  rebuild type=" << rb_type
+                              << "  rebuild mode=" << rebuild_mode
+                              << "  type=" << rb_type
                               << "  centers_moved=" << rb_stats.centers_moved
                               << "  elements_moved=" << rb_stats.elements_moved
-                              << "  total_rebuild_s=" << total_rb_s << "\n";
+                              << "  total_rebuild_s=" << total_rb_s;
+                    if (use_delta_rebuild)
+                        std::cout << "  remaining_deleted_slots="
+                                  << rb_stats.remaining_deleted_slots;
+                    std::cout << "\n";
                 }
 
                 const double throughput = (max_t > 0.0)
@@ -1205,9 +1254,14 @@ int main(int argc, char** argv)
                 if (rb_type > 0) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
-                                     world_size, EF_CONSTRUCTION, M_SUB,
-                                     NUM_BUILDING_THREADS);
+                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
+                        subIndex.reBuildDelta(static_cast<int>(hdr.size), NCENTERS,
+                                              world_size, NUM_BUILDING_THREADS);
+                    } else {
+                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                                         world_size, EF_CONSTRUCTION, M_SUB,
+                                         NUM_BUILDING_THREADS);
+                    }
                     // Sync updated routing state.
                     bcastRoutingState(rank, dim,
                                       nullptr, nullptr, nullptr,
@@ -1222,6 +1276,15 @@ int main(int argc, char** argv)
                     double exec_recv[3]; // unused on non-root ranks
                     MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
                                0, MPI_COMM_WORLD);
+                    // Delta rebuild only: contribute remaining deleted slots to
+                    // the coordinator's SUM reduce.
+                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
+                        long long del_send = static_cast<long long>(
+                            subIndex.getLastRebuildRemainingDeleted());
+                        long long del_recv = 0LL; // unused on non-root ranks
+                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                    }
                 }
 
                 // Shard size gather.
@@ -1273,9 +1336,14 @@ int main(int argc, char** argv)
                 if (rb_type > 0) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
-                                     world_size, EF_CONSTRUCTION, M_SUB,
-                                     NUM_BUILDING_THREADS);
+                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
+                        subIndex.reBuildDelta(static_cast<int>(hdr.size), NCENTERS,
+                                              world_size, NUM_BUILDING_THREADS);
+                    } else {
+                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                                         world_size, EF_CONSTRUCTION, M_SUB,
+                                         NUM_BUILDING_THREADS);
+                    }
                     bcastRoutingState(rank, dim,
                                       nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
@@ -1289,6 +1357,13 @@ int main(int argc, char** argv)
                     double exec_recv[3];
                     MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
                                0, MPI_COMM_WORLD);
+                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
+                        long long del_send = static_cast<long long>(
+                            subIndex.getLastRebuildRemainingDeleted());
+                        long long del_recv = 0LL;
+                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                    }
                 }
 
                 // Shard size gather.
