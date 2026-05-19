@@ -401,28 +401,27 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
         *dist = centers[0].first;
     }
 
+    // Normalise all distances by the nearest-centroid distance so the
+    // exponential weighting is scale-invariant across datasets.
+    const double d0 = static_cast<double>(centers[0].first) + 1e-10;
+
     std::vector<double> partition_probs(num_partitions_, 0.0);
-
-    for (size_t rank = 0; rank < centers.size(); rank++) {
-        const float d = centers[rank].first;
-        const hnswlib::labeltype center_id = centers[rank].second;
-        const int pid = partitions[center_id];
-
-        // Match notebook logic: combine inverse-cubic distance weight with rank weight.
-        const double weight = 1.0 / std::pow(static_cast<double>(d) + 1e-5, 3.0);
-        const double order_weight = 1.0 / static_cast<double>(rank + 1);
-        partition_probs[pid] += order_weight * weight;
+    for (const auto& [d, center_id] : centers) {
+        const int    pid    = partitions[center_id];
+        const double rel_d  = static_cast<double>(d) / d0;
+        // Size-weighted exponential decay: P(p) proportional to |p| * exp(-alpha * d/d0).
+        // center_counts_[center_id] is the cluster-membership count and acts as the
+        // Bayesian prior; exp(-3 * rel_d) is the distance likelihood.
+        const double weight = static_cast<double>(center_counts_[center_id])
+                              * std::exp(-1.0 * rel_d);
+        partition_probs[static_cast<size_t>(pid)] += weight;
     }
 
-    double prob_sum = std::accumulate(partition_probs.begin(), partition_probs.end(), 0.0);
+    const double prob_sum = std::accumulate(partition_probs.begin(), partition_probs.end(), 0.0);
     if (prob_sum <= 0.0) {
-        // Fallback: at least route to nearest-center partition.
         return {static_cast<size_t>(partitions[centers[0].second])};
     }
-
-    for (double& p : partition_probs) {
-        p /= prob_sum;
-    }
+    for (double& p : partition_probs) p /= prob_sum;
 
     std::vector<size_t> ordered_pids(num_partitions_);
     std::iota(ordered_pids.begin(), ordered_pids.end(), 0);
@@ -434,18 +433,11 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
 
     std::vector<size_t> visited_partitions;
     double recall_estimate = 0.0;
-
     for (size_t pid : ordered_pids) {
-        if (partition_probs[pid] <= 0.0) {
-            break;
-        }
-
+        if (partition_probs[pid] <= 0.0) break;
         visited_partitions.push_back(pid);
         recall_estimate += partition_probs[pid];
-
-        if (recall_estimate >= recall_target) {
-            break;
-        }
+        if (recall_estimate >= recall_target) break;
     }
 
     if (visited_partitions.empty()) {
@@ -625,7 +617,7 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     // run partitioning algo
     start = MPI_Wtime();
     kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(), 
-           &w_partitions_int, &imbalance, true, seed, ECO, &edge_cut, new_partitions.data());
+           &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, new_partitions.data());
     end = MPI_Wtime();
     double partition_time = end-start;
 
