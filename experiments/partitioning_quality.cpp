@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
 
         // assign vectors to workers
         double start = MPI_Wtime();
-        int num_threads = 32; //TODO: hard coded
+        int num_threads = omp_get_max_threads(); //TODO: hard coded
         bool log_partitions = false; //TODO: hard coded
         std::vector<int> counts_per_partition = metaIndex.distribute_vectors(
             DATASETS[dataset_name]["base_file"], 
@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
         subIndex.build(
             200, // ef_construction, TODO: hard coded
             16, // M_sub, TODO: hard coded
-            32 // num_building_threads, TODO: hard coded
+            omp_get_max_threads() // num_building_threads, TODO: hard coded
         );
 
         std::string output_dir = dataset_name + "_" + std::to_string(num_partitions);
