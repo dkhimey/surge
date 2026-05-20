@@ -131,7 +131,8 @@ static std::set<int> routeQuery(
     const std::vector<int>&          partitions,
     int                              num_partitions,
     RoutingMode                      mode,
-    float                            param)
+    float                            param,
+    const std::vector<int>&          center_counts)
 {
     std::set<int> target_ranks;
 
@@ -176,19 +177,19 @@ static std::set<int> routeQuery(
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
-        // Size prior: count how many centers belong to each partition
-        std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
-        for (int p : partitions) part_size[static_cast<size_t>(p)]++;
-
-        // Scale-invariant weights: normalize by nearest-center distance
+        // Scale-invariant weights: normalize by nearest-center distance.
+        // Per-cluster membership count is the size prior — matching
+        // Coordinator::getPartitionsForSearch_RecallTgt_.
         const double d0 = static_cast<double>(centers[0].first) + 1e-10;
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
-            const double rel_d     = static_cast<double>(centers[r].first) / d0;
-            const int    pid       = partitions[static_cast<int>(centers[r].second)];
-            const double w         = std::exp(-1.0 * rel_d);
-            const double size_wt   = static_cast<double>(part_size[static_cast<size_t>(pid)]);
-            part_probs[static_cast<size_t>(pid)] += w * size_wt;
+            const double rel_d   = static_cast<double>(centers[r].first) / d0;
+            const int    cid     = static_cast<int>(centers[r].second);
+            const int    pid     = partitions[cid];
+            const double size_wt = static_cast<double>(
+                (!center_counts.empty() && cid < static_cast<int>(center_counts.size()))
+                ? std::max(center_counts[cid], 1) : 1);
+            part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
         }
 
         double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
@@ -385,6 +386,7 @@ int main(int argc, char** argv)
     // ── Shared routing state (all ranks) ─────────────────────────────────────
     std::unordered_map<int,int>       label_to_center;
     std::vector<int>                  routing_partitions;
+    std::vector<int>                  routing_center_counts;  // center_id → active vector count
     hnswlib::L2Space                  meta_space(dim);
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
@@ -793,6 +795,15 @@ int main(int argc, char** argv)
                 }
                 if (!have_gt && have_static_gt) { gt = static_gt; have_gt = true; }
 
+                // Broadcast current center_counts to all ranks so every rank uses
+                // the same per-cluster size prior in routeQuery (RecallTarget mode).
+                {
+                    routing_center_counts = metaIndex.getCenterCounts();
+                    int n = static_cast<int>(routing_center_counts.size());
+                    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                    MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
+                }
+
                 // ── Combo loop (results buffered; collect_sizes() called once after) ──
                 // Declared before the loop because ComboResult must live that long.
                 struct ComboResult {
@@ -825,7 +836,8 @@ int main(int argc, char** argv)
                             float* Q = queries.data() + q * dim;
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
-                                num_partitions, sweep_mode, sweep_param);
+                                num_partitions, sweep_mode, sweep_param,
+                                routing_center_counts);
                             thread_parts += static_cast<long long>(targets.size());
                             for (int tgt : targets) {
                                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
@@ -1210,6 +1222,14 @@ int main(int argc, char** argv)
                     }
                 }
 
+                // Receive center_counts broadcast from coordinator.
+                {
+                    int n = 0;
+                    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                    routing_center_counts.resize(n);
+                    MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
+                }
+
                 // Run once per combo — must match coordinator's combo loop exactly.
                 for (int ci = 0; ci < n_combos; ci++) {
                     const auto& [sweep_mode_ex, sweep_param_ex] = sweep_combos[ci];
@@ -1230,7 +1250,8 @@ int main(int argc, char** argv)
                             float* Q = queries.data() + q * dim;
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
-                                num_partitions, sweep_mode_ex, sweep_param_ex);
+                                num_partitions, sweep_mode_ex, sweep_param_ex,
+                                routing_center_counts);
                             thread_parts += static_cast<long long>(targets.size());
                             for (int tgt : targets) {
                                 local_qids[tgt].push_back(static_cast<uint32_t>(q));

@@ -45,6 +45,7 @@ public:
     hnswlib::HierarchicalNSW<float>* getMetaHNSW() { return meta_HNSW_; }
     const std::vector<int>& getPartitions() const { return partitions; }
     const std::unordered_map<int,int>& getLabelToCenter() const { return label_to_center_; }
+    const std::vector<int>& getCenterCounts() const { return center_counts_; }
 
     // Two-phase, lock-minimal center updates for batch insert/delete steps.
     // Phase 1 accumulates per-center sums in parallel; Phase 2 applies all
