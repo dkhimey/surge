@@ -166,12 +166,8 @@ void Coordinator::build(
     int seed = 0;
 
     std::cout << "NUMBER OF PARTITIONS: " << num_partitions << std::endl;
-    // run Karlsuhe partitioning algorithm
-    // kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(), 
-    //        &w_partitions_int, &imbalance, true, gen(), STRONG, &edge_cut, partitions.data());
-
-    // with vertex weights
-    kaffpa(&ncenters_int, center_counts_.data(), xadj.data(), nullptr, adjncy.data(), 
+    // run Karlsuhe partitioning algorithm (no vertex weights, matching rePartition)
+    kaffpa(&ncenters_int, nullptr, xadj.data(), nullptr, adjncy.data(),
            &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, partitions.data());
 
     end = MPI_Wtime();
@@ -597,7 +593,7 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
             new_meta_HNSW->addPoint(centers_.data() + (i * dim_), i);
         }
     }
-    new_meta_HNSW->setEf(100);
+    new_meta_HNSW->setEf(200);
     double end = MPI_Wtime();
     double hnsw_time = end-start;
 
@@ -1524,7 +1520,7 @@ void Coordinator::handle_deletes(const std::vector<int>& labels, int world_size)
 
 int Coordinator::kmeans_(float* sample, size_t nPrime, size_t m_centers, float* centers_, float EPSILON) {
     center_counts_ = std::vector<int>(m_centers, 0);
-    return kmeans(
+    int iters = kmeans(
         sample,
         nPrime,
         dim_,
@@ -1534,6 +1530,10 @@ int Coordinator::kmeans_(float* sample, size_t nPrime, size_t m_centers, float* 
         EPSILON,
         KMEANS_EPOCHS
     );
+    // Reset counts to zero so subsequent inserts accumulate from a clean
+    // baseline, matching the reference pipeline (msturing-cluster-analysis.cpp).
+    std::fill(center_counts_.begin(), center_counts_.end(), 0);
+    return iters;
 }
 
 // ========== Executor Implementation ==========
