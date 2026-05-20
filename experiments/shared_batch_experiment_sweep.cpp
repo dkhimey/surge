@@ -180,15 +180,29 @@ static std::set<int> routeQuery(
         // Scale-invariant weights: normalize by nearest-center distance.
         // Per-cluster membership count is the size prior — matching
         // Coordinator::getPartitionsForSearch_RecallTgt_.
+        // If center_counts is empty or all-zero (e.g. theoretical routing
+        // without any inserted vectors), fall back to the number of centers
+        // per partition, which is always derivable from partitions[].
         const double d0 = static_cast<double>(centers[0].first) + 1e-10;
+
+        bool counts_live = false;
+        if (!center_counts.empty()) {
+            for (int c : center_counts) { if (c > 0) { counts_live = true; break; } }
+        }
+        std::vector<int> part_size;
+        if (!counts_live) {
+            part_size.assign(static_cast<size_t>(num_partitions), 0);
+            for (int p : partitions) ++part_size[static_cast<size_t>(p)];
+        }
+
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
             const double rel_d   = static_cast<double>(centers[r].first) / d0;
             const int    cid     = static_cast<int>(centers[r].second);
             const int    pid     = partitions[cid];
-            const double size_wt = static_cast<double>(
-                (!center_counts.empty() && cid < static_cast<int>(center_counts.size()))
-                ? std::max(center_counts[cid], 1) : 1);
+            const double size_wt = counts_live
+                ? static_cast<double>(center_counts[static_cast<size_t>(cid)])
+                : static_cast<double>(part_size[static_cast<size_t>(pid)]);
             part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
         }
 

@@ -401,16 +401,28 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
     // exponential weighting is scale-invariant across datasets.
     const double d0 = static_cast<double>(centers[0].first) + 1e-10;
 
+    // Choose the size prior: if any center_counts_ entry is nonzero the
+    // index has seen real vectors and we use per-center membership counts.
+    // Otherwise (e.g. build() was called but no vectors were ever routed,
+    // as in theoretical_partitioning_quality) fall back to the number of
+    // centers assigned to each partition — always derivable from partitions[].
+    bool counts_live = false;
+    for (int c : center_counts_) { if (c > 0) { counts_live = true; break; } }
+
+    std::vector<int> part_size;
+    if (!counts_live) {
+        part_size.assign(num_partitions_, 0);
+        for (int p : partitions) ++part_size[static_cast<size_t>(p)];
+    }
+
     std::vector<double> partition_probs(num_partitions_, 0.0);
     for (const auto& [d, center_id] : centers) {
-        const int    pid    = partitions[center_id];
-        const double rel_d  = static_cast<double>(d) / d0;
-        // Size-weighted exponential decay: P(p) proportional to |p| * exp(-alpha * d/d0).
-        // center_counts_[center_id] is the cluster-membership count and acts as the
-        // Bayesian prior; exp(-3 * rel_d) is the distance likelihood.
-        const double weight = static_cast<double>(center_counts_[center_id])
-                              * std::exp(-1.0 * rel_d);
-        partition_probs[static_cast<size_t>(pid)] += weight;
+        const int    pid     = partitions[center_id];
+        const double rel_d   = static_cast<double>(d) / d0;
+        const double size_wt = counts_live
+            ? static_cast<double>(center_counts_[center_id])
+            : static_cast<double>(part_size[static_cast<size_t>(pid)]);
+        partition_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
     }
 
     const double prob_sum = std::accumulate(partition_probs.begin(), partition_probs.end(), 0.0);
