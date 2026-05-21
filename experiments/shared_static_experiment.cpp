@@ -174,7 +174,7 @@ static std::set<int> routeQuery(
                 const double size_wt = counts_live
                     ? static_cast<double>(center_counts[static_cast<size_t>(cid)])
                     : static_cast<double>(part_size[static_cast<size_t>(pid)]);
-                scratch_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
+                scratch_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-3.0 * rel_d);
             }
 
             double prob_sum = std::accumulate(scratch_probs.begin(), scratch_probs.end(), 0.0);
