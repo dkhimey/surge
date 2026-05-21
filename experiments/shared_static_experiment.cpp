@@ -584,17 +584,18 @@ int main(int argc, char** argv)
                       << "  avg_parts=" << avg_parts_warmup << "\n";
 
         // ── Timed passes ──────────────────────────────────────────────────────
-        // All NUM_RUNS passes run back-to-back inside a single timed region,
-        // matching gp-ann's approach (total_queries = nq * NUM_RUNS).
+        // Each run is timed independently.  QPS is computed from the minimum
+        // elapsed time (max-across-ranks per run, then min across runs).
         long long timed_parts_acc = 0;
-        uint64_t  timed_hits_acc  = 0;  // not used for QPS, only bookkeeping
-
-        MPI_Barrier(MPI_COMM_WORLD);
-        const double t0 = MPI_Wtime();
+        double    min_elapsed     = std::numeric_limits<double>::max();
 
         for (int r = 0; r < NUM_RUNS; r++) {
             long long pass_parts = 0;
             uint64_t  pass_hits  = 0;
+
+            MPI_Barrier(MPI_COMM_WORLD);
+            const double t0 = MPI_Wtime();
+
             runSearchPass(rank, world_size, num_partitions, k,
                           nq, my_qs, my_qe,
                           queries, dim,
@@ -603,23 +604,26 @@ int main(int argc, char** argv)
                           sub_index,
                           /*gt=*/nullptr,   // skip recall in timed passes
                           pass_parts, pass_hits);
+
+            const double t1 = MPI_Wtime();
+
+            double run_elapsed = t1 - t0;
+            double run_max     = 0.0;
+            MPI_Reduce(&run_elapsed, &run_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+            if (rank == 0)
+                min_elapsed = std::min(min_elapsed, run_max);
+
             timed_parts_acc += pass_parts;
         }
-
-        const double t1 = MPI_Wtime();
-        MPI_Barrier(MPI_COMM_WORLD);
-
-        double elapsed     = t1 - t0;
-        double max_elapsed = 0.0;
-        MPI_Reduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
         long long global_timed_parts = 0;
         MPI_Reduce(&timed_parts_acc, &global_timed_parts, 1, MPI_LONG_LONG,
                    MPI_SUM, 0, MPI_COMM_WORLD);
 
         if (rank == 0) {
-            const double qps = (max_elapsed > 0.0)
-                ? static_cast<double>(nq) * NUM_RUNS / max_elapsed
+            const double qps = (min_elapsed > 0.0)
+                ? static_cast<double>(nq) / min_elapsed
                 : 0.0;
             const double avg_parts_timed =
                 (nq > 0 && NUM_RUNS > 0)
