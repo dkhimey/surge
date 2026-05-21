@@ -78,22 +78,15 @@ static std::string mode_to_string(RoutingMode m)
 }
 
 // ─── routeQuery ──────────────────────────────────────────────────────────────
-// Matches shared_batch_experiment_sweep.cpp and Coordinator::getPartitionsForSearch_RecallTgt_
-// exactly — kept here so this file compiles standalone without a shared header.
-//
-// scratch_probs and scratch_ordered must be pre-allocated to size >= num_partitions
-// by the caller.  They are used only in the RecallTarget branch and are reset
-// in-place on each call, avoiding per-query heap allocation inside the hot loop.
+// Identical to shared_batch_experiment_sweep.cpp — kept here so this file
+// compiles standalone without a shared header.
 static std::set<int> routeQuery(
     float*                           vec,
     hnswlib::HierarchicalNSW<float>* hnsw,
     const std::vector<int>&          partitions,
     int                              num_partitions,
     RoutingMode                      mode,
-    float                            param,
-    const std::vector<int>&          center_counts,
-    std::vector<double>&             scratch_probs,
-    std::vector<int>&                scratch_ordered)
+    float                            param)
 {
     std::set<int> target_ranks;
 
@@ -134,80 +127,42 @@ static std::set<int> routeQuery(
     } else { // RecallTarget
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
+        size_t knn = std::min<size_t>(50, ncenters);
+        auto centers = hnsw->searchKnnCloserFirst(vec, knn);
+        if (centers.empty()) return target_ranks;
 
-        // Use per-centroid live vector counts as the size prior when available
-        // (matching Coordinator::getPartitionsForSearch_RecallTgt_ and
-        // shared_batch_experiment_sweep.cpp).  Fall back to centroid-per-partition
-        // counts only when center_counts is empty or all-zero (e.g. index built
-        // but no vectors ever routed).
-        bool counts_live = false;
-        if (!center_counts.empty()) {
-            for (int c : center_counts) { if (c > 0) { counts_live = true; break; } }
-        }
-        std::vector<int> part_size;
-        if (!counts_live) {
-            part_size.assign(static_cast<size_t>(num_partitions), 0);
-            for (int p : partitions) ++part_size[static_cast<size_t>(p)];
-        }
+        std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
+        for (int p : partitions) part_size[static_cast<size_t>(p)]++;
 
-        // Start with 2×num_partitions neighbors — enough to cover each partition
-        // at least twice on average — rather than a fixed 50.  If the greedy
-        // accumulation hits a zero-probability partition before reaching
-        // recall_target (meaning some partitions were not reached by the initial
-        // search), double knn and retry.  This expansion rarely fires in practice.
-        size_t knn = std::min<size_t>(static_cast<size_t>(num_partitions) * 2, ncenters);
-
-        std::vector<std::pair<float, hnswlib::labeltype>> centers;
-        while (true) {
-            centers = hnsw->searchKnnCloserFirst(vec, knn);
-            if (centers.empty()) return target_ranks;
-
-            const double d0 = static_cast<double>(centers[0].first) + 1e-10;
-
-            // Reset scratch buffer in-place — no allocation.
-            std::fill(scratch_probs.begin(), scratch_probs.end(), 0.0);
-
-            for (const auto& [d, cid_lbl] : centers) {
-                const double rel_d   = static_cast<double>(d) / d0;
-                const int    cid     = static_cast<int>(cid_lbl);
-                const int    pid     = partitions[cid];
-                const double size_wt = counts_live
-                    ? static_cast<double>(center_counts[static_cast<size_t>(cid)])
-                    : static_cast<double>(part_size[static_cast<size_t>(pid)]);
-                scratch_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-3.0 * rel_d);
-            }
-
-            double prob_sum = std::accumulate(scratch_probs.begin(), scratch_probs.end(), 0.0);
-            if (prob_sum <= 0.0) {
-                target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
-                return target_ranks;
-            }
-            for (double& p : scratch_probs) p /= prob_sum;
-
-            std::iota(scratch_ordered.begin(), scratch_ordered.end(), 0);
-            std::sort(scratch_ordered.begin(), scratch_ordered.end(),
-                      [&](int a, int b){ return scratch_probs[a] > scratch_probs[b]; });
-
-            double acc = 0.0;
-            target_ranks.clear();
-            bool hit_zero = false;
-            for (int pid : scratch_ordered) {
-                if (scratch_probs[static_cast<size_t>(pid)] <= 0.0) { hit_zero = true; break; }
-                target_ranks.insert(pid + 1);
-                acc += scratch_probs[static_cast<size_t>(pid)];
-                if (acc >= recall_target) break;
-            }
-
-            // Done if we reached the target, or all centroids are exhausted
-            // (can't expand further), or the greedy loop didn't hit a zero
-            // (all partitions had non-zero weight, so we have full coverage).
-            if (acc >= recall_target || knn >= ncenters || !hit_zero) break;
-
-            // Some partitions had zero weight because they weren't reached by
-            // the initial knn — double and retry.
-            knn = std::min(knn * 2, ncenters);
+        const double d0 = static_cast<double>(centers[0].first) + 1e-10;
+        std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
+        for (size_t r = 0; r < centers.size(); r++) {
+            const double rel_d   = static_cast<double>(centers[r].first) / d0;
+            const int    pid     = partitions[static_cast<int>(centers[r].second)];
+            const double w       = std::exp(-3.0 * rel_d);
+            const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
+            part_probs[static_cast<size_t>(pid)] += w * size_wt;
         }
 
+        double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
+        if (prob_sum <= 0.0) {
+            target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
+            return target_ranks;
+        }
+        for (double& p : part_probs) p /= prob_sum;
+
+        std::vector<int> ordered(num_partitions);
+        std::iota(ordered.begin(), ordered.end(), 0);
+        std::sort(ordered.begin(), ordered.end(),
+                  [&](int a, int b){ return part_probs[a] > part_probs[b]; });
+
+        double acc = 0.0;
+        for (int pid : ordered) {
+            if (part_probs[static_cast<size_t>(pid)] <= 0.0) break;
+            target_ranks.insert(pid + 1);
+            acc += part_probs[static_cast<size_t>(pid)];
+            if (acc >= recall_target) break;
+        }
         if (target_ranks.empty())
             target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
     }
@@ -314,7 +269,6 @@ static void runSearchPass(
     int                              dim,
     hnswlib::HierarchicalNSW<float>* routing_hnsw,
     const std::vector<int>&          routing_partitions,
-    const std::vector<int>&          routing_center_counts,
     RoutingMode                      mode,
     float                            param,
     Executor*                        sub_index,        // null on coordinator
@@ -334,19 +288,12 @@ static void runSearchPass(
         std::vector<std::vector<float>>    local_qvecs(world_size);
         long long thread_parts = 0;
 
-        // Per-thread scratch buffers for RecallTarget routing — allocated once
-        // here and reused across every query this thread processes.
-        std::vector<double> thread_probs(static_cast<size_t>(num_partitions), 0.0);
-        std::vector<int>    thread_ordered(static_cast<size_t>(num_partitions));
-
         #pragma omp for nowait schedule(static)
         for (size_t q = my_qs; q < my_qe; q++) {
             float* Q = const_cast<float*>(queries.data()) + q * dim;
             std::set<int> targets = routeQuery(
                 Q, routing_hnsw, routing_partitions,
-                num_partitions, mode, param,
-                routing_center_counts,
-                thread_probs, thread_ordered);
+                num_partitions, mode, param);
             thread_parts += static_cast<long long>(targets.size());
             for (int tgt : targets) {
                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
@@ -514,7 +461,6 @@ int main(int argc, char** argv)
 
     // ── Shared routing state (all ranks) ─────────────────────────────────────
     std::vector<int>                  routing_partitions;
-    std::vector<int>                  routing_center_counts;  // center_id → active vector count
     hnswlib::L2Space                  meta_space(dim);
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
@@ -539,14 +485,6 @@ int main(int argc, char** argv)
                           routing_hnsw, routing_partitions,
                           &meta_space);
 
-        // Broadcast per-centroid live vector counts so all ranks use the same
-        // size prior in RecallTarget routing (matching shared_batch_experiment_sweep
-        // and Coordinator::getPartitionsForSearch_RecallTgt_).
-        routing_center_counts = meta_index->getCenterCounts();
-        int n_cc = static_cast<int>(routing_center_counts.size());
-        MPI_Bcast(&n_cc, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(routing_center_counts.data(), n_cc, MPI_INT, 0, MPI_COMM_WORLD);
-
         std::cout << "[Static] Coordinator routing state broadcast complete\n";
     } else {
         // Executor: load shard, then receive routing state broadcast.
@@ -562,12 +500,6 @@ int main(int argc, char** argv)
         bcastRoutingState(rank, dim, nullptr, nullptr,
                           routing_hnsw, routing_partitions,
                           &meta_space);
-
-        // Receive center_counts broadcast from coordinator.
-        int n_cc = 0;
-        MPI_Bcast(&n_cc, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        routing_center_counts.resize(n_cc);
-        MPI_Bcast(routing_center_counts.data(), n_cc, MPI_INT, 0, MPI_COMM_WORLD);
 
         std::cout << "[Static] Executor " << rank << " ready\n";
     }
@@ -628,7 +560,6 @@ int main(int argc, char** argv)
                       nq, my_qs, my_qe,
                       queries, dim,
                       routing_hnsw, routing_partitions,
-                      routing_center_counts,
                       mode, param,
                       sub_index,
                       have_gt ? &gt : nullptr,
@@ -669,7 +600,6 @@ int main(int argc, char** argv)
                           nq, my_qs, my_qe,
                           queries, dim,
                           routing_hnsw, routing_partitions,
-                          routing_center_counts,
                           mode, param,
                           sub_index,
                           /*gt=*/nullptr,   // skip recall in timed passes
