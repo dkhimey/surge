@@ -47,7 +47,7 @@
 
 // ─── Hyper-parameters ────────────────────────────────────────────────────────
 static constexpr int EF_SEARCH = 200;
-static constexpr int NUM_RUNS  = 3;   // timed passes per (mode, param) combo
+static constexpr int NUM_RUNS  = 10;  // timed passes per (mode, param) combo
 
 // ─── Sweep grids (must match shared_batch_experiment_sweep.cpp) ───────────────
 static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 15, 20, 25, 30};
