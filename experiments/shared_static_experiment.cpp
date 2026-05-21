@@ -78,15 +78,16 @@ static std::string mode_to_string(RoutingMode m)
 }
 
 // ─── routeQuery ──────────────────────────────────────────────────────────────
-// Identical to shared_batch_experiment_sweep.cpp — kept here so this file
-// compiles standalone without a shared header.
+// Matches shared_batch_experiment_sweep.cpp and Coordinator::getPartitionsForSearch_RecallTgt_
+// exactly — kept here so this file compiles standalone without a shared header.
 static std::set<int> routeQuery(
     float*                           vec,
     hnswlib::HierarchicalNSW<float>* hnsw,
     const std::vector<int>&          partitions,
     int                              num_partitions,
     RoutingMode                      mode,
-    float                            param)
+    float                            param,
+    const std::vector<int>&          center_counts)
 {
     std::set<int> target_ranks;
 
@@ -131,17 +132,31 @@ static std::set<int> routeQuery(
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
-        std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
-        for (int p : partitions) part_size[static_cast<size_t>(p)]++;
+        // Use per-centroid live vector counts as the size prior when available
+        // (matching Coordinator::getPartitionsForSearch_RecallTgt_ and
+        // shared_batch_experiment_sweep.cpp).  Fall back to centroid-per-partition
+        // counts only when center_counts is empty or all-zero (e.g. index built
+        // but no vectors ever routed).
+        bool counts_live = false;
+        if (!center_counts.empty()) {
+            for (int c : center_counts) { if (c > 0) { counts_live = true; break; } }
+        }
+        std::vector<int> part_size;
+        if (!counts_live) {
+            part_size.assign(static_cast<size_t>(num_partitions), 0);
+            for (int p : partitions) ++part_size[static_cast<size_t>(p)];
+        }
 
         const double d0 = static_cast<double>(centers[0].first) + 1e-10;
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
             const double rel_d   = static_cast<double>(centers[r].first) / d0;
-            const int    pid     = partitions[static_cast<int>(centers[r].second)];
-            const double w       = std::exp(-3.0 * rel_d);
-            const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
-            part_probs[static_cast<size_t>(pid)] += w * size_wt;
+            const int    cid     = static_cast<int>(centers[r].second);
+            const int    pid     = partitions[cid];
+            const double size_wt = counts_live
+                ? static_cast<double>(center_counts[static_cast<size_t>(cid)])
+                : static_cast<double>(part_size[static_cast<size_t>(pid)]);
+            part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
         }
 
         double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
@@ -269,6 +284,7 @@ static void runSearchPass(
     int                              dim,
     hnswlib::HierarchicalNSW<float>* routing_hnsw,
     const std::vector<int>&          routing_partitions,
+    const std::vector<int>&          routing_center_counts,
     RoutingMode                      mode,
     float                            param,
     Executor*                        sub_index,        // null on coordinator
@@ -293,7 +309,8 @@ static void runSearchPass(
             float* Q = const_cast<float*>(queries.data()) + q * dim;
             std::set<int> targets = routeQuery(
                 Q, routing_hnsw, routing_partitions,
-                num_partitions, mode, param);
+                num_partitions, mode, param,
+                routing_center_counts);
             thread_parts += static_cast<long long>(targets.size());
             for (int tgt : targets) {
                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
@@ -461,6 +478,7 @@ int main(int argc, char** argv)
 
     // ── Shared routing state (all ranks) ─────────────────────────────────────
     std::vector<int>                  routing_partitions;
+    std::vector<int>                  routing_center_counts;  // center_id → active vector count
     hnswlib::L2Space                  meta_space(dim);
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
@@ -485,6 +503,14 @@ int main(int argc, char** argv)
                           routing_hnsw, routing_partitions,
                           &meta_space);
 
+        // Broadcast per-centroid live vector counts so all ranks use the same
+        // size prior in RecallTarget routing (matching shared_batch_experiment_sweep
+        // and Coordinator::getPartitionsForSearch_RecallTgt_).
+        routing_center_counts = meta_index->getCenterCounts();
+        int n_cc = static_cast<int>(routing_center_counts.size());
+        MPI_Bcast(&n_cc, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(routing_center_counts.data(), n_cc, MPI_INT, 0, MPI_COMM_WORLD);
+
         std::cout << "[Static] Coordinator routing state broadcast complete\n";
     } else {
         // Executor: load shard, then receive routing state broadcast.
@@ -500,6 +526,12 @@ int main(int argc, char** argv)
         bcastRoutingState(rank, dim, nullptr, nullptr,
                           routing_hnsw, routing_partitions,
                           &meta_space);
+
+        // Receive center_counts broadcast from coordinator.
+        int n_cc = 0;
+        MPI_Bcast(&n_cc, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        routing_center_counts.resize(n_cc);
+        MPI_Bcast(routing_center_counts.data(), n_cc, MPI_INT, 0, MPI_COMM_WORLD);
 
         std::cout << "[Static] Executor " << rank << " ready\n";
     }
@@ -560,6 +592,7 @@ int main(int argc, char** argv)
                       nq, my_qs, my_qe,
                       queries, dim,
                       routing_hnsw, routing_partitions,
+                      routing_center_counts,
                       mode, param,
                       sub_index,
                       have_gt ? &gt : nullptr,
@@ -600,6 +633,7 @@ int main(int argc, char** argv)
                           nq, my_qs, my_qe,
                           queries, dim,
                           routing_hnsw, routing_partitions,
+                          routing_center_counts,
                           mode, param,
                           sub_index,
                           /*gt=*/nullptr,   // skip recall in timed passes
