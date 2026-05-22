@@ -2025,8 +2025,32 @@ void Executor::reBuildDelta(
         for (hnswlib::tableint iid = 0; iid < static_cast<hnswlib::tableint>(nelts); iid++) {
             if (sub_HNSW_->isMarkedDeleted(iid)) continue;
 
+            int ext_lbl = static_cast<int>(sub_HNSW_->getExternalLabel(iid));
+
+            // Canonical-ownership check: verify that label_lookup_ maps this
+            // label back to this exact internal ID.  A mismatch means the slot
+            // holds a "ghost" label — its label_lookup_ entry was already
+            // updated to point to a different (live) slot by a replace_deleted
+            // addPoint, but the stale label value was never cleared from the
+            // data buffer.  Visiting ghost slots would feed the wrong label into
+            // the mark-delete pass, potentially causing "markDelete: Label not
+            // found" if the live entry was subsequently erased.
+            //
+            // No lock is needed here: the rebuild protocol guarantees no
+            // concurrent writes to label_lookup_ during this iterate pass
+            // (insertLocalBatch requires exclusive graph_mutex_, which is
+            // blocked by our shared_lock above; no other shard touches this
+            // local map).  All OMP threads are read-only, so concurrent reads
+            // of the unordered_map are safe under the C++ standard.
+            {
+                const auto it = sub_HNSW_->label_lookup_.find(
+                    static_cast<hnswlib::labeltype>(ext_lbl));
+                if (it == sub_HNSW_->label_lookup_.end() ||
+                        it->second != iid)
+                    continue;
+            }
+
             float* vec_ptr  = reinterpret_cast<float*>(sub_HNSW_->getDataByInternalId(iid));
-            int    ext_lbl  = static_cast<int>(sub_HNSW_->getExternalLabel(iid));
 
             hnswlib::labeltype center = metaHNSW->searchKnn(vec_ptr, 1).top().second;
             int p = partitions[center] + 1;   // executor rank = shard index + 1

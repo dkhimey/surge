@@ -830,7 +830,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock <std::mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end() || isMarkedDeleted(search->second)) {
-            throw std::runtime_error("Label not found");
+            throw std::runtime_error("getDataByLabel: Label not found");
         }
         tableint internalId = search->second;
         lock_table.unlock();
@@ -857,7 +857,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock <std::mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end()) {
-            throw std::runtime_error("Label not found");
+            throw std::runtime_error("markDelete: Label not found");
         }
         tableint internalId = search->second;
         lock_table.unlock();
@@ -899,7 +899,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock <std::mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end()) {
-            throw std::runtime_error("Label not found");
+            throw std::runtime_error("unmarkDelete: Label not found");
         }
         tableint internalId = search->second;
         lock_table.unlock();
@@ -982,7 +982,21 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             setExternalLabel(internal_id_replaced, label);
 
             std::unique_lock <std::mutex> lock_table(label_lookup_lock);
-            label_lookup_.erase(label_replaced);
+            // Only erase label_replaced from label_lookup_ if the entry still
+            // points to internal_id_replaced.  When a slot is mark-deleted and
+            // then a live replacement for the same label arrives and takes a
+            // *different* slot, label_lookup_[label_replaced] is updated to
+            // point to the new live slot while the old slot's data buffer still
+            // holds the stale label value ("ghost label").  If we unconditionally
+            // erase here we would destroy the valid live entry for that label.
+            {
+                auto it = label_lookup_.find(label_replaced);
+                if (it != label_lookup_.end() && it->second == internal_id_replaced) {
+                    label_lookup_.erase(it);
+                }
+                // else: label_replaced is a ghost — its label_lookup_ entry was
+                // already reassigned to a live slot; leave it intact.
+            }
             label_lookup_[label] = internal_id_replaced;
             lock_table.unlock();
 
