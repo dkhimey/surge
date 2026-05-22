@@ -830,7 +830,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock <std::mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end() || isMarkedDeleted(search->second)) {
-            throw std::runtime_error("Label not found");
+            throw std::runtime_error("getDataByLabel: Label not found");
         }
         tableint internalId = search->second;
         lock_table.unlock();
@@ -857,7 +857,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock <std::mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end()) {
-            throw std::runtime_error("Label not found");
+            throw std::runtime_error("markDelete: Label not found");
         }
         tableint internalId = search->second;
         lock_table.unlock();
@@ -899,7 +899,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::unique_lock <std::mutex> lock_table(label_lookup_lock);
         auto search = label_lookup_.find(label);
         if (search == label_lookup_.end()) {
-            throw std::runtime_error("Label not found");
+            throw std::runtime_error("unmarkDelete: Label not found");
         }
         tableint internalId = search->second;
         lock_table.unlock();
