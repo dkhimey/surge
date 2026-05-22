@@ -1256,8 +1256,14 @@ int main(int argc, char** argv)
                     const int label = range_start + i;
                     const int cid   = del_center_ids[i];
                     if (cid == -1) continue;
-                    if (routing_partitions[cid] + 1 == rank)
-                        my_delete_labels.push_back(label);
+                    // Every executor attempts every label.  The one that actually
+                    // holds the vector will succeed; the others get "Label not
+                    // found" from hnswlib and markDeleteLocalBatch silently skips
+                    // them.  This is correct even after a delta rebuild where
+                    // reBuildDelta may have reclassified a vector to a different
+                    // nearest center than label_to_center records, making
+                    // routing_partitions[cid]-based filtering unreliable.
+                    my_delete_labels.push_back(label);
                     label_to_center.erase(label);
                 }
                 subIndex.markDeleteLocalBatch(my_delete_labels);
