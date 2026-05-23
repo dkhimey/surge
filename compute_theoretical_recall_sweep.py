@@ -248,9 +248,13 @@ def compute_step_sweep(
     partition_step: int,
     k_neighbors:    int,
     num_partitions: int,
-) -> Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]]:
+) -> Tuple[
+    Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]],
+    Dict[float, Tuple[float, float]],
+]:
     """
-    Run all (mode, param) sweep combinations for a single runbook step.
+    Run all (mode, param) sweep combinations for a single runbook step,
+    and compute oracle lower bounds for each recall target.
 
     Parameters
     ----------
@@ -266,7 +270,7 @@ def compute_step_sweep(
 
     Returns
     -------
-    dict keyed by (mode_str, param) ->
+    routing_results : dict keyed by (mode_str, param) ->
         (recall, activation_rate, per_partition_counts, query_time_s)
     """
     ground_truth = read_fbin_ground_truth(gt_file)
@@ -448,7 +452,43 @@ def compute_step_sweep(
         ppc        = _compute_per_partition_counts(visited, num_partitions)
         results[("RecallTarget", float(target))] = (recall, activation, ppc, t_rt)
 
-    return results
+    # ── Oracle lower bounds ────────────────────────────────────────────────────
+    # For each recall target τ, compute the minimum number of partitions that
+    # would need to be visited per query if partitions could be perfectly ranked
+    # by GT-neighbour density.  This is derived entirely from ground_truth_partitions
+    # (already computed above) so no extra file loading or routing is needed.
+    #
+    # query_dist[i, p] = fraction of query i's k GT neighbours in partition p.
+    # Sorting descending and cumsumming gives the achievable recall curve; the
+    # oracle picks the fewest partitions whose cumulative mass meets τ.
+    query_dist = np.zeros((num_queries, num_partitions), dtype=np.float64)
+    for i in range(num_queries):
+        counts = np.bincount(
+            np.array(ground_truth_partitions[i], dtype=np.intp),
+            minlength=num_partitions,
+        )
+        query_dist[i] = counts / k_neighbors
+
+    sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]  # (Q, P) descending
+    cumsum      = np.cumsum(sorted_dist, axis=1)         # (Q, P)
+
+    oracle_results: Dict[float, Tuple[float, float]] = {}
+    for target in TARGET_PARAMS:
+        meets = cumsum >= target                          # (Q, P) bool
+        idx   = np.where(
+            meets.any(axis=1),
+            np.argmax(meets, axis=1),
+            num_partitions - 1,                          # fallback: all partitions needed
+        )                                                # (Q,) 0-indexed
+        n_parts         = idx + 1                        # (Q,) number of partitions visited
+        achieved_recall = cumsum[np.arange(num_queries), idx]
+
+        oracle_results[float(target)] = (
+            float(n_parts.mean()) / num_partitions,      # mean activation
+            float(achieved_recall.mean()),               # mean achieved recall
+        )
+
+    return results, oracle_results
 
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
@@ -493,15 +533,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing ground-truth files (step<N+1>.gt100).",
     )
     return parser.parse_args()
-
-
-# ─── Column name helper ───────────────────────────────────────────────────────
-
-def combo_col(metric: str, tag: str, mode: str, param: float) -> str:
-    """Build a column name.  e.g. recall_no_rebuilds_BranchingFactor_5
-    or activation_rebuild_RecallTarget_0.90"""
-    p_str = f"{param:.2f}" if mode == "RecallTarget" else str(int(param))
-    return f"{metric}_{tag}_{mode}_{p_str}"
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -589,21 +620,25 @@ if __name__ == "__main__":
     # ── Run evaluations ───────────────────────────────────────────────────────
     # rebuild_results[step]    = {(mode, param): (recall, activation, ppc, t)}
     # no_rebuild_results[step] = {(mode, param): (recall, activation, ppc, t)}
-    rebuild_results:    Dict[int, Dict] = {}
-    no_rebuild_results: Dict[int, Dict] = {}
+    # *_oracle_results[step]   = {target: (oracle_activation, oracle_recall)}
+    rebuild_results:          Dict[int, Dict] = {}
+    no_rebuild_results:       Dict[int, Dict] = {}
+    rebuild_oracle_results:   Dict[int, Dict] = {}
+    no_rebuild_oracle_results: Dict[int, Dict] = {}
 
     # Rebuild pass — per-step router and partitions
     if not args.no_rebuilds:
         for step in processed_steps:
             gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
             print(f"\nREBUILDING: evaluating step {step} ...")
-            res = compute_step_sweep(
+            res, oracle = compute_step_sweep(
                 queries, base_mmap, gt_test,
                 base_directory, partitions_directory,
                 hnsw_step=step, partition_step=step,
                 k_neighbors=10, num_partitions=num_partitions,
             )
-            rebuild_results[step] = res
+            rebuild_results[step]        = res
+            rebuild_oracle_results[step] = oracle
             for (mode, param), (recall, activation, _, _) in res.items():
                 print(
                     f"  [{mode}={param:.4g}] "
@@ -616,13 +651,14 @@ if __name__ == "__main__":
         if not Path(gt_test).exists():
             continue
         print(f"\nNO REBUILDING: evaluating step {step} ...")
-        res = compute_step_sweep(
+        res, oracle = compute_step_sweep(
             queries, base_mmap, gt_test,
             base_directory, partitions_directory,
             hnsw_step=step_start, partition_step=step_start,
             k_neighbors=10, num_partitions=num_partitions,
         )
-        no_rebuild_results[step] = res
+        no_rebuild_results[step]        = res
+        no_rebuild_oracle_results[step] = oracle
         for (mode, param), (recall, activation, _, _) in res.items():
             print(
                 f"  [{mode}={param:.4g}] "
@@ -630,46 +666,51 @@ if __name__ == "__main__":
             )
 
     # ── Build output DataFrame ────────────────────────────────────────────────
+    # Tidy / long format: one row per (step, rebuild_tag, mode, param).
+    # Columns: step, rebuild, mode, param, recall, activation, cof, query_time_s
+    # Oracle rows use mode="Oracle" and carry no cof or query_time_s.
     all_steps = sorted(set(rebuild_results) | set(no_rebuild_results))
     if not all_steps:
         print("No steps were evaluated. Exiting.")
         raise SystemExit(0)
 
-    # Reference combo for coefficient-of-variation computation
-    # (BranchingFactor=1, matching the convention in compute_theoretical_recall_updated.py)
-    ref_combo = ("BranchingFactor", 1.0)
-
     rows: List[Dict[str, Any]] = []
     for step in all_steps:
-        row: Dict[str, Any] = {"step": step}
-
-        # CoV of per-partition activation counts using BranchingFactor=1 as reference
+        tags = []
         if not args.no_rebuilds and step in rebuild_results:
-            _, _, ppc_ref, _ = rebuild_results[step][ref_combo]
-            mean_val = np.mean(ppc_ref)
-            row["cof"] = (np.std(ppc_ref) / mean_val) if mean_val > 0 else float("nan")
-
+            tags.append(("rebuild",     rebuild_results[step],     rebuild_oracle_results[step]))
         if step in no_rebuild_results:
-            _, _, ppc_ref_nr, _ = no_rebuild_results[step][ref_combo]
-            mean_val_nr = np.mean(ppc_ref_nr)
-            row["cof_no_rebuilds"] = (
-                (np.std(ppc_ref_nr) / mean_val_nr) if mean_val_nr > 0 else float("nan")
-            )
+            tags.append(("no_rebuilds", no_rebuild_results[step],  no_rebuild_oracle_results[step]))
 
-        for (mode, param) in SWEEP_COMBOS:
-            if not args.no_rebuilds and step in rebuild_results:
-                r, act, _, t = rebuild_results[step][(mode, param)]
-                row[combo_col("recall",       "rebuild", mode, param)] = r
-                row[combo_col("activation",   "rebuild", mode, param)] = act
-                row[combo_col("query_time_s", "rebuild", mode, param)] = t
-
-            if step in no_rebuild_results:
-                r, act, _, t = no_rebuild_results[step][(mode, param)]
-                row[combo_col("recall",       "no_rebuilds", mode, param)] = r
-                row[combo_col("activation",   "no_rebuilds", mode, param)] = act
-                row[combo_col("query_time_s", "no_rebuilds", mode, param)] = t
-
-        rows.append(row)
+        for tag, res, oracle in tags:
+            # Routing rows
+            for (mode, param) in SWEEP_COMBOS:
+                r, act, ppc, t = res[(mode, param)]
+                mean_val = np.mean(ppc)
+                cof = (np.std(ppc) / mean_val) if mean_val > 0 else float("nan")
+                rows.append({
+                    "step":         step,
+                    "rebuild":      tag,
+                    "mode":         mode,
+                    "param":        param,
+                    "recall":       r,
+                    "activation":   act,
+                    "cof":          cof,
+                    "query_time_s": t,
+                })
+            # Oracle rows — one per recall target
+            for target in TARGET_PARAMS:
+                oracle_act, oracle_recall = oracle[float(target)]
+                rows.append({
+                    "step":         step,
+                    "rebuild":      tag,
+                    "mode":         "Oracle",
+                    "param":        target,
+                    "recall":       oracle_recall,
+                    "activation":   oracle_act,
+                    "cof":          float("nan"),
+                    "query_time_s": float("nan"),
+                })
 
     table = pd.DataFrame(rows)
 
