@@ -283,7 +283,7 @@ def compute_step_sweep(
 
     # Load partition assignments: center_id -> partition_id
     partition_file = f"{partition_dir}/step_{partition_step:06d}_partitions.csv"
-    partitions = np.loadtxt(partition_file, delimiter=",", dtype=int)
+    partitions = np.loadtxt(partition_file, delimiter=",", dtype=int)[:-1]
 
     # ── Route GT vectors to determine their partition assignments ─────────────
     # Each GT neighbor is assigned to the partition of its nearest center.
@@ -563,7 +563,7 @@ if __name__ == "__main__":
     first_partition_file = (
         f"{partitions_directory}/step_{step_start:06d}_partitions.csv"
     )
-    first_partitions = np.loadtxt(first_partition_file, delimiter=",", dtype=int)
+    first_partitions = np.loadtxt(first_partition_file, delimiter=",", dtype=int)[:-1]
     num_partitions   = int(first_partitions.max()) + 1
     print(f"Found {num_partitions} partitions")
 
