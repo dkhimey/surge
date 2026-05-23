@@ -308,6 +308,11 @@ public:
     // Returns the number of active (non-deleted) elements in the sub-HNSW.
     size_t getElementCount() const;
 
+    // Returns the fraction of allocated HNSW slots that are tombstones:
+    //   num_deleted_ / getCurrentElementCount()
+    // Returns 0.0 when the graph is empty.
+    double getTombstoneRatio() const;
+
     // Per-phase wall-clock times from the most recent reBuild() call.
     // These are set before REBUILD_SUCCESS is sent, so they are valid
     // as soon as reBuild() returns.  All return 0.0 before the first rebuild.

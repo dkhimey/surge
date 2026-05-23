@@ -2410,6 +2410,14 @@ size_t Executor::getElementCount() const {
     return (total > deleted) ? (total - deleted) : 0;
 }
 
+double Executor::getTombstoneRatio() const {
+    std::shared_lock lock(graph_mutex_);
+    const size_t total   = sub_HNSW_->getCurrentElementCount();
+    if (total == 0) return 0.0;
+    const size_t deleted = sub_HNSW_->getDeletedCount();
+    return static_cast<double>(deleted) / static_cast<double>(total);
+}
+
 // ── insertLocalBatch ─────────────────────────────────────────────────────────
 // Insert a batch of vectors (received via AllToAllV in shared_batch_experiment)
 // directly into the local sub-HNSW without going through the MPI message
