@@ -133,7 +133,12 @@ def mmap_u8bin(filename: str) -> np.memmap:
                      offset=8, shape=(num_points, dim))
 
 
-def read_fbin_ground_truth(filename: str) -> List[List[int]]:
+def read_fbin_ground_truth(filename: str) -> np.ndarray:
+    """Read ground-truth neighbor IDs, returned as a (num_queries, K) int array.
+
+    Returns np.intp dtype so the array can be used directly as an index into
+    other numpy arrays without an extra cast.
+    """
     with open(filename, "rb") as f:
         num_queries = np.frombuffer(f.read(4), dtype=np.uint32)[0]
         K = np.frombuffer(f.read(4), dtype=np.uint32)[0]
@@ -141,8 +146,8 @@ def read_fbin_ground_truth(filename: str) -> List[List[int]]:
         all_ids = np.frombuffer(f.read(total_elements * 4), dtype=np.uint32)
         if all_ids.size != total_elements:
             raise ValueError("Failed to read neighbor IDs")
-        f.seek(total_elements * 4, 1)  # skip distances
-        return all_ids.reshape((num_queries, K)).astype(int).tolist()
+        # distances follow in the file; we don't read further so no seek needed
+    return all_ids.reshape((num_queries, K)).astype(np.intp)
 
 
 def parse_runbook(path: str) -> Dict[int, int]:
@@ -205,112 +210,70 @@ def find_first_available_step(base_dir: str, partitions_dir: str) -> int:
 # ─── Shared recall metrics ────────────────────────────────────────────────────
 
 def _compute_recall(
-    visited: Dict[int, set],
-    ground_truth_partitions: Dict[int, List[int]],
-    num_queries: int,
+    visited_mask: np.ndarray,
+    gt_parts: np.ndarray,
+    k: int,
 ) -> float:
-    total = 0.0
-    for i in range(num_queries):
-        gt   = ground_truth_partitions[i]
-        hits = sum(1 for p in gt if p in visited[i])
-        total += hits / len(gt)
-    return total / num_queries
+    """Fraction of GT partition neighbours found, averaged over queries.
+
+    Parameters
+    ----------
+    visited_mask : (Q, P) bool array — True where a partition was visited.
+    gt_parts     : (Q, k) int array  — partition ID of each GT neighbour.
+    k            : number of GT neighbours per query.
+    """
+    Q    = gt_parts.shape[0]
+    hits = visited_mask[np.arange(Q)[:, None], gt_parts].sum(axis=1)  # (Q,)
+    return float((hits / k).mean())
 
 
 def _compute_activation(
-    visited: Dict[int, set],
-    num_queries: int,
+    visited_mask: np.ndarray,
     num_partitions: int,
 ) -> float:
-    return sum(len(v) / num_partitions for v in visited.values()) / num_queries
+    """Mean fraction of partitions visited per query."""
+    return float(visited_mask.sum(axis=1).mean()) / num_partitions
 
 
 def _compute_per_partition_counts(
-    visited: Dict[int, set],
-    num_partitions: int,
+    visited_mask: np.ndarray,
 ) -> np.ndarray:
-    counts = np.zeros(num_partitions, dtype=np.int64)
-    for vps in visited.values():
-        for pid in vps:
-            counts[pid] += 1
-    return counts
+    """Number of queries that visited each partition."""
+    return visited_mask.sum(axis=0).astype(np.int64)
 
 
-# ─── Per-step sweep computation ───────────────────────────────────────────────
+# ─── Routing cache ────────────────────────────────────────────────────────────
 
-def compute_step_sweep(
+def _build_routing_cache(
     queries:        np.ndarray,
-    base_mmap,
-    gt_file:        str,
     base_dir:       str,
     partition_dir:  str,
     hnsw_step:      int,
     partition_step: int,
-    k_neighbors:    int,
     num_partitions: int,
-) -> Tuple[
-    Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]],
-    Dict[float, Tuple[float, float]],
-]:
+) -> dict:
+    """Load HNSW + partitions, run the unified knn_query, precompute per-mode structures.
+
+    Separating routing setup from GT evaluation allows the no-rebuild pass to
+    call this once and reuse the result across all steps — avoiding redundant
+    HNSW loads and knn_query calls when hnsw_step/partition_step are constant.
+
+    Returns a dict with keys:
+      router, partitions, current_count, num_partitions, Q,
+      labels_bf_all, unique_orders,
+      ordered_pids_rt, cumprobs_rt, fallback_pids_rt,
+      t_unified
     """
-    Run all (mode, param) sweep combinations for a single runbook step,
-    and compute oracle lower bounds for each recall target.
-
-    Parameters
-    ----------
-    queries         : query vectors, shape (Q, dim), float32
-    base_mmap       : mmap of the base vector file
-    gt_file         : path to the ground-truth file for this step
-    base_dir        : directory with step_NNNNNN_hnsw.bin files
-    partition_dir   : directory with step_NNNNNN_partitions.csv files
-    hnsw_step       : step number to load HNSW from
-    partition_step  : step number to load partitions from
-    k_neighbors     : number of ground-truth neighbors (k for recall@k)
-    num_partitions  : total number of partitions
-
-    Returns
-    -------
-    routing_results : dict keyed by (mode_str, param) ->
-        (recall, activation_rate, per_partition_counts, query_time_s)
-    """
-    ground_truth = read_fbin_ground_truth(gt_file)
-    num_queries  = len(ground_truth)
-
-    # Load HNSW router
     router = hnswlib.Index(space='l2', dim=100)
     router.load_index(f"{base_dir}/step_{hnsw_step:06d}_hnsw.bin")
     current_count = router.get_current_count()
 
-    # Load partition assignments: center_id -> partition_id
     partition_file = f"{partition_dir}/step_{partition_step:06d}_partitions.csv"
     partitions = np.loadtxt(partition_file, delimiter=",", dtype=int)[:-1]
 
-    # ── Route GT vectors to determine their partition assignments ─────────────
-    # Each GT neighbor is assigned to the partition of its nearest center.
-    gt_indices = np.empty(num_queries * k_neighbors, dtype=np.int64)
-    pos = 0
-    for gt_list in ground_truth:
-        gt_indices[pos:pos + k_neighbors] = gt_list[:k_neighbors]
-        pos += k_neighbors
-
-    vecs_gt = np.ascontiguousarray(base_mmap[gt_indices]).astype(np.float32)
-    router.set_ef(100)
-    labels_gt, _ = router.knn_query(vecs_gt, k=1)
-    gt_part_ids  = partitions[labels_gt[:, 0]]
-
-    ground_truth_partitions: Dict[int, List[int]] = {}
-    pos = 0
-    for i in range(num_queries):
-        ground_truth_partitions[i] = gt_part_ids[pos:pos + k_neighbors].tolist()
-        pos += k_neighbors
-
-    results: Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]] = {}
+    Q = len(queries)
 
     # ── Single unified HNSW query shared by all three routing modes ───────────
-    # BranchingFactor needs k=max_bf=80, RecallTarget needs k=50, NProbe needs
-    # ≥max_nprobe=9 unique partitions.  One knn_query for max(max_bf, k_rt_max)
-    # satisfies all three; we only expand when the NProbe uniqueness condition
-    # is not yet met (same expansion logic as before, but shared).
     max_bf     = max(BRANCHING_FACTOR_PARAMS)
     max_nprobe = max(NPROBE_PARAMS)
     k_rt_max   = min(50, current_count)
@@ -335,49 +298,14 @@ def compute_step_sweep(
         labels_all, dists_all = router.knn_query(queries, k=k_np)
         t_unified = time.perf_counter() - t0
 
-    # Derive per-mode views — slices share the underlying array, no copy.
+    # Derive per-mode slices (share memory, no copy).
     k_bf_actual   = min(max_bf, current_count)
     labels_bf_all = labels_all[:, :k_bf_actual]
-    labels_np_all = labels_all
     labels_rt_all = labels_all[:, :k_rt_max]
     dists_rt_all  = dists_all[:, :k_rt_max]
-    t_bf = t_np = t_rt = t_unified
 
-    # ── BranchingFactor sweep ──────────────────────────────────────────────────
-    # Mirrors getPartitionsForSearch_Branching_: query HNSW for k nearest
-    # centers, collect all unique partitions among those k centers.
-    # Each bf value uses a prefix of labels_bf_all.
-
-    for bf in BRANCHING_FACTOR_PARAMS:
-        k          = min(bf, current_count)
-        labels_bf  = labels_bf_all[:, :k]
-
-        visited: Dict[int, set] = {}
-        for i, label_list in enumerate(labels_bf):
-            visited[i] = set(int(partitions[l]) for l in label_list)
-
-        recall     = _compute_recall(visited, ground_truth_partitions, num_queries)
-        activation = _compute_activation(visited, num_queries, num_partitions)
-        ppc        = _compute_per_partition_counts(visited, num_partitions)
-        results[("BranchingFactor", float(bf))] = (recall, activation, ppc, t_bf)
-
-    # ── NProbe sweep ───────────────────────────────────────────────────────────
-    # Mirrors getPartitionsForSearch_Nprobe_: expand HNSW k until every query
-    # has at least max(NPROBE_PARAMS) unique partitions in its result list,
-    # then walk centers in nearest-first order collecting nprobe unique
-    # partitions per query.
-    #
-    # The expansion loop matches the C++ while-loop (starting at nprobe and
-    # multiplying by 10 each iteration).  All nprobe values share one final
-    # knn_query result.
-    # labels_np_all and t_np are set by the unified HNSW query above.
-
-    # ── Precompute ordered-unique partition lists for NProbe ──────────────────
-    # Map every label to its partition once via numpy, then build the
-    # arrival-order list of unique partitions per query in a single Python pass.
-    # All nprobe values share this structure — each is just a prefix slice,
-    # eliminating the O(Q × max_nprobe × k_np) rescanning of the old approach.
-    part_seq = partitions[labels_np_all]   # (Q, k_np) – fast numpy lookup
+    # ── NProbe: ordered-unique partition list per query ───────────────────────
+    part_seq = partitions[labels_all]   # (Q, k_np)
     unique_orders: List[List[int]] = []
     for row in part_seq:
         seen_set: set = set()
@@ -388,118 +316,197 @@ def compute_step_sweep(
                 order.append(pid)
         unique_orders.append(order)
 
-    for nprobe in NPROBE_PARAMS:
-        visited: Dict[int, set] = {
-            i: set(unique_orders[i][:nprobe]) for i in range(num_queries)
-        }
+    # ── RecallTarget: vectorised probability precomputation ───────────────────
+    # part_size via np.bincount (no Python loop).
+    part_size = np.bincount(partitions.astype(np.intp),
+                             minlength=num_partitions).astype(np.float64)
 
-        recall     = _compute_recall(visited, ground_truth_partitions, num_queries)
-        activation = _compute_activation(visited, num_queries, num_partitions)
-        ppc        = _compute_per_partition_counts(visited, num_partitions)
-        results[("NProbe", float(nprobe))] = (recall, activation, ppc, t_np)
+    d0_rt      = dists_rt_all[:, :1] + 1e-10                      # (Q, 1)
+    rel_d_rt   = dists_rt_all / d0_rt                              # (Q, k_rt)
+    pids_rt    = partitions[labels_rt_all]                         # (Q, k_rt)
+    weights_rt = part_size[pids_rt] * np.exp(-rel_d_rt)           # (Q, k_rt)
 
-    # ── RecallTarget sweep ─────────────────────────────────────────────────────
-    # Mirrors getPartitionsForSearch_RecallTgt_:
-    #
-    # 1. Query HNSW for the nearest min(50, ncenters) centers.
-    # 2. For each center c at squared-L2 distance d to the query:
-    #      score contribution = part_size[partition(c)] * exp(−d / d0)
-    #    where d0 = distance to the nearest center + ε (scale normalisation)
-    #    and part_size[p] = number of centers assigned to partition p (used as
-    #    the size prior; matches the C++ fallback when center_counts_ are all
-    #    zero, which is always the case in the offline theoretical setting).
-    # 3. Normalise scores to a probability distribution over partitions.
-    # 4. Walk partitions in descending probability order, accumulating
-    #    probability until the cumulative sum meets recall_target.
-    # labels_rt_all, dists_rt_all and t_rt are set by the unified HNSW query above.
+    # np.bincount with weights: faster scatter-add than np.add.at.
+    linear_idx = (np.arange(Q)[:, None] * num_partitions + pids_rt).ravel()
+    partition_probs_all = np.bincount(
+        linear_idx,
+        weights=weights_rt.ravel(),
+        minlength=Q * num_partitions,
+    ).reshape(Q, num_partitions)
 
-    # Size prior: number of centers per partition (computed once, shared
-    # across all TARGET_PARAMS iterations).
-    part_size = np.zeros(num_partitions, dtype=np.float64)
-    for pid in partitions:
-        part_size[int(pid)] += 1.0
-
-    # ── Vectorised probability pre-computation ────────────────────────────────
-    # Replace the per-query Python loop with fully vectorised NumPy operations.
-    # All Q queries are processed simultaneously.
-    Q = num_queries
-    d0_rt       = dists_rt_all[:, :1] + 1e-10                     # (Q, 1)
-    rel_d_rt    = dists_rt_all / d0_rt                             # (Q, k_rt)
-    pids_rt     = partitions[labels_rt_all]                        # (Q, k_rt)
-    weights_rt  = part_size[pids_rt] * np.exp(-rel_d_rt)          # (Q, k_rt)
-
-    partition_probs_all = np.zeros((Q, num_partitions), dtype=np.float64)
-    np.add.at(partition_probs_all,
-              (np.arange(Q)[:, None], pids_rt),
-              weights_rt)
-
-    prob_sums        = partition_probs_all.sum(axis=1, keepdims=True)  # (Q, 1)
-    fallback_pids_rt = partitions[labels_rt_all[:, 0]]                 # (Q,)
+    prob_sums        = partition_probs_all.sum(axis=1, keepdims=True)
+    fallback_pids_rt = partitions[labels_rt_all[:, 0]]
     zero_mask        = prob_sums[:, 0] <= 0.0
     partition_probs_all[zero_mask, fallback_pids_rt[zero_mask]] = 1.0
     prob_sums[zero_mask] = 1.0
-    partition_probs_all /= prob_sums                                    # normalise
+    partition_probs_all /= prob_sums
 
-    ordered_pids_rt = np.argsort(-partition_probs_all, axis=1)         # (Q, P) desc
+    ordered_pids_rt = np.argsort(-partition_probs_all, axis=1)         # (Q, P)
     sorted_probs_rt = np.take_along_axis(partition_probs_all,
-                                         ordered_pids_rt, axis=1)      # (Q, P)
+                                          ordered_pids_rt, axis=1)
     cumprobs_rt     = np.cumsum(sorted_probs_rt, axis=1)               # (Q, P)
 
+    return dict(
+        router=router,
+        partitions=partitions,
+        current_count=current_count,
+        num_partitions=num_partitions,
+        Q=Q,
+        labels_bf_all=labels_bf_all,
+        unique_orders=unique_orders,
+        ordered_pids_rt=ordered_pids_rt,
+        cumprobs_rt=cumprobs_rt,
+        fallback_pids_rt=fallback_pids_rt,
+        t_unified=t_unified,
+    )
+
+
+def _eval_step(
+    cache:       dict,
+    gt_file:     str,
+    base_mmap,
+    k_neighbors: int,
+) -> Tuple[
+    Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]],
+    Dict[float, Tuple[float, float]],
+]:
+    """Evaluate all sweep combinations for one GT file using a prebuilt routing cache.
+
+    Parameters
+    ----------
+    cache       : dict returned by _build_routing_cache.
+    gt_file     : path to the ground-truth .gt100 file for this step.
+    base_mmap   : mmap of the base vector file (for GT vector lookup).
+    k_neighbors : k for recall@k.
+    """
+    router           = cache["router"]
+    partitions       = cache["partitions"]
+    current_count    = cache["current_count"]
+    num_partitions   = cache["num_partitions"]
+    Q                = cache["Q"]
+    labels_bf_all    = cache["labels_bf_all"]
+    unique_orders    = cache["unique_orders"]
+    ordered_pids_rt  = cache["ordered_pids_rt"]
+    cumprobs_rt      = cache["cumprobs_rt"]
+    fallback_pids_rt = cache["fallback_pids_rt"]
+    t_unified        = cache["t_unified"]
+
+    # ── Load GT and map each GT neighbour to its partition ────────────────────
+    # read_fbin_ground_truth returns (Q, k) np.intp — no loop needed.
+    ground_truth = read_fbin_ground_truth(gt_file)         # (Q, k)
+    gt_indices   = ground_truth.ravel()                    # (Q*k,)
+    vecs_gt      = np.ascontiguousarray(
+                       base_mmap[gt_indices]).astype(np.float32)
+    router.set_ef(100)
+    labels_gt, _ = router.knn_query(vecs_gt, k=1)
+    gt_part_ids  = partitions[labels_gt[:, 0]]             # (Q*k,)
+    gt_parts_2d  = gt_part_ids.reshape(Q, k_neighbors)    # (Q, k)
+
+    results: Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]] = {}
+
+    # ── BranchingFactor sweep ─────────────────────────────────────────────────
+    # Mirrors getPartitionsForSearch_Branching_: collect all unique partitions
+    # among the k nearest centers.  Boolean mask replaces dict-of-sets.
+    for bf in BRANCHING_FACTOR_PARAMS:
+        k       = min(bf, current_count)
+        pids_bf = partitions[labels_bf_all[:, :k]]         # (Q, k)
+        visited_mask = np.zeros((Q, num_partitions), dtype=bool)
+        visited_mask[np.arange(Q)[:, None], pids_bf] = True
+
+        recall     = _compute_recall(visited_mask, gt_parts_2d, k_neighbors)
+        activation = _compute_activation(visited_mask, num_partitions)
+        ppc        = _compute_per_partition_counts(visited_mask)
+        results[("BranchingFactor", float(bf))] = (recall, activation, ppc, t_unified)
+
+    # ── NProbe sweep ──────────────────────────────────────────────────────────
+    # Mirrors getPartitionsForSearch_Nprobe_: walk centers nearest-first,
+    # collecting nprobe unique partitions.  unique_orders is pre-sorted.
+    for nprobe in NPROBE_PARAMS:
+        visited_mask = np.zeros((Q, num_partitions), dtype=bool)
+        for i in range(Q):
+            visited_mask[i, unique_orders[i][:nprobe]] = True
+
+        recall     = _compute_recall(visited_mask, gt_parts_2d, k_neighbors)
+        activation = _compute_activation(visited_mask, num_partitions)
+        ppc        = _compute_per_partition_counts(visited_mask)
+        results[("NProbe", float(nprobe))] = (recall, activation, ppc, t_unified)
+
+    # ── RecallTarget sweep ────────────────────────────────────────────────────
+    # cumprobs_rt is precomputed in the cache; only the threshold varies here.
+    # np.put_along_axis scatters the rank mask into the partition-indexed mask.
     for target in TARGET_PARAMS:
-        meets     = cumprobs_rt >= target                              # (Q, P) bool
+        meets     = cumprobs_rt >= target                              # (Q, P)
         first_idx = np.where(meets.any(axis=1),
                              np.argmax(meets, axis=1),
                              num_partitions - 1)                       # (Q,)
+        rank_mask    = np.arange(num_partitions)[None, :] <= first_idx[:, None]
+        visited_mask = np.zeros((Q, num_partitions), dtype=bool)
+        np.put_along_axis(visited_mask, ordered_pids_rt, rank_mask, axis=1)
 
-        visited: Dict[int, set] = {}
-        for i in range(Q):
-            vps = set(ordered_pids_rt[i, :int(first_idx[i]) + 1].tolist())
-            if not vps:
-                vps.add(int(fallback_pids_rt[i]))
-            visited[i] = vps
+        recall     = _compute_recall(visited_mask, gt_parts_2d, k_neighbors)
+        activation = _compute_activation(visited_mask, num_partitions)
+        ppc        = _compute_per_partition_counts(visited_mask)
+        results[("RecallTarget", float(target))] = (recall, activation, ppc, t_unified)
 
-        recall     = _compute_recall(visited, ground_truth_partitions, num_queries)
-        activation = _compute_activation(visited, num_queries, num_partitions)
-        ppc        = _compute_per_partition_counts(visited, num_partitions)
-        results[("RecallTarget", float(target))] = (recall, activation, ppc, t_rt)
-
-    # ── Oracle lower bounds ────────────────────────────────────────────────────
-    # For each recall target τ, compute the minimum number of partitions that
-    # would need to be visited per query if partitions could be perfectly ranked
-    # by GT-neighbour density.  This is derived entirely from ground_truth_partitions
-    # (already computed above) so no extra file loading or routing is needed.
-    #
+    # ── Oracle lower bounds ───────────────────────────────────────────────────
     # query_dist[i, p] = fraction of query i's k GT neighbours in partition p.
-    # Sorting descending and cumsumming gives the achievable recall curve; the
-    # oracle picks the fewest partitions whose cumulative mass meets τ.
-    query_dist = np.zeros((num_queries, num_partitions), dtype=np.float64)
-    for i in range(num_queries):
-        counts = np.bincount(
-            np.array(ground_truth_partitions[i], dtype=np.intp),
-            minlength=num_partitions,
-        )
-        query_dist[i] = counts / k_neighbors
+    # Vectorised via np.bincount (replaces Python loop over queries).
+    flat    = gt_parts_2d.ravel().astype(np.intp)
+    row_idx = np.repeat(np.arange(Q), k_neighbors)
+    linear  = row_idx * num_partitions + flat
+    query_dist = np.bincount(
+        linear,
+        minlength=Q * num_partitions,
+    ).reshape(Q, num_partitions).astype(np.float64) / k_neighbors
 
-    sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]  # (Q, P) descending
-    cumsum      = np.cumsum(sorted_dist, axis=1)         # (Q, P)
+    sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]
+    cumsum      = np.cumsum(sorted_dist, axis=1)
 
     oracle_results: Dict[float, Tuple[float, float]] = {}
     for target in TARGET_PARAMS:
-        meets = cumsum >= target                          # (Q, P) bool
+        meets = cumsum >= target
         idx   = np.where(
             meets.any(axis=1),
             np.argmax(meets, axis=1),
-            num_partitions - 1,                          # fallback: all partitions needed
-        )                                                # (Q,) 0-indexed
-        n_parts         = idx + 1                        # (Q,) number of partitions visited
-        achieved_recall = cumsum[np.arange(num_queries), idx]
-
+            num_partitions - 1,
+        )
+        n_parts         = idx + 1
+        achieved_recall = cumsum[np.arange(Q), idx]
         oracle_results[float(target)] = (
-            float(n_parts.mean()) / num_partitions,      # mean activation
-            float(achieved_recall.mean()),               # mean achieved recall
+            float(n_parts.mean()) / num_partitions,
+            float(achieved_recall.mean()),
         )
 
     return results, oracle_results
+
+
+# ─── Per-step sweep computation ───────────────────────────────────────────────
+
+def compute_step_sweep(
+    queries:        np.ndarray,
+    base_mmap,
+    gt_file:        str,
+    base_dir:       str,
+    partition_dir:  str,
+    hnsw_step:      int,
+    partition_step: int,
+    k_neighbors:    int,
+    num_partitions: int,
+) -> Tuple[
+    Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]],
+    Dict[float, Tuple[float, float]],
+]:
+    """Run all (mode, param) sweep combinations for a single runbook step.
+
+    Thin wrapper around _build_routing_cache + _eval_step.  For repeated calls
+    with the same hnsw_step/partition_step (the no-rebuild pass), call
+    _build_routing_cache once and _eval_step per GT file instead.
+    """
+    cache = _build_routing_cache(
+        queries, base_dir, partition_dir,
+        hnsw_step, partition_step, num_partitions,
+    )
+    return _eval_step(cache, gt_file, base_mmap, k_neighbors)
 
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
@@ -656,18 +663,20 @@ if __name__ == "__main__":
                     f"recall={recall:.4f}  activation={activation:.4f}"
                 )
 
-    # No-rebuild pass — always use step_start router and partitions
+    # No-rebuild pass — always use step_start router and partitions.
+    # Build the routing cache once; only the GT file changes per step,
+    # so the HNSW load and knn_query are not repeated.
+    print(f"\nBuilding no-rebuild routing cache from step {step_start} ...")
+    no_rebuild_cache = _build_routing_cache(
+        queries, base_directory, partitions_directory,
+        step_start, step_start, num_partitions,
+    )
     for step in processed_steps:
         gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
         if not Path(gt_test).exists():
             continue
         print(f"\nNO REBUILDING: evaluating step {step} ...")
-        res, oracle = compute_step_sweep(
-            queries, base_mmap, gt_test,
-            base_directory, partitions_directory,
-            hnsw_step=step_start, partition_step=step_start,
-            k_neighbors=10, num_partitions=num_partitions,
-        )
+        res, oracle = _eval_step(no_rebuild_cache, gt_test, base_mmap, k_neighbors=10)
         no_rebuild_results[step]        = res
         no_rebuild_oracle_results[step] = oracle
         for (mode, param), (recall, activation, _, _) in res.items():
