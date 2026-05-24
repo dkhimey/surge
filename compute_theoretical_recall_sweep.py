@@ -51,6 +51,7 @@ Plus cof / cof_no_rebuilds columns (coefficient of variation of per-partition
 activation counts, computed using BranchingFactor=1 as the reference combo).
 """
 
+import os
 import numpy as np
 import struct
 from pathlib import Path
@@ -60,6 +61,7 @@ import argparse
 import time
 import pandas as pd
 import hnswlib
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Any, Optional
 
 # ─── Sweep parameter grids (match shared_batch_experiment_sweep.cpp) ──────────
@@ -251,6 +253,7 @@ def _build_routing_cache(
     hnsw_step:      int,
     partition_step: int,
     num_partitions: int,
+    hnsw_threads:   int = 1,
 ) -> dict:
     """Load HNSW + partitions, run the unified knn_query, precompute per-mode structures.
 
@@ -258,11 +261,15 @@ def _build_routing_cache(
     call this once and reuse the result across all steps — avoiding redundant
     HNSW loads and knn_query calls when hnsw_step/partition_step are constant.
 
+    hnsw_threads controls the num_threads argument passed to every knn_query call.
+    When running W parallel workers, set hnsw_threads = cpu_count // W so each
+    worker uses an equal share of cores without over-subscribing.
+
     Returns a dict with keys:
       router, partitions, current_count, num_partitions, Q,
       labels_bf_all, unique_orders,
       ordered_pids_rt, cumprobs_rt, fallback_pids_rt,
-      t_unified
+      t_unified, hnsw_threads
     """
     router = hnswlib.Index(space='l2', dim=100)
     router.load_index(f"{base_dir}/step_{hnsw_step:06d}_hnsw.bin")
@@ -280,7 +287,8 @@ def _build_routing_cache(
     k_unified  = min(max(max_bf, k_rt_max), current_count)
     router.set_ef(max(100, k_unified))
     t0 = time.perf_counter()
-    labels_all, dists_all = router.knn_query(queries, k=k_unified)
+    labels_all, dists_all = router.knn_query(queries, k=k_unified,
+                                              num_threads=hnsw_threads)
     t_unified = time.perf_counter() - t0
 
     # Expand only if any query lacks max_nprobe unique partitions.
@@ -295,7 +303,8 @@ def _build_routing_cache(
         k_np = min(k_np * 10, current_count)
         router.set_ef(max(100, k_np))
         t0 = time.perf_counter()
-        labels_all, dists_all = router.knn_query(queries, k=k_np)
+        labels_all, dists_all = router.knn_query(queries, k=k_np,
+                                                  num_threads=hnsw_threads)
         t_unified = time.perf_counter() - t0
 
     # Derive per-mode slices (share memory, no copy).
@@ -358,6 +367,7 @@ def _build_routing_cache(
         cumprobs_rt=cumprobs_rt,
         fallback_pids_rt=fallback_pids_rt,
         t_unified=t_unified,
+        hnsw_threads=hnsw_threads,
     )
 
 
@@ -390,6 +400,7 @@ def _eval_step(
     cumprobs_rt      = cache["cumprobs_rt"]
     fallback_pids_rt = cache["fallback_pids_rt"]
     t_unified        = cache["t_unified"]
+    hnsw_threads     = cache["hnsw_threads"]
 
     # ── Load GT and map each GT neighbour to its partition ────────────────────
     # read_fbin_ground_truth returns (Q, K) np.intp where K is the file's stored
@@ -399,7 +410,7 @@ def _eval_step(
     vecs_gt      = np.ascontiguousarray(
                        base_mmap[gt_indices]).astype(np.float32)
     router.set_ef(100)
-    labels_gt, _ = router.knn_query(vecs_gt, k=1)
+    labels_gt, _ = router.knn_query(vecs_gt, k=1, num_threads=hnsw_threads)
     gt_part_ids  = partitions[labels_gt[:, 0]]             # (Q*k,)
     gt_parts_2d  = gt_part_ids.reshape(Q, k_neighbors)    # (Q, k)
 
@@ -493,6 +504,7 @@ def compute_step_sweep(
     partition_step: int,
     k_neighbors:    int,
     num_partitions: int,
+    hnsw_threads:   int = 1,
 ) -> Tuple[
     Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]],
     Dict[float, Tuple[float, float]],
@@ -506,6 +518,7 @@ def compute_step_sweep(
     cache = _build_routing_cache(
         queries, base_dir, partition_dir,
         hnsw_step, partition_step, num_partitions,
+        hnsw_threads=hnsw_threads,
     )
     return _eval_step(cache, gt_file, base_mmap, k_neighbors)
 
@@ -550,6 +563,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gt-dir", required=True,
         help="Directory containing ground-truth files (step<N+1>.gt100).",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=os.cpu_count() or 1,
+        help="Number of parallel processes for the rebuild pass.  "
+             "Each worker gets cpu_count // workers HNSW threads so the total "
+             "stays at cpu_count.  The no-rebuild pass always runs serially "
+             "with all CPUs available to hnswlib.  Defaults to cpu_count.",
     )
     return parser.parse_args()
 
@@ -645,32 +665,53 @@ if __name__ == "__main__":
     rebuild_oracle_results:   Dict[int, Dict] = {}
     no_rebuild_oracle_results: Dict[int, Dict] = {}
 
-    # Rebuild pass — per-step router and partitions
-    if not args.no_rebuilds:
-        for step in processed_steps:
-            gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
-            print(f"\nREBUILDING: evaluating step {step} ...")
-            res, oracle = compute_step_sweep(
-                queries, base_mmap, gt_test,
-                base_directory, partitions_directory,
-                hnsw_step=step, partition_step=step,
-                k_neighbors=10, num_partitions=num_partitions,
-            )
-            rebuild_results[step]        = res
-            rebuild_oracle_results[step] = oracle
-            for (mode, param), (recall, activation, _, _) in res.items():
-                print(
-                    f"  [{mode}={param:.4g}] "
-                    f"recall={recall:.4f}  activation={activation:.4f}"
-                )
+    workers = args.workers
+    # Divide the CPU thread budget evenly across parallel workers.
+    # hnswlib's knn_query defaults to num_threads=-1 (all CPUs via OpenMP), so
+    # without this each worker would try to claim every core simultaneously.
+    # Rebuild pass: divide CPU threads evenly across workers.
+    # No-rebuild pass: always serial, so hnswlib gets all CPUs there.
+    hnsw_threads = max(1, (os.cpu_count() or 1) // workers)
+    print(f"rebuild: workers={workers}  hnsw_threads_per_worker={hnsw_threads}  "
+          f"no-rebuild: serial  hnsw_threads={os.cpu_count()}")
 
-    # No-rebuild pass — always use step_start router and partitions.
-    # Build the routing cache once; only the GT file changes per step,
-    # so the HNSW load and knn_query are not repeated.
+    # Rebuild pass — each step loads its own HNSW, so steps are fully independent.
+    # Run in separate processes (ProcessPoolExecutor) for true CPU parallelism.
+    # np.memmap is cheap to pickle: it serialises only the file path + parameters.
+    if not args.no_rebuilds:
+        print(f"\nREBUILDING: submitting {len(processed_steps)} step(s) "
+              f"to {workers} worker(s) ...")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_step = {
+                executor.submit(
+                    compute_step_sweep,
+                    queries, base_mmap,
+                    f"{args.gt_dir}/step{step + 1}.gt100",
+                    base_directory, partitions_directory,
+                    step, step, 10, num_partitions,
+                    hnsw_threads,
+                ): step
+                for step in processed_steps
+            }
+            for fut in as_completed(future_to_step):
+                step = future_to_step[fut]
+                res, oracle = fut.result()
+                rebuild_results[step]        = res
+                rebuild_oracle_results[step] = oracle
+                print(f"\nREBUILDING: step {step} complete.")
+                for (mode, param), (recall, activation, _, _) in res.items():
+                    print(
+                        f"  [{mode}={param:.4g}] "
+                        f"recall={recall:.4f}  activation={activation:.4f}"
+                    )
+
+    # No-rebuild pass — build routing cache once; only the GT file changes per step.
+    # Runs serially (1 worker) so hnswlib can use all CPUs for GT-vector routing.
     print(f"\nBuilding no-rebuild routing cache from step {step_start} ...")
     no_rebuild_cache = _build_routing_cache(
         queries, base_directory, partitions_directory,
         step_start, step_start, num_partitions,
+        hnsw_threads=os.cpu_count() or 1,
     )
     for step in processed_steps:
         gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
