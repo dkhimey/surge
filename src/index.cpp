@@ -725,7 +725,7 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
 
     {
         std::unique_lock lock(graph_mutex_);
-        free(meta_HNSW_);
+        delete meta_HNSW_;
         meta_HNSW_ = new_meta_HNSW;
         partitions = new_partitions;
     }
@@ -1766,8 +1766,10 @@ void Executor::partialReBuild(
 
     sub_HNSW_->setEf(ef_construction);
 
+    delete metaHNSW;
+
     // Step 10: Notify completion
-    MessageHeader header; 
+    MessageHeader header;
     header.type = REBUILD_SUCCESS;
     // // additionally send back num levels in the graph
     header.size = sub_HNSW_->maxlevel_;
@@ -1954,10 +1956,12 @@ void Executor::reBuild(
 
     next_sub_HNSW->setEf(ef_construction);
 
+    delete metaHNSW;
+
     // lock as you make the switch
     {   std::unique_lock lock(graph_mutex_);
 
-        free(sub_HNSW_);
+        delete sub_HNSW_;   // was free() — must be delete to invoke ~HierarchicalNSW
         sub_HNSW_ = next_sub_HNSW;
     }
 
