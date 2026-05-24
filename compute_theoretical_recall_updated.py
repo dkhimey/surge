@@ -237,6 +237,7 @@ def compute_recall_nprobe(
     while True:
         niter += 1
         k_capped = min(k, current_count)
+        print(f"Iteration {niter}: querying k={k_capped} centers...")
         t0 = time.perf_counter()
         labels, _ = router.knn_query(queries, k=k_capped)  # (Q, k_capped)
         final_elapsed = time.perf_counter() - t0
