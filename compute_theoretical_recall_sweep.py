@@ -358,21 +358,26 @@ def compute_step_sweep(
             break
         k_np *= 10
 
-    def first_p_unique(label_list, p: int) -> set:
-        """Collect the first p unique partition IDs from label_list."""
-        seen: set = set()
-        for label in label_list:
-            pid = int(partitions[label])
-            if pid not in seen:
-                seen.add(pid)
-                if len(seen) == p:
-                    break
-        return seen
+    # ── Precompute ordered-unique partition lists for NProbe ──────────────────
+    # Map every label to its partition once via numpy, then build the
+    # arrival-order list of unique partitions per query in a single Python pass.
+    # All nprobe values share this structure — each is just a prefix slice,
+    # eliminating the O(Q × max_nprobe × k_np) rescanning of the old approach.
+    part_seq = partitions[labels_np_all]   # (Q, k_np) – fast numpy lookup
+    unique_orders: List[List[int]] = []
+    for row in part_seq:
+        seen_set: set = set()
+        order: List[int] = []
+        for pid in map(int, row):
+            if pid not in seen_set:
+                seen_set.add(pid)
+                order.append(pid)
+        unique_orders.append(order)
 
     for nprobe in NPROBE_PARAMS:
-        visited: Dict[int, set] = {}
-        for i, label_list in enumerate(labels_np_all):
-            visited[i] = first_p_unique(label_list, nprobe)
+        visited: Dict[int, set] = {
+            i: set(unique_orders[i][:nprobe]) for i in range(num_queries)
+        }
 
         recall     = _compute_recall(visited, ground_truth_partitions, num_queries)
         activation = _compute_activation(visited, num_queries, num_partitions)
@@ -404,47 +409,43 @@ def compute_step_sweep(
     for pid in partitions:
         part_size[int(pid)] += 1.0
 
-    # Pre-compute normalised probability vectors and descending partition order
-    # for every query — these are the same for all recall targets.
-    query_part_probs: List[Tuple[np.ndarray, np.ndarray]] = []
-    fallback_pids:    List[int] = []
+    # ── Vectorised probability pre-computation ────────────────────────────────
+    # Replace the per-query Python loop with fully vectorised NumPy operations.
+    # All Q queries are processed simultaneously.
+    Q = num_queries
+    d0_rt       = dists_rt_all[:, :1] + 1e-10                     # (Q, 1)
+    rel_d_rt    = dists_rt_all / d0_rt                             # (Q, k_rt)
+    pids_rt     = partitions[labels_rt_all]                        # (Q, k_rt)
+    weights_rt  = part_size[pids_rt] * np.exp(-rel_d_rt)          # (Q, k_rt)
 
-    for i in range(num_queries):
-        label_list = labels_rt_all[i]
-        dist_list  = dists_rt_all[i]
-        d0 = float(dist_list[0]) + 1e-10  # avoid division by zero
+    partition_probs_all = np.zeros((Q, num_partitions), dtype=np.float64)
+    np.add.at(partition_probs_all,
+              (np.arange(Q)[:, None], pids_rt),
+              weights_rt)
 
-        partition_probs = np.zeros(num_partitions, dtype=np.float64)
-        for label, d in zip(label_list, dist_list):
-            pid   = int(partitions[label])
-            rel_d = float(d) / d0
-            partition_probs[pid] += part_size[pid] * np.exp(-rel_d)
+    prob_sums        = partition_probs_all.sum(axis=1, keepdims=True)  # (Q, 1)
+    fallback_pids_rt = partitions[labels_rt_all[:, 0]]                 # (Q,)
+    zero_mask        = prob_sums[:, 0] <= 0.0
+    partition_probs_all[zero_mask, fallback_pids_rt[zero_mask]] = 1.0
+    prob_sums[zero_mask] = 1.0
+    partition_probs_all /= prob_sums                                    # normalise
 
-        prob_sum = partition_probs.sum()
-        fallback = int(partitions[label_list[0]])
-        if prob_sum <= 0.0:
-            partition_probs[fallback] = 1.0
-            prob_sum = 1.0
-        partition_probs /= prob_sum
-
-        ordered_pids = np.argsort(-partition_probs)  # descending
-        query_part_probs.append((partition_probs, ordered_pids))
-        fallback_pids.append(fallback)
+    ordered_pids_rt = np.argsort(-partition_probs_all, axis=1)         # (Q, P) desc
+    sorted_probs_rt = np.take_along_axis(partition_probs_all,
+                                         ordered_pids_rt, axis=1)      # (Q, P)
+    cumprobs_rt     = np.cumsum(sorted_probs_rt, axis=1)               # (Q, P)
 
     for target in TARGET_PARAMS:
+        meets     = cumprobs_rt >= target                              # (Q, P) bool
+        first_idx = np.where(meets.any(axis=1),
+                             np.argmax(meets, axis=1),
+                             num_partitions - 1)                       # (Q,)
+
         visited: Dict[int, set] = {}
-        for i, (partition_probs, ordered_pids) in enumerate(query_part_probs):
-            vps: set = set()
-            recall_estimate = 0.0
-            for pid in ordered_pids:
-                if partition_probs[pid] <= 0.0:
-                    break
-                vps.add(int(pid))
-                recall_estimate += partition_probs[pid]
-                if recall_estimate >= target:
-                    break
+        for i in range(Q):
+            vps = set(ordered_pids_rt[i, :int(first_idx[i]) + 1].tolist())
             if not vps:
-                vps.add(fallback_pids[i])
+                vps.add(int(fallback_pids_rt[i]))
             visited[i] = vps
 
         recall     = _compute_recall(visited, ground_truth_partitions, num_queries)
