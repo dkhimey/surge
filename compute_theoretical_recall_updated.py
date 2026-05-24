@@ -231,7 +231,7 @@ def compute_recall_nprobe(
     gt_parts = partitions[gt_labels[:, 0]].reshape(Q, k_neighbors)  # (Q, k)
 
     # Find k large enough that every query sees >= max_p unique partitions
-    k = max_p
+    k = max_p * 10
     final_elapsed = 0.0
     niter = 0
     while True:
