@@ -392,9 +392,10 @@ def _eval_step(
     t_unified        = cache["t_unified"]
 
     # ── Load GT and map each GT neighbour to its partition ────────────────────
-    # read_fbin_ground_truth returns (Q, k) np.intp — no loop needed.
-    ground_truth = read_fbin_ground_truth(gt_file)         # (Q, k)
-    gt_indices   = ground_truth.ravel()                    # (Q*k,)
+    # read_fbin_ground_truth returns (Q, K) np.intp where K is the file's stored
+    # neighbor count (e.g. 100 for .gt100).  Slice to k_neighbors before ravelling.
+    ground_truth = read_fbin_ground_truth(gt_file)                    # (Q, K)
+    gt_indices   = ground_truth[:, :k_neighbors].ravel()              # (Q*k,)
     vecs_gt      = np.ascontiguousarray(
                        base_mmap[gt_indices]).astype(np.float32)
     router.set_ef(100)
