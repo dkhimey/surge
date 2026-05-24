@@ -306,17 +306,47 @@ def compute_step_sweep(
 
     results: Dict[Tuple[str, float], Tuple[float, float, np.ndarray, float]] = {}
 
+    # ── Single unified HNSW query shared by all three routing modes ───────────
+    # BranchingFactor needs k=max_bf=80, RecallTarget needs k=50, NProbe needs
+    # ≥max_nprobe=9 unique partitions.  One knn_query for max(max_bf, k_rt_max)
+    # satisfies all three; we only expand when the NProbe uniqueness condition
+    # is not yet met (same expansion logic as before, but shared).
+    max_bf     = max(BRANCHING_FACTOR_PARAMS)
+    max_nprobe = max(NPROBE_PARAMS)
+    k_rt_max   = min(50, current_count)
+    k_unified  = min(max(max_bf, k_rt_max), current_count)
+    router.set_ef(max(100, k_unified))
+    t0 = time.perf_counter()
+    labels_all, dists_all = router.knn_query(queries, k=k_unified)
+    t_unified = time.perf_counter() - t0
+
+    # Expand only if any query lacks max_nprobe unique partitions.
+    k_np = k_unified
+    while True:
+        min_unique = min(
+            len(set(int(partitions[l]) for l in ll))
+            for ll in labels_all
+        )
+        if min_unique >= max_nprobe or k_np >= current_count:
+            break
+        k_np = min(k_np * 10, current_count)
+        router.set_ef(max(100, k_np))
+        t0 = time.perf_counter()
+        labels_all, dists_all = router.knn_query(queries, k=k_np)
+        t_unified = time.perf_counter() - t0
+
+    # Derive per-mode views — slices share the underlying array, no copy.
+    k_bf_actual   = min(max_bf, current_count)
+    labels_bf_all = labels_all[:, :k_bf_actual]
+    labels_np_all = labels_all
+    labels_rt_all = labels_all[:, :k_rt_max]
+    dists_rt_all  = dists_all[:, :k_rt_max]
+    t_bf = t_np = t_rt = t_unified
+
     # ── BranchingFactor sweep ──────────────────────────────────────────────────
     # Mirrors getPartitionsForSearch_Branching_: query HNSW for k nearest
     # centers, collect all unique partitions among those k centers.
-    #
-    # Optimization: query once for max_bf and reuse prefix for smaller values.
-    max_bf = max(BRANCHING_FACTOR_PARAMS)
-    k_bf   = min(max_bf, current_count)
-    router.set_ef(max(100, k_bf))
-    t0 = time.perf_counter()
-    labels_bf_all, _ = router.knn_query(queries, k=k_bf)
-    t_bf = time.perf_counter() - t0
+    # Each bf value uses a prefix of labels_bf_all.
 
     for bf in BRANCHING_FACTOR_PARAMS:
         k          = min(bf, current_count)
@@ -340,23 +370,7 @@ def compute_step_sweep(
     # The expansion loop matches the C++ while-loop (starting at nprobe and
     # multiplying by 10 each iteration).  All nprobe values share one final
     # knn_query result.
-    max_nprobe = max(NPROBE_PARAMS)
-    router.set_ef(100)
-    k_np = max_nprobe
-    labels_np_all: Optional[np.ndarray] = None
-    t_np = 0.0
-    while True:
-        k_np = min(k_np, current_count)
-        t0 = time.perf_counter()
-        labels_np_all, _ = router.knn_query(queries, k=k_np)
-        t_np = time.perf_counter() - t0  # time of the final (used) call
-        min_unique = min(
-            len(set(int(partitions[l]) for l in ll))
-            for ll in labels_np_all
-        )
-        if min_unique >= max_nprobe or k_np >= current_count:
-            break
-        k_np *= 10
+    # labels_np_all and t_np are set by the unified HNSW query above.
 
     # ── Precompute ordered-unique partition lists for NProbe ──────────────────
     # Map every label to its partition once via numpy, then build the
@@ -397,11 +411,7 @@ def compute_step_sweep(
     # 3. Normalise scores to a probability distribution over partitions.
     # 4. Walk partitions in descending probability order, accumulating
     #    probability until the cumulative sum meets recall_target.
-    k_rt = min(50, current_count)
-    router.set_ef(max(100, k_rt))
-    t0 = time.perf_counter()
-    labels_rt_all, dists_rt_all = router.knn_query(queries, k=k_rt)
-    t_rt = time.perf_counter() - t0
+    # labels_rt_all, dists_rt_all and t_rt are set by the unified HNSW query above.
 
     # Size prior: number of centers per partition (computed once, shared
     # across all TARGET_PARAMS iterations).
