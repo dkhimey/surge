@@ -8,6 +8,7 @@ import hnswlib
 import time
 import pandas as pd
 from typing import List, Tuple
+from scipy.optimize import linear_sum_assignment
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,25 @@ def _recall(visited_mask: np.ndarray, gt_parts: np.ndarray, k: int) -> float:
 
 def _activation(visited_mask: np.ndarray, num_partitions: int) -> float:
     return float(visited_mask.sum(axis=1).mean()) / num_partitions
+
+
+def _compute_phi(part_a: np.ndarray, part_b: np.ndarray, nblocks: int) -> float:
+    """Fraction of centers whose partition changes under the optimal bipartite relabeling.
+
+    Strips the trailing moved_nodes line that save_blocks() appends, so callers
+    can pass the raw np.loadtxt output without pre-processing.
+    The result is invariant to any prior relabeling of either input array —
+    bipartite matching finds the globally optimal alignment regardless of labels.
+    """
+    a = part_a[:-1]   # drop trailing moved_nodes count
+    b = part_b[:-1]
+    cost = np.zeros((nblocks, nblocks), dtype=np.int64)
+    np.add.at(cost, (a, b), 1)
+    row_ind, col_ind = linear_sum_assignment(-cost)
+    relabel = np.empty(nblocks, dtype=np.int64)
+    relabel[row_ind] = col_ind
+    moved = int((relabel[a] != b).sum())
+    return moved / len(a)
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +398,14 @@ def _call_routing(mode, queries, base_mmap, gt_file,
         params_cast = [int(p) for p in params]
     else:
         params_cast = [float(p) for p in params]
-    return fn(queries, base_mmap, gt_file,
-              base_dir, partition_dir, hnsw_step, partition_step,
-              params_cast, k_neighbors, num_partitions)
+    try:
+        return fn(queries, base_mmap, gt_file,
+                  base_dir, partition_dir, hnsw_step, partition_step,
+                  params_cast, k_neighbors, num_partitions)
+    except RuntimeError as e:
+        print(f"WARNING: skipping step (hnsw_step={hnsw_step}, "
+              f"partition_step={partition_step}): {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +430,14 @@ def parse_args():
     parser.add_argument("--no-rebuilds", action="store_true",
                         help="Evaluate only the no-rebuild path "
                              "(always use first-step router/partitions)")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Maintenance threshold τ ∈ [0, 1]. The routing layer is "
+                             "rebuilt at step s when φ (fraction of centers whose "
+                             "partition changes relative to the last rebuild, under "
+                             "optimal bipartite relabeling) exceeds τ. "
+                             "Mutually exclusive with --no-rebuilds. "
+                             "Output file gets a _tX suffix. "
+                             "τ=0 rebuilds every step; τ=1 never rebuilds.")
     parser.add_argument("--runbook-path", required=True,
                         help="Path to the runbook YAML file")
     parser.add_argument("--query-file", required=True,
@@ -422,6 +455,10 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
+    if args.no_rebuilds and args.threshold is not None:
+        raise ValueError("--no-rebuilds and --threshold are mutually exclusive")
+
     mode = args.mode
     params = args.params
 
@@ -441,9 +478,9 @@ if __name__ == "__main__":
     step_start = find_first_available_step(base_directory, partitions_directory)
     print(f"Starting step (auto-detected): {step_start}")
 
-    # Detect step_end for rebuild mode
+    # Detect step_end for rebuild mode (not needed for threshold or no-rebuild passes)
     step_end = step_start
-    if not args.no_rebuilds:
+    if not args.no_rebuilds and args.threshold is None:
         while Path(f"{base_directory}/step_{step_end:06d}_hnsw.bin").exists():
             step_end += 2
 
@@ -458,7 +495,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Rebuild pass
     # ------------------------------------------------------------------
-    if not args.no_rebuilds:
+    if not args.no_rebuilds and args.threshold is None:
         for step in range(step_start, step_end, 2):
             gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
             hnsw_file = f"{base_directory}/step_{step:06d}_hnsw.bin"
@@ -474,6 +511,8 @@ if __name__ == "__main__":
                 base_directory, partitions_directory,
                 step, step, params, 10, num_partitions)
 
+            if step_results is None:
+                continue
             for param, (r, act, ppc, t) in zip(params, step_results):
                 rows.append({
                     "step": step,
@@ -496,39 +535,121 @@ if __name__ == "__main__":
         if s >= step_start and (s - step_start) % 2 == 0
     ]
 
-    for step in no_rebuild_steps:
-        gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
-        if not Path(gt_test).exists():
-            print(f"Missing GT at step {step}: {gt_test}. Skipping.")
-            continue
+    if args.threshold is None:
+        for step in no_rebuild_steps:
+            gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
+            if not Path(gt_test).exists():
+                print(f"Missing GT at step {step}: {gt_test}. Skipping.")
+                continue
 
-        step_results = _call_routing(
-            mode, queries, base_mmap, gt_test,
-            base_directory, partitions_directory,
-            step_start, step_start, params, 10, num_partitions)
+            step_results = _call_routing(
+                mode, queries, base_mmap, gt_test,
+                base_directory, partitions_directory,
+                step_start, step_start, params, 10, num_partitions)
 
-        for param, (r, act, ppc, t) in zip(params, step_results):
-            rows.append({
-                "step": step,
-                "rebuild": "no_rebuild",
-                "mode": mode,
-                "param": param,
-                "recall": r,
-                "activation": act,
-                "cof": _cof(ppc),
-                "query_time_s": t,
-            })
-        print(f"NO-REBUILD step {step}: "
-              f"recall={[r for r, *_ in step_results]}")
+            if step_results is None:
+                continue
+            for param, (r, act, ppc, t) in zip(params, step_results):
+                rows.append({
+                    "step": step,
+                    "rebuild": "no_rebuild",
+                    "mode": mode,
+                    "param": param,
+                    "recall": r,
+                    "activation": act,
+                    "cof": _cof(ppc),
+                    "query_time_s": t,
+                })
+            print(f"NO-REBUILD step {step}: "
+                  f"recall={[r for r, *_ in step_results]}")
+
+    # ------------------------------------------------------------------
+    # Threshold pass
+    # ------------------------------------------------------------------
+    # At each step s, compare the partition file for s against the partition
+    # from the last rebuild step using optimal bipartite matching.  φ is the
+    # fraction of centers whose group membership changes under that matching.
+    # If φ > τ a rebuild is triggered and s becomes the new active step;
+    # otherwise the active step stays fixed.  Both the HNSW and partition used
+    # for routing always come from the current active step.
+    #
+    # Correctness note: the bipartite matching finds the optimal label alignment
+    # regardless of any prior relabeling, so the already chain-matched partition
+    # files from runbook_partitions_parallel.cpp are equivalent to raw KaFFPa
+    # outputs for the purpose of computing φ.
+    # ------------------------------------------------------------------
+    if args.threshold is not None:
+        tau = args.threshold
+        last_rebuild = step_start
+        active_partition = np.loadtxt(
+            f"{partitions_directory}/step_{step_start:06d}_partitions.csv",
+            delimiter=",", dtype=int)
+
+        for step in no_rebuild_steps:
+            gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
+            hnsw_file = f"{base_directory}/step_{step:06d}_hnsw.bin"
+            partition_file = f"{partitions_directory}/step_{step:06d}_partitions.csv"
+
+            if not all(Path(f).exists() for f in [gt_test, hnsw_file, partition_file]):
+                missing = [f for f in [gt_test, hnsw_file, partition_file]
+                           if not Path(f).exists()]
+                print(f"Step {step}: missing {missing} — stopping threshold pass.")
+                break
+
+            part_s = np.loadtxt(partition_file, delimiter=",", dtype=int)
+            phi = _compute_phi(part_s, active_partition, num_partitions)
+            did_rebuild = phi > tau
+            if did_rebuild:
+                last_rebuild = step
+                active_partition = part_s
+
+            print(f"THRESHOLD(τ={tau}) step {step}: φ={phi:.4f} "
+                  f"{'→ REBUILD' if did_rebuild else '  (skip)  '} "
+                  f"active={last_rebuild}")
+
+            step_results = _call_routing(
+                mode, queries, base_mmap, gt_test,
+                base_directory, partitions_directory,
+                last_rebuild, last_rebuild, params, 10, num_partitions)
+
+            if step_results is None:
+                continue
+            for param, (r, act, ppc, t) in zip(params, step_results):
+                rows.append({
+                    "step": step,
+                    "rebuild": f"threshold_{tau:.4g}",
+                    "mode": mode,
+                    "param": param,
+                    "recall": r,
+                    "activation": act,
+                    "cof": _cof(ppc),
+                    "query_time_s": t,
+                    "phi": phi,
+                    "did_rebuild": did_rebuild,
+                    "active_step": last_rebuild,
+                })
+            print(f"THRESHOLD step {step}: "
+                  f"recall={[r for r, *_ in step_results]}")
 
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
-    df = pd.DataFrame(rows, columns=[
-        "step", "rebuild", "mode", "param",
-        "recall", "activation", "cof", "query_time_s"])
+    if args.threshold is not None:
+        tau_str = f"{round(args.threshold * 100)}"
+        suffix = f"_t{tau_str}"
+        columns = ["step", "rebuild", "mode", "param",
+                   "recall", "activation", "cof", "query_time_s",
+                   "phi", "did_rebuild", "active_step"]
+    elif args.no_rebuilds:
+        suffix = "_no_rebuilds"
+        columns = ["step", "rebuild", "mode", "param",
+                   "recall", "activation", "cof", "query_time_s"]
+    else:
+        suffix = ""
+        columns = ["step", "rebuild", "mode", "param",
+                   "recall", "activation", "cof", "query_time_s"]
 
-    suffix = "_no_rebuilds" if args.no_rebuilds else ""
+    df = pd.DataFrame(rows, columns=columns)
     output_name = f"full_results_{mode}{suffix}.csv"
     output_path = f"{partitions_directory}/{output_name}"
     df.to_csv(output_path, index=False)
