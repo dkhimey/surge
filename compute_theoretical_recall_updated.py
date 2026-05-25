@@ -387,6 +387,84 @@ def compute_recall_recall_target(
 
 
 # ---------------------------------------------------------------------------
+# Oracle
+# ---------------------------------------------------------------------------
+
+ORACLE_TARGETS = [0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.97, 0.98, 0.99]
+
+
+def _compute_oracle(
+    queries: np.ndarray,
+    base_mmap,
+    gt_file: str,
+    base_dir: str,
+    partition_dir: str,
+    hnsw_step: int,
+    partition_step: int,
+    k_neighbors: int,
+    num_partitions: int,
+    partitions: np.ndarray = None,
+) -> List[Tuple]:
+    """For each target in ORACLE_TARGETS, compute the minimum number of partitions
+    (on average across queries) needed to achieve that recall, assuming exhaustive
+    search within each probed partition.  Returns List[(target, activation, recall)]."""
+    ground_truth = read_fbin_ground_truth(gt_file)
+    Q = ground_truth.shape[0]
+
+    router = hnswlib.Index(space='l2', dim=queries.shape[1])
+    router.load_index(f"{base_dir}/step_{hnsw_step:06d}_hnsw.bin")
+    router.set_ef(100)
+
+    if partitions is None:
+        partitions = np.loadtxt(
+            f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
+            delimiter=",", dtype=int)
+
+    # Map each GT neighbour to its partition via the routing HNSW
+    gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
+    gt_vecs = np.ascontiguousarray(base_mmap[gt_indices]).astype(np.float32)
+    gt_labels, _ = router.knn_query(gt_vecs, k=1)
+    gt_part_ids = partitions[gt_labels[:, 0]]
+    gt_parts_2d = gt_part_ids.reshape(Q, k_neighbors)   # (Q, k)
+
+    # query_dist[i, p] = fraction of query i's GT neighbours in partition p
+    flat    = gt_parts_2d.ravel().astype(np.intp)
+    row_idx = np.repeat(np.arange(Q), k_neighbors)
+    linear  = row_idx * num_partitions + flat
+    query_dist = np.bincount(
+        linear, minlength=Q * num_partitions,
+    ).reshape(Q, num_partitions).astype(np.float64) / k_neighbors
+
+    # Greedily add partitions in descending density order
+    sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]
+    cumsum      = np.cumsum(sorted_dist, axis=1)
+
+    results = []
+    for target in ORACLE_TARGETS:
+        meets = cumsum >= target
+        idx   = np.where(meets.any(axis=1), np.argmax(meets, axis=1), num_partitions - 1)
+        results.append((
+            float(target),
+            float((idx + 1).mean()) / num_partitions,   # activation
+            float(cumsum[np.arange(Q), idx].mean()),     # achieved recall
+        ))
+    return results
+
+
+def _call_oracle(queries, base_mmap, gt_file,
+                 base_dir, partition_dir, hnsw_step, partition_step,
+                 k_neighbors, num_partitions,
+                 partitions: np.ndarray = None):
+    try:
+        return _compute_oracle(queries, base_mmap, gt_file,
+                               base_dir, partition_dir, hnsw_step, partition_step,
+                               k_neighbors, num_partitions, partitions=partitions)
+    except RuntimeError as e:
+        print(f"WARNING: skipping oracle (hnsw_step={hnsw_step}): {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Routing dispatch
 # ---------------------------------------------------------------------------
 
@@ -533,6 +611,23 @@ if __name__ == "__main__":
                     "cof": _cof(ppc),
                     "query_time_s": t,
                 })
+            if mode == "RecallTarget":
+                oracle_results = _call_oracle(
+                    queries, base_mmap, gt_test,
+                    base_directory, partitions_directory,
+                    step, step, 10, num_partitions)
+                if oracle_results is not None:
+                    for target, act, rec in oracle_results:
+                        rows.append({
+                            "step": step,
+                            "rebuild": "rebuild",
+                            "mode": "Oracle",
+                            "param": target,
+                            "recall": rec,
+                            "activation": act,
+                            "cof": float("nan"),
+                            "query_time_s": float("nan"),
+                        })
             print(f"REBUILD step {step}: "
                   f"recall={[r for r, *_ in step_results]}")
 
@@ -569,6 +664,23 @@ if __name__ == "__main__":
                     "cof": _cof(ppc),
                     "query_time_s": t,
                 })
+            if mode == "RecallTarget":
+                oracle_results = _call_oracle(
+                    queries, base_mmap, gt_test,
+                    base_directory, partitions_directory,
+                    step_start, step_start, 10, num_partitions)
+                if oracle_results is not None:
+                    for target, act, rec in oracle_results:
+                        rows.append({
+                            "step": step,
+                            "rebuild": "no_rebuild",
+                            "mode": "Oracle",
+                            "param": target,
+                            "recall": rec,
+                            "activation": act,
+                            "cof": float("nan"),
+                            "query_time_s": float("nan"),
+                        })
             print(f"NO-REBUILD step {step}: "
                   f"recall={[r for r, *_ in step_results]}")
 
@@ -638,6 +750,27 @@ if __name__ == "__main__":
                     "did_rebuild": did_rebuild,
                     "active_step": last_rebuild,
                 })
+            if mode == "RecallTarget":
+                oracle_results = _call_oracle(
+                    queries, base_mmap, gt_test,
+                    base_directory, partitions_directory,
+                    last_rebuild, last_rebuild, 10, num_partitions,
+                    partitions=active_partition)
+                if oracle_results is not None:
+                    for target, act, rec in oracle_results:
+                        rows.append({
+                            "step": step,
+                            "rebuild": f"threshold_{tau:.4g}",
+                            "mode": "Oracle",
+                            "param": target,
+                            "recall": rec,
+                            "activation": act,
+                            "cof": float("nan"),
+                            "query_time_s": float("nan"),
+                            "phi": phi,
+                            "did_rebuild": did_rebuild,
+                            "active_step": last_rebuild,
+                        })
             print(f"THRESHOLD step {step}: "
                   f"recall={[r for r, *_ in step_results]}")
 
