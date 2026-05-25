@@ -175,6 +175,7 @@ def compute_recall_branching_factor(
     branching_factors: List[int],
     k_neighbors: int,
     num_partitions: int,
+    partitions: np.ndarray = None,
 ) -> List[Tuple]:
     """BranchingFactor routing: query k nearest centers, visit all unique partitions."""
     ground_truth = read_fbin_ground_truth(gt_file)      # (Q, K)
@@ -186,9 +187,10 @@ def compute_recall_branching_factor(
     router.set_ef(max(100, max_bf))
     current_count = router.get_current_count()
 
-    partitions = np.loadtxt(
-        f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
-        delimiter=",", dtype=int)
+    if partitions is None:
+        partitions = np.loadtxt(
+            f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
+            delimiter=",", dtype=int)
 
     # GT partition assignment
     gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
@@ -229,6 +231,7 @@ def compute_recall_nprobe(
     nprobe_values: List[int],
     k_neighbors: int,
     num_partitions: int,
+    partitions: np.ndarray = None,
 ) -> List[Tuple]:
     """NProbe routing: walk centers in HNSW order until N unique partitions seen."""
     ground_truth = read_fbin_ground_truth(gt_file)      # (Q, K)
@@ -240,9 +243,10 @@ def compute_recall_nprobe(
     router.set_ef(100)
     current_count = router.get_current_count()
 
-    partitions = np.loadtxt(
-        f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
-        delimiter=",", dtype=int)
+    if partitions is None:
+        partitions = np.loadtxt(
+            f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
+            delimiter=",", dtype=int)
 
     # GT partition assignment
     gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
@@ -309,6 +313,7 @@ def compute_recall_recall_target(
     k_neighbors: int,
     num_partitions: int,
     k_rt: int = 50,
+    partitions: np.ndarray = None,
 ) -> List[Tuple]:
     """RecallTarget routing: score partitions by size * exp(-d/d0), greedily
     accumulate until cumulative probability >= target."""
@@ -319,9 +324,10 @@ def compute_recall_recall_target(
     router.load_index(f"{base_dir}/step_{hnsw_step:06d}_hnsw.bin")
     router.set_ef(max(100, k_rt))
 
-    partitions = np.loadtxt(
-        f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
-        delimiter=",", dtype=int)
+    if partitions is None:
+        partitions = np.loadtxt(
+            f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
+            delimiter=",", dtype=int)
     part_size = np.bincount(partitions, minlength=num_partitions).astype(np.float32)
 
     # GT partition assignment
@@ -393,7 +399,8 @@ ROUTING_FUNCS = {
 
 def _call_routing(mode, queries, base_mmap, gt_file,
                   base_dir, partition_dir, hnsw_step, partition_step,
-                  params, k_neighbors, num_partitions):
+                  params, k_neighbors, num_partitions,
+                  partitions: np.ndarray = None):
     fn = ROUTING_FUNCS[mode]
     if mode in ("BranchingFactor", "NProbe"):
         params_cast = [int(p) for p in params]
@@ -402,7 +409,8 @@ def _call_routing(mode, queries, base_mmap, gt_file,
     try:
         return fn(queries, base_mmap, gt_file,
                   base_dir, partition_dir, hnsw_step, partition_step,
-                  params_cast, k_neighbors, num_partitions)
+                  params_cast, k_neighbors, num_partitions,
+                  partitions=partitions)
     except RuntimeError as e:
         print(f"WARNING: skipping step (hnsw_step={hnsw_step}, "
               f"partition_step={partition_step}): {e}")
@@ -597,7 +605,7 @@ if __name__ == "__main__":
                 print(f"Step {step}: missing {missing} — stopping threshold pass.")
                 break
 
-            part_s = np.loadtxt(partition_file, delimiter=",", dtype=int)
+            part_s = _load_partition(step)
             phi = _compute_phi(part_s, active_partition, num_partitions)
             did_rebuild = phi > tau
             if did_rebuild:
@@ -611,7 +619,8 @@ if __name__ == "__main__":
             step_results = _call_routing(
                 mode, queries, base_mmap, gt_test,
                 base_directory, partitions_directory,
-                last_rebuild, last_rebuild, params, 10, num_partitions)
+                last_rebuild, last_rebuild, params, 10, num_partitions,
+                partitions=active_partition)
 
             if step_results is None:
                 continue
