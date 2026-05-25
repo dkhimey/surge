@@ -390,7 +390,18 @@ def compute_recall_recall_target(
 # Oracle
 # ---------------------------------------------------------------------------
 
-ORACLE_TARGETS = [0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.97, 0.98, 0.99]
+BRANCHING_FACTOR_PARAMS: List[int]   = [1, 2, 5, 10, 20, 40, 80]
+NPROBE_PARAMS:           List[int]   = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+TARGET_PARAMS:           List[float] = [0.60, 0.70, 0.75, 0.80, 0.85,
+                                        0.90, 0.95, 0.97, 0.98, 0.99]
+
+DEFAULT_PARAMS = {
+    "BranchingFactor": BRANCHING_FACTOR_PARAMS,
+    "NProbe":          NPROBE_PARAMS,
+    "RecallTarget":    TARGET_PARAMS,
+}
+
+ORACLE_TARGETS = TARGET_PARAMS
 
 
 def _compute_oracle(
@@ -510,10 +521,11 @@ def parse_args():
     parser.add_argument("--mode", required=True,
                         choices=["BranchingFactor", "NProbe", "RecallTarget"],
                         help="Routing mode to evaluate")
-    parser.add_argument("--params", required=True, nargs="+", type=float,
+    parser.add_argument("--params", nargs="+", type=float, default=None,
                         help="Parameter values for the chosen mode "
                              "(integers for BranchingFactor/NProbe, "
-                             "floats 0-1 for RecallTarget)")
+                             "floats 0-1 for RecallTarget). "
+                             "Defaults to the full sweep grid for the chosen mode.")
     parser.add_argument("--no-rebuilds", action="store_true",
                         help="Evaluate only the no-rebuild path "
                              "(always use first-step router/partitions)")
@@ -547,7 +559,7 @@ if __name__ == "__main__":
         raise ValueError("--no-rebuilds and --threshold are mutually exclusive")
 
     mode = args.mode
-    params = args.params
+    params = args.params if args.params is not None else DEFAULT_PARAMS[mode]
 
     deltas = parse_runbook(args.runbook_path)
     runbook_steps = sorted(deltas)
