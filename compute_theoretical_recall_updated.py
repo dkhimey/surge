@@ -605,7 +605,7 @@ if __name__ == "__main__":
                 print(f"Step {step}: missing {missing} — stopping threshold pass.")
                 break
 
-            part_s = _load_partition(step)
+            part_s = np.loadtxt(partition_file, delimiter=",", dtype=int)
             phi = _compute_phi(part_s, active_partition, num_partitions)
             did_rebuild = phi > tau
             if did_rebuild:
