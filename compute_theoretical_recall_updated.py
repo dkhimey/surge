@@ -143,20 +143,19 @@ def _activation(visited_mask: np.ndarray, num_partitions: int) -> float:
 def _compute_phi(part_a: np.ndarray, part_b: np.ndarray, nblocks: int) -> float:
     """Fraction of centers whose partition changes under the optimal bipartite relabeling.
 
-    Strips the trailing moved_nodes line that save_blocks() appends, so callers
-    can pass the raw np.loadtxt output without pre-processing.
+    Callers must pass partition arrays of length n_centers (i.e. with the
+    trailing moved_nodes entry that save_blocks() appends already stripped —
+    every np.loadtxt of a partitions.csv in this file now uses [:-1]).
     The result is invariant to any prior relabeling of either input array —
     bipartite matching finds the globally optimal alignment regardless of labels.
     """
-    a = part_a[:-1]   # drop trailing moved_nodes count
-    b = part_b[:-1]
     cost = np.zeros((nblocks, nblocks), dtype=np.int64)
-    np.add.at(cost, (a, b), 1)
+    np.add.at(cost, (part_a, part_b), 1)
     row_ind, col_ind = linear_sum_assignment(-cost)
     relabel = np.empty(nblocks, dtype=np.int64)
     relabel[row_ind] = col_ind
-    moved = int((relabel[a] != b).sum())
-    return moved / len(a)
+    moved = int((relabel[part_a] != part_b).sum())
+    return moved / len(part_a)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +189,7 @@ def compute_recall_branching_factor(
     if partitions is None:
         partitions = np.loadtxt(
             f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
-            delimiter=",", dtype=int)
+            delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
 
     # GT partition assignment
     gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
@@ -246,7 +245,7 @@ def compute_recall_nprobe(
     if partitions is None:
         partitions = np.loadtxt(
             f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
-            delimiter=",", dtype=int)
+            delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
 
     # GT partition assignment
     gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
@@ -327,7 +326,7 @@ def compute_recall_recall_target(
     if partitions is None:
         partitions = np.loadtxt(
             f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
-            delimiter=",", dtype=int)
+            delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
     part_size = np.bincount(partitions, minlength=num_partitions).astype(np.float32)
 
     # GT partition assignment
@@ -344,8 +343,12 @@ def compute_recall_recall_target(
 
     pids = partitions[labels]  # (Q, k_rt)
 
-    # Score: part_size[pid] * exp(-d / d0) where d0 = mean distance per query
-    d0 = distances.mean(axis=1, keepdims=True).clip(min=1e-10)   # (Q, 1)
+    # Score: part_size[pid] * exp(-d / d0) where d0 = nearest-center distance.
+    # Matches src/index.cpp::getPartitionsForSearch_RecallTgt_ (d0 = centers[0].first)
+    # and compute_theoretical_recall_sweep.py.  Using mean distance here instead
+    # flattens the resulting partition probability distribution and makes the
+    # cumulative-probability cutoff overestimate partitions / misrank them.
+    d0 = distances[:, :1] + 1e-10                                 # (Q, 1)
     weights = part_size[pids] * np.exp(-distances / d0)           # (Q, k_rt)
 
     # Scatter-add weights into per-partition scores (Q, P)
@@ -429,7 +432,7 @@ def _compute_oracle(
     if partitions is None:
         partitions = np.loadtxt(
             f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
-            delimiter=",", dtype=int)
+            delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
 
     # Map each GT neighbour to its partition via the routing HNSW
     gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
@@ -585,7 +588,7 @@ if __name__ == "__main__":
 
     first_partitions = np.loadtxt(
         f"{partitions_directory}/step_{step_start:06d}_partitions.csv",
-        delimiter=",", dtype=int)
+        delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
     num_partitions = int(first_partitions.max()) + 1
     print(f"Found {num_partitions} partitions")
 
@@ -716,7 +719,7 @@ if __name__ == "__main__":
         last_rebuild = step_start
         active_partition = np.loadtxt(
             f"{partitions_directory}/step_{step_start:06d}_partitions.csv",
-            delimiter=",", dtype=int)
+            delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
 
         for step in no_rebuild_steps:
             gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
@@ -729,7 +732,7 @@ if __name__ == "__main__":
                 print(f"Step {step}: missing {missing} — stopping threshold pass.")
                 break
 
-            part_s = np.loadtxt(partition_file, delimiter=",", dtype=int)
+            part_s = np.loadtxt(partition_file, delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
             phi = _compute_phi(part_s, active_partition, num_partitions)
             did_rebuild = phi > tau
             if did_rebuild:
