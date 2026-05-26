@@ -313,6 +313,7 @@ def compute_recall_recall_target(
     num_partitions: int,
     k_rt: int = 50,
     partitions: np.ndarray = None,
+    per_query_out: dict = None,
 ) -> List[Tuple]:
     """RecallTarget routing: score partitions by size * exp(-d/d0), greedily
     accumulate until cumulative probability >= target."""
@@ -366,6 +367,25 @@ def compute_recall_recall_target(
     sorted_probs = np.take_along_axis(partition_probs, ordered_pids, axis=1)
     cumprobs = np.cumsum(sorted_probs, axis=1)                    # (Q, P)
 
+    # ── Per-step ranking summary ──────────────────────────────────────────
+    # partition_probs[q, p] is the heuristic weight the routing assigns to
+    # partition p for query q (sum of part_size * exp(-d/d_min) over the
+    # k_rt nearest centers in p, normalised per query).  Average across
+    # queries to get a per-partition mean weight, then order partition
+    # labels by descending mean weight.  Format matches the oracle's
+    # ranking output so the two can be compared row-for-row.
+    mean_probs        = partition_probs.mean(axis=0)              # (P,)
+    mean_ranking      = np.argsort(-mean_probs).astype(np.int32)  # (P,)
+    mean_ranked_probs = mean_probs[mean_ranking]                  # (P,)
+    ranking_list = mean_ranking.tolist()
+    probs_list   = [float(p) for p in mean_ranked_probs]
+
+    # Per-query ordering + sorted probs, populated only when the caller asks
+    # (used by --per-query-rankings to dump a sidecar CSV).
+    if per_query_out is not None:
+        per_query_out["ordering"]     = ordered_pids   # (Q, P) int32
+        per_query_out["sorted_probs"] = sorted_probs   # (Q, P) float64
+
     results = []
     for target in targets:
         # first column index where cumprob >= target
@@ -384,7 +404,7 @@ def compute_recall_recall_target(
         r = _recall(visited_mask, gt_parts, k_neighbors)
         act = _activation(visited_mask, num_partitions)
         ppc = visited_mask.sum(axis=0).astype(np.int64)
-        results.append((r, act, ppc, elapsed))
+        results.append((r, act, ppc, elapsed, ranking_list, probs_list))
 
     return results
 
@@ -418,6 +438,7 @@ def _compute_oracle(
     k_neighbors: int,
     num_partitions: int,
     partitions: np.ndarray = None,
+    per_query_out: dict = None,
 ) -> List[Tuple]:
     """For each target in ORACLE_TARGETS, compute the minimum number of partitions
     (on average across queries) needed to achieve that recall, assuming exhaustive
@@ -449,9 +470,29 @@ def _compute_oracle(
         linear, minlength=Q * num_partitions,
     ).reshape(Q, num_partitions).astype(np.float64) / k_neighbors
 
-    # Greedily add partitions in descending density order
-    sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]
+    # Per-query ordering (labels in descending density) and the corresponding
+    # sorted densities.  ordered_density is the same vector as sorted_dist but
+    # with the partition labels preserved alongside.
+    per_query_ordering    = np.argsort(-query_dist, axis=1).astype(np.int32)
+    per_query_sorted_dist = np.take_along_axis(query_dist, per_query_ordering, axis=1)
+    # Greedy cumulative density used by the activation/recall reporting.
+    sorted_dist = per_query_sorted_dist
     cumsum      = np.cumsum(sorted_dist, axis=1)
+
+    # ── Per-step ranking summary ──────────────────────────────────────────
+    # Mean across queries of query_dist[q, p].  Each partition's "weight"
+    # here is its average fraction of a query's GT neighbours — directly
+    # comparable to the RecallTarget routing's mean partition_probs[q, p].
+    mean_density        = query_dist.mean(axis=0)                       # (P,)
+    mean_ranking        = np.argsort(-mean_density).astype(np.int32)    # (P,)
+    mean_ranked_density = mean_density[mean_ranking]                    # (P,)
+    ranking_list = mean_ranking.tolist()
+    probs_list   = [float(p) for p in mean_ranked_density]
+
+    # Per-query ordering + sorted densities for the optional sidecar CSV.
+    if per_query_out is not None:
+        per_query_out["ordering"]     = per_query_ordering      # (Q, P) int32
+        per_query_out["sorted_probs"] = per_query_sorted_dist   # (Q, P) float64
 
     results = []
     for target in ORACLE_TARGETS:
@@ -461,6 +502,8 @@ def _compute_oracle(
             float(target),
             float((idx + 1).mean()) / num_partitions,   # activation
             float(cumsum[np.arange(Q), idx].mean()),     # achieved recall
+            ranking_list,
+            probs_list,
         ))
     return results
 
@@ -468,11 +511,14 @@ def _compute_oracle(
 def _call_oracle(queries, base_mmap, gt_file,
                  base_dir, partition_dir, hnsw_step, partition_step,
                  k_neighbors, num_partitions,
-                 partitions: np.ndarray = None):
+                 partitions: np.ndarray = None,
+                 per_query_out: dict = None):
     try:
         return _compute_oracle(queries, base_mmap, gt_file,
                                base_dir, partition_dir, hnsw_step, partition_step,
-                               k_neighbors, num_partitions, partitions=partitions)
+                               k_neighbors, num_partitions,
+                               partitions=partitions,
+                               per_query_out=per_query_out)
     except RuntimeError as e:
         print(f"WARNING: skipping oracle (hnsw_step={hnsw_step}): {e}")
         return None
@@ -492,17 +538,24 @@ ROUTING_FUNCS = {
 def _call_routing(mode, queries, base_mmap, gt_file,
                   base_dir, partition_dir, hnsw_step, partition_step,
                   params, k_neighbors, num_partitions,
-                  partitions: np.ndarray = None):
+                  partitions: np.ndarray = None,
+                  per_query_out: dict = None):
     fn = ROUTING_FUNCS[mode]
     if mode in ("BranchingFactor", "NProbe"):
         params_cast = [int(p) for p in params]
     else:
         params_cast = [float(p) for p in params]
+    # per_query_out is only meaningful for RecallTarget; the other routing
+    # functions don't accept the keyword.
+    extra_kwargs = {}
+    if mode == "RecallTarget" and per_query_out is not None:
+        extra_kwargs["per_query_out"] = per_query_out
     try:
         return fn(queries, base_mmap, gt_file,
                   base_dir, partition_dir, hnsw_step, partition_step,
                   params_cast, k_neighbors, num_partitions,
-                  partitions=partitions)
+                  partitions=partitions,
+                  **extra_kwargs)
     except RuntimeError as e:
         print(f"WARNING: skipping step (hnsw_step={hnsw_step}, "
               f"partition_step={partition_step}): {e}")
@@ -548,6 +601,18 @@ def parse_args():
                         help="Path to the base vectors file")
     parser.add_argument("--gt-dir", required=True,
                         help="Directory containing stepN.gt100 ground-truth files")
+    parser.add_argument("--per-query-rankings", action="store_true",
+                        help="Dump per-query partition rankings and scores from "
+                             "RecallTarget and Oracle every 100 processed steps. "
+                             "Writes a sidecar CSV per_query_rankings{suffix}.csv "
+                             "with one row per (step, query_id) containing both "
+                             "the routing's per-query ordering+scores and the "
+                             "oracle's per-query ordering+densities for 1:1 "
+                             "comparison.  Only effective with --mode RecallTarget.")
+    parser.add_argument("--per-query-every", type=int, default=100,
+                        help="Iteration interval (in processed steps) at which "
+                             "per-query rankings are dumped when "
+                             "--per-query-rankings is enabled.  Default: 100.")
     return parser.parse_args()
 
 
@@ -592,13 +657,60 @@ if __name__ == "__main__":
     num_partitions = int(first_partitions.max()) + 1
     print(f"Found {num_partitions} partitions")
 
+    # ── Determine suffix early so the per-query sidecar can share it ──────
+    if args.threshold is not None:
+        tau_str = f"{round(args.threshold * 100)}"
+        suffix = f"_t{tau_str}"
+    elif args.no_rebuilds:
+        suffix = "_no_rebuilds"
+    else:
+        suffix = ""
+
+    # ── Per-query rankings sidecar setup ──────────────────────────────────
+    per_query_path = None
+    dump_every     = max(1, int(args.per_query_every))
+    if args.per_query_rankings and mode == "RecallTarget":
+        per_query_path = f"{partitions_directory}/per_query_rankings{suffix}.csv"
+        with open(per_query_path, "w") as _pq:
+            _pq.write("step,query_id,rt_ranking,rt_scores,"
+                      "oracle_ranking,oracle_scores\n")
+        print(f"Per-query rankings will be dumped to {per_query_path} "
+              f"every {dump_every} processed steps.")
+
+    def _append_per_query(step_value, rt_data, oracle_data):
+        """Append per-query rows for one step.  rt_data and oracle_data are
+        dicts populated by compute_recall_recall_target / _compute_oracle
+        when per_query_out is provided; each has keys 'ordering' (Q, P int32)
+        and 'sorted_probs' (Q, P float)."""
+        if per_query_path is None:
+            return
+        if not rt_data or not oracle_data:
+            return
+        rt_ord, rt_sc = rt_data["ordering"], rt_data["sorted_probs"]
+        or_ord, or_sc = oracle_data["ordering"], oracle_data["sorted_probs"]
+        Q_local = rt_ord.shape[0]
+        with open(per_query_path, "a") as _pq:
+            for q in range(Q_local):
+                rt_r = rt_ord[q].tolist()
+                rt_s = [round(float(p), 6) for p in rt_sc[q]]
+                or_r = or_ord[q].tolist()
+                or_s = [round(float(p), 6) for p in or_sc[q]]
+                # Wrap list reprs in double quotes so embedded commas don't
+                # break the CSV; pandas.read_csv parses these correctly.
+                _pq.write(
+                    f'{step_value},{q},'
+                    f'"{rt_r}","{rt_s}","{or_r}","{or_s}"\n'
+                )
+
     rows = []
 
     # ------------------------------------------------------------------
     # Rebuild pass
     # ------------------------------------------------------------------
     if not args.no_rebuilds and args.threshold is None:
+        pass_iter = -1
         for step in range(step_start, step_end, 2):
+            pass_iter += 1
             gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
             hnsw_file = f"{base_directory}/step_{step:06d}_hnsw.bin"
             partition_file = f"{partitions_directory}/step_{step:06d}_partitions.csv"
@@ -608,15 +720,24 @@ if __name__ == "__main__":
                 print(f"Step {step}: missing {missing} — stopping rebuild pass.")
                 break
 
+            dump_now = (per_query_path is not None
+                        and mode == "RecallTarget"
+                        and pass_iter % dump_every == 0)
+            rt_pq     = {} if dump_now else None
+            oracle_pq = {} if dump_now else None
+
             step_results = _call_routing(
                 mode, queries, base_mmap, gt_test,
                 base_directory, partitions_directory,
-                step, step, params, 10, num_partitions)
+                step, step, params, 10, num_partitions,
+                per_query_out=rt_pq)
 
             if step_results is None:
                 continue
-            for param, (r, act, ppc, t) in zip(params, step_results):
-                rows.append({
+            for param, result in zip(params, step_results):
+                # RecallTarget tuples carry two extra fields (ranking + probs)
+                r, act, ppc, t = result[:4]
+                row = {
                     "step": step,
                     "rebuild": "rebuild",
                     "mode": mode,
@@ -625,14 +746,20 @@ if __name__ == "__main__":
                     "activation": act,
                     "cof": _cof(ppc),
                     "query_time_s": t,
-                })
+                }
+                if mode == "RecallTarget":
+                    _, _, _, _, ranking, probs = result
+                    row["partition_ranking"] = str(ranking)
+                    row["partition_probs"]   = str([round(p, 6) for p in probs])
+                rows.append(row)
             if mode == "RecallTarget":
                 oracle_results = _call_oracle(
                     queries, base_mmap, gt_test,
                     base_directory, partitions_directory,
-                    step, step, 10, num_partitions)
+                    step, step, 10, num_partitions,
+                    per_query_out=oracle_pq)
                 if oracle_results is not None:
-                    for target, act, rec in oracle_results:
+                    for target, act, rec, ranking, probs in oracle_results:
                         rows.append({
                             "step": step,
                             "rebuild": "rebuild",
@@ -642,9 +769,16 @@ if __name__ == "__main__":
                             "activation": act,
                             "cof": float("nan"),
                             "query_time_s": float("nan"),
+                            "partition_ranking": str(ranking),
+                            "partition_probs":   str([round(p, 6) for p in probs]),
                         })
+            if dump_now:
+                _append_per_query(step, rt_pq, oracle_pq)
+                print(f"  [per-query] dumped step {step} "
+                      f"({rt_pq['ordering'].shape[0]} queries) to "
+                      f"{per_query_path}")
             print(f"REBUILD step {step}: "
-                  f"recall={[r for r, *_ in step_results]}")
+                  f"recall={[r[0] for r in step_results]}")
 
     # ------------------------------------------------------------------
     # No-rebuild pass  (always use step_start router/partitions)
@@ -655,21 +789,32 @@ if __name__ == "__main__":
     ]
 
     if args.threshold is None:
+        pass_iter = -1
         for step in no_rebuild_steps:
+            pass_iter += 1
             gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
             if not Path(gt_test).exists():
                 print(f"Missing GT at step {step}: {gt_test}. Skipping.")
                 continue
 
+            dump_now = (per_query_path is not None
+                        and mode == "RecallTarget"
+                        and pass_iter % dump_every == 0)
+            rt_pq     = {} if dump_now else None
+            oracle_pq = {} if dump_now else None
+
             step_results = _call_routing(
                 mode, queries, base_mmap, gt_test,
                 base_directory, partitions_directory,
-                step_start, step_start, params, 10, num_partitions)
+                step_start, step_start, params, 10, num_partitions,
+                per_query_out=rt_pq)
 
             if step_results is None:
                 continue
-            for param, (r, act, ppc, t) in zip(params, step_results):
-                rows.append({
+            for param, result in zip(params, step_results):
+                # RecallTarget tuples carry two extra fields (ranking + probs)
+                r, act, ppc, t = result[:4]
+                row = {
                     "step": step,
                     "rebuild": "no_rebuild",
                     "mode": mode,
@@ -678,14 +823,20 @@ if __name__ == "__main__":
                     "activation": act,
                     "cof": _cof(ppc),
                     "query_time_s": t,
-                })
+                }
+                if mode == "RecallTarget":
+                    _, _, _, _, ranking, probs = result
+                    row["partition_ranking"] = str(ranking)
+                    row["partition_probs"]   = str([round(p, 6) for p in probs])
+                rows.append(row)
             if mode == "RecallTarget":
                 oracle_results = _call_oracle(
                     queries, base_mmap, gt_test,
                     base_directory, partitions_directory,
-                    step_start, step_start, 10, num_partitions)
+                    step_start, step_start, 10, num_partitions,
+                    per_query_out=oracle_pq)
                 if oracle_results is not None:
-                    for target, act, rec in oracle_results:
+                    for target, act, rec, ranking, probs in oracle_results:
                         rows.append({
                             "step": step,
                             "rebuild": "no_rebuild",
@@ -695,9 +846,16 @@ if __name__ == "__main__":
                             "activation": act,
                             "cof": float("nan"),
                             "query_time_s": float("nan"),
+                            "partition_ranking": str(ranking),
+                            "partition_probs":   str([round(p, 6) for p in probs]),
                         })
+            if dump_now:
+                _append_per_query(step, rt_pq, oracle_pq)
+                print(f"  [per-query] dumped step {step} "
+                      f"({rt_pq['ordering'].shape[0]} queries) to "
+                      f"{per_query_path}")
             print(f"NO-REBUILD step {step}: "
-                  f"recall={[r for r, *_ in step_results]}")
+                  f"recall={[r[0] for r in step_results]}")
 
     # ------------------------------------------------------------------
     # Threshold pass
@@ -721,7 +879,9 @@ if __name__ == "__main__":
             f"{partitions_directory}/step_{step_start:06d}_partitions.csv",
             delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
 
+        pass_iter = -1
         for step in no_rebuild_steps:
+            pass_iter += 1
             gt_test = f"{args.gt_dir}/step{step + 1}.gt100"
             hnsw_file = f"{base_directory}/step_{step:06d}_hnsw.bin"
             partition_file = f"{partitions_directory}/step_{step:06d}_partitions.csv"
@@ -743,16 +903,25 @@ if __name__ == "__main__":
                   f"{'→ REBUILD' if did_rebuild else '  (skip)  '} "
                   f"active={last_rebuild}")
 
+            dump_now = (per_query_path is not None
+                        and mode == "RecallTarget"
+                        and pass_iter % dump_every == 0)
+            rt_pq     = {} if dump_now else None
+            oracle_pq = {} if dump_now else None
+
             step_results = _call_routing(
                 mode, queries, base_mmap, gt_test,
                 base_directory, partitions_directory,
                 last_rebuild, last_rebuild, params, 10, num_partitions,
-                partitions=active_partition)
+                partitions=active_partition,
+                per_query_out=rt_pq)
 
             if step_results is None:
                 continue
-            for param, (r, act, ppc, t) in zip(params, step_results):
-                rows.append({
+            for param, result in zip(params, step_results):
+                # RecallTarget tuples carry two extra fields (ranking + probs)
+                r, act, ppc, t = result[:4]
+                row = {
                     "step": step,
                     "rebuild": f"threshold_{tau:.4g}",
                     "mode": mode,
@@ -764,15 +933,21 @@ if __name__ == "__main__":
                     "phi": phi,
                     "did_rebuild": did_rebuild,
                     "active_step": last_rebuild,
-                })
+                }
+                if mode == "RecallTarget":
+                    _, _, _, _, ranking, probs = result
+                    row["partition_ranking"] = str(ranking)
+                    row["partition_probs"]   = str([round(p, 6) for p in probs])
+                rows.append(row)
             if mode == "RecallTarget":
                 oracle_results = _call_oracle(
                     queries, base_mmap, gt_test,
                     base_directory, partitions_directory,
                     last_rebuild, last_rebuild, 10, num_partitions,
-                    partitions=active_partition)
+                    partitions=active_partition,
+                    per_query_out=oracle_pq)
                 if oracle_results is not None:
-                    for target, act, rec in oracle_results:
+                    for target, act, rec, ranking, probs in oracle_results:
                         rows.append({
                             "step": step,
                             "rebuild": f"threshold_{tau:.4g}",
@@ -785,27 +960,37 @@ if __name__ == "__main__":
                             "phi": phi,
                             "did_rebuild": did_rebuild,
                             "active_step": last_rebuild,
+                            "partition_ranking": str(ranking),
+                            "partition_probs":   str([round(p, 6) for p in probs]),
                         })
+            if dump_now:
+                _append_per_query(step, rt_pq, oracle_pq)
+                print(f"  [per-query] dumped step {step} "
+                      f"({rt_pq['ordering'].shape[0]} queries) to "
+                      f"{per_query_path}")
             print(f"THRESHOLD step {step}: "
-                  f"recall={[r for r, *_ in step_results]}")
+                  f"recall={[r[0] for r in step_results]}")
 
     # ------------------------------------------------------------------
     # Save results
     # ------------------------------------------------------------------
+    # partition_ranking and partition_probs are populated on RecallTarget rows
+    # (mean-across-queries partition_probs from the routing heuristic) and on
+    # Oracle rows (mean-across-queries query_dist, i.e. fraction of each
+    # query's GT in each partition).  The two are directly comparable: same
+    # ordering convention (descending mean weight) and same per-partition
+    # weight semantics (one probability/density value per partition).
+    # BranchingFactor / NProbe rows leave these columns blank.
+    # `suffix` was determined earlier (so the per-query sidecar could share it).
     if args.threshold is not None:
-        tau_str = f"{round(args.threshold * 100)}"
-        suffix = f"_t{tau_str}"
         columns = ["step", "rebuild", "mode", "param",
                    "recall", "activation", "cof", "query_time_s",
-                   "phi", "did_rebuild", "active_step"]
-    elif args.no_rebuilds:
-        suffix = "_no_rebuilds"
-        columns = ["step", "rebuild", "mode", "param",
-                   "recall", "activation", "cof", "query_time_s"]
+                   "phi", "did_rebuild", "active_step",
+                   "partition_ranking", "partition_probs"]
     else:
-        suffix = ""
         columns = ["step", "rebuild", "mode", "param",
-                   "recall", "activation", "cof", "query_time_s"]
+                   "recall", "activation", "cof", "query_time_s",
+                   "partition_ranking", "partition_probs"]
 
     df = pd.DataFrame(rows, columns=columns)
     output_name = f"full_results_{mode}{suffix}.csv"
