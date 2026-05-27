@@ -24,7 +24,16 @@
 // ─── Output CSV columns ──────────────────────────────────────────────────────
 //  All rows:
 //    step, operation, mode, param,
-//    range_start, range_end, time_s, throughput, recall@<k>, avg_parts_searched
+//    range_start, range_end, time_s, throughput,
+//    recall@<k>, theoretical_recall@<k>, avg_parts_searched
+//
+//  theoretical_recall@<k> is computed during the sweep (search rows only;
+//  -1 elsewhere).  For each query it equals
+//    | gt_partitions(q) ∩ visited_partitions(q, mode, param) | / | gt_partitions(q) |
+//  where gt_partitions(q) is the set of partitions holding q's top-K GT
+//  neighbours, looked up via a fresh routing_hnsw->searchKnn(gt_vec, 1) pass
+//  — matching compute_theoretical_recall_updated.py exactly.  Computed
+//  outside the timed search window so throughput is unaffected.
 //  Rebuild rows (operation="rebuild") additionally populate:
 //    centers_moved, elements_moved,
 //    repart_hnsw_s, repart_bottom_s, repart_kaffpa_s, repart_relabel_s,
@@ -39,6 +48,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -53,7 +63,90 @@
 #include <omp.h>
 #include <yaml-cpp/yaml.h>
 
+// POSIX mmap headers — used by BaseMmap below to sparse-read GT vectors
+// from base_file for theoretical-recall computation (matches the offline
+// Python script's np.memmap pattern).
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <stdexcept>
+#include <unordered_set>
+
 #include "index.h"
+
+// ─── mmap helper for sparse GT vector reads ─────────────────────────────────
+//
+// Mirrors compute_theoretical_recall_updated.py's mmap_fbin / mmap_u8bin:
+// open base_file, mmap it read-only, and copy individual vectors out at
+// arbitrary indices into a float buffer.  Supports FBIN (float32) and
+// U8BIN (uint8 → float32 widen).  Throws on other formats.
+//
+// Used only for theoretical-recall setup (once per search step, outside
+// the timed query window), so per-vector copy cost is irrelevant.
+class BaseMmap {
+public:
+    BaseMmap(const std::string& path, FileFormat format)
+        : format_(format)
+    {
+        if (format != FBIN && format != U8BIN) {
+            throw std::runtime_error(
+                "BaseMmap: only FBIN/U8BIN supported for theoretical recall");
+        }
+        fd_ = open(path.c_str(), O_RDONLY);
+        if (fd_ < 0)
+            throw std::runtime_error("BaseMmap: cannot open " + path);
+        struct stat st;
+        if (fstat(fd_, &st) != 0) {
+            close(fd_);
+            throw std::runtime_error("BaseMmap: fstat failed for " + path);
+        }
+        size_ = static_cast<size_t>(st.st_size);
+        base_ = mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
+        if (base_ == MAP_FAILED) {
+            close(fd_);
+            throw std::runtime_error("BaseMmap: mmap failed for " + path);
+        }
+        const uint32_t* hdr = static_cast<const uint32_t*>(base_);
+        n_   = hdr[0];
+        dim_ = hdr[1];
+    }
+    ~BaseMmap() {
+        if (base_ && base_ != MAP_FAILED) munmap(base_, size_);
+        if (fd_ >= 0) close(fd_);
+    }
+    BaseMmap(const BaseMmap&)            = delete;
+    BaseMmap& operator=(const BaseMmap&) = delete;
+
+    uint32_t n()   const { return n_; }
+    uint32_t dim() const { return dim_; }
+
+    // Copy vector at index `id` into `out` (resized to dim()).  Widens
+    // u8 → float on the fly.
+    void readVector(uint32_t id, std::vector<float>& out) const {
+        out.resize(dim_);
+        const char* payload = static_cast<const char*>(base_) + 8;
+        if (format_ == FBIN) {
+            const float* p = reinterpret_cast<const float*>(payload)
+                           + static_cast<size_t>(id) * dim_;
+            std::memcpy(out.data(), p, dim_ * sizeof(float));
+        } else { // U8BIN
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(payload)
+                             + static_cast<size_t>(id) * dim_;
+            for (size_t i = 0; i < dim_; ++i)
+                out[i] = static_cast<float>(p[i]);
+        }
+    }
+
+private:
+    int        fd_     = -1;
+    void*      base_   = nullptr;
+    size_t     size_   = 0;
+    uint32_t   n_      = 0;
+    uint32_t   dim_    = 0;
+    FileFormat format_;
+};
 
 // ─── Build hyper-parameters ──────────────────────────────────────────────────
 static constexpr int    NCENTERS             = 10000;
@@ -472,6 +565,7 @@ int main(int argc, char** argv)
         }
         csv << "step,operation,mode,param"
             << ",range_start,range_end,time_s,throughput,recall@" << k
+            << ",theoretical_recall@" << k
             << ",avg_parts_searched"
             << ",centers_moved,elements_moved"
             << ",repart_hnsw_s,repart_bottom_s,repart_kaffpa_s,repart_relabel_s"
@@ -512,6 +606,7 @@ int main(int argc, char** argv)
                              const std::string& mode_str, float param_val,
                              int rs, int re,
                              double time_s, double throughput, double recall,
+                             double theoretical_recall,
                              double avg_parts,
                              const RebuildStats& rb,
                              const std::vector<unsigned long long>& sizes)
@@ -521,6 +616,7 @@ int main(int argc, char** argv)
                 << "," << rs << "," << re
                 << "," << time_s << "," << throughput
                 << "," << recall
+                << "," << theoretical_recall
                 << "," << avg_parts
                 << "," << rb.centers_moved
                 << "," << rb.elements_moved
@@ -564,7 +660,7 @@ int main(int argc, char** argv)
         {
             auto sizes = collect_sizes();
             write_row(init.step_num, "insert", "", -1.0f,
-                      init.start, init.end, 0.0, 0.0, -1.0, -1.0,
+                      init.start, init.end, 0.0, 0.0, -1.0, -1.0, -1.0,
                       kNoRebuild, sizes);
         }
 
@@ -759,14 +855,14 @@ int main(int argc, char** argv)
                     ? static_cast<double>(n_insert) / max_t : 0.0;
                 auto sizes = collect_sizes();
                 write_row(step.step_num, "insert", "", -1.0f,
-                          step.start, step.end, max_t, throughput, -1.0, -1.0,
+                          step.start, step.end, max_t, throughput, -1.0, -1.0, -1.0,
                           kNoRebuild, sizes);
                 if (rb_type > 0) {
                     const double total_rb_s = rb_stats.repart_hnsw_s + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
                     write_row(step.step_num, "rebuild", "", -1.0f, -1, -1,
-                              total_rb_s, -1.0, -1.0, -1.0, rb_stats, sizes);
+                              total_rb_s, -1.0, -1.0, -1.0, -1.0, rb_stats, sizes);
                 }
 
             // ── DELETE ────────────────────────────────────────────────────────
@@ -899,14 +995,14 @@ int main(int argc, char** argv)
                     ? static_cast<double>(n_delete) / max_t : 0.0;
                 auto sizes = collect_sizes();
                 write_row(step.step_num, "delete", "", -1.0f,
-                          step.start, step.end, max_t, throughput, -1.0, -1.0,
+                          step.start, step.end, max_t, throughput, -1.0, -1.0, -1.0,
                           kNoRebuild, sizes);
                 if (rb_type > 0) {
                     const double total_rb_s = rb_stats.repart_hnsw_s + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
                     write_row(step.step_num, "rebuild", "", -1.0f, -1, -1,
-                              total_rb_s, -1.0, -1.0, -1.0, rb_stats, sizes);
+                              total_rb_s, -1.0, -1.0, -1.0, -1.0, rb_stats, sizes);
                 }
 
             // ── SEARCH (sweep) ────────────────────────────────────────────────
@@ -943,6 +1039,48 @@ int main(int argc, char** argv)
                     MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
                 }
 
+                // ── Theoretical-recall setup ─────────────────────────────
+                // For each query in this rank's slice, resolve its top-K GT
+                // neighbours to partition IDs via a fresh meta-HNSW lookup
+                // (mirrors compute_theoretical_recall_updated.py).  Each rank
+                // computes its own slice — no broadcast needed because
+                // routing_hnsw and routing_partitions are already replicated.
+                // Runs outside the per-combo timing window, so search
+                // throughput is unaffected.
+                //
+                // gt_partitions[q-my_qs] is a per-neighbour vector (length kk,
+                // -1 for unresolved ids) — NOT a set.  This gives the
+                // neighbor-frequency theoretical recall used by the Python
+                // _recall(), which is a strict upper bound on actual recall.
+                std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
+                if (have_gt) {
+                    BaseMmap base_view(base_file, file_format);
+                    #pragma omp parallel
+                    {
+                        std::vector<float> tmp_vec;
+                        #pragma omp for schedule(static)
+                        for (size_t q = my_qs; q < my_qe; q++) {
+                            if (q >= gt.size()) continue;
+                            const auto& gt_q = gt[q];
+                            const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
+                            auto&       glist = gt_partitions[q - my_qs];
+                            glist.assign(kk, -1);
+                            for (int i = 0; i < kk; i++) {
+                                const int gid = gt_q[i];
+                                if (gid < 0 || static_cast<uint32_t>(gid) >= base_view.n())
+                                    continue;
+                                base_view.readVector(static_cast<uint32_t>(gid), tmp_vec);
+                                auto pq = routing_hnsw->searchKnn(tmp_vec.data(), 1);
+                                if (pq.empty()) continue;
+                                const int cid = static_cast<int>(pq.top().second);
+                                if (cid < 0 || cid >= static_cast<int>(routing_partitions.size()))
+                                    continue;
+                                glist[i] = routing_partitions[cid];
+                            }
+                        }
+                    }
+                }
+
                 // ── Combo loop (results buffered; collect_sizes() called once after) ──
                 // Declared before the loop because ComboResult must live that long.
                 struct ComboResult {
@@ -952,6 +1090,13 @@ int main(int argc, char** argv)
                     double      qps;
                     double      recall;
                     double      avg_parts;
+                    // Theoretical recall: fraction of partitions holding the
+                    // top-K GT neighbours that the router would also probe
+                    // for this mode/param.  GT→partition mapping uses a fresh
+                    // routing_hnsw->searchKnn(gt_vec, 1) lookup per GT id,
+                    // matching compute_theoretical_recall_updated.py exactly.
+                    // -1 if no GT was loaded for this step.
+                    double      theoretical_recall;
                 };
                 std::vector<ComboResult> combo_results;
                 combo_results.reserve(n_combos);
@@ -963,12 +1108,18 @@ int main(int argc, char** argv)
                     std::vector<std::vector<uint32_t>> send_qids(world_size);
                     std::vector<std::vector<float>>    send_qvecs(world_size);
                     long long my_total_parts = 0;
+                    // Theoretical-recall accumulator over this rank's slice
+                    // (computed alongside routing; pre-timing).
+                    double    my_theo_sum     = 0.0;
+                    long long my_theo_counted = 0;
 
                     #pragma omp parallel
                     {
                         std::vector<std::vector<uint32_t>> local_qids(world_size);
                         std::vector<std::vector<float>>    local_qvecs(world_size);
-                        long long thread_parts = 0;
+                        long long thread_parts      = 0;
+                        double    thread_theo_sum   = 0.0;
+                        long long thread_theo_count = 0;
 
                         #pragma omp for nowait schedule(static)
                         for (size_t q = my_qs; q < my_qe; q++) {
@@ -982,6 +1133,23 @@ int main(int argc, char** argv)
                                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
                                 local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
                             }
+
+                            // Theoretical recall (neighbor-frequency, upper-
+                            // bounds actual recall): for each top-K GT
+                            // neighbour, check whether its owning partition
+                            // is in the visited set; divide by k.  targets
+                            // stores partition_id + 1; subtract 1 to recover.
+                            const auto& glist = gt_partitions[q - my_qs];
+                            if (!glist.empty()) {
+                                int inter = 0;
+                                for (int pid : glist) {
+                                    if (pid < 0) continue;
+                                    if (targets.count(pid + 1)) ++inter;
+                                }
+                                thread_theo_sum   += static_cast<double>(inter)
+                                                   / static_cast<double>(k);
+                                thread_theo_count += 1;
+                            }
                         }
 
                         #pragma omp critical
@@ -992,7 +1160,9 @@ int main(int argc, char** argv)
                                 send_qvecs[r].insert(send_qvecs[r].end(),
                                                      local_qvecs[r].begin(), local_qvecs[r].end());
                             }
-                            my_total_parts += thread_parts;
+                            my_total_parts  += thread_parts;
+                            my_theo_sum     += thread_theo_sum;
+                            my_theo_counted += thread_theo_count;
                         }
                     }
 
@@ -1022,12 +1192,21 @@ int main(int argc, char** argv)
                         MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                     }
 
-                    long long global_parts = 0;
-                    MPI_Reduce(&my_total_parts, &global_parts, 1, MPI_LONG_LONG,
+                    // Fused SUM reduce: (total_parts, theo_sum, theo_counted).
+                    // Encoded as double[3] — long long counts fit exactly up
+                    // to 2^53, far above any realistic nq * world_size.
+                    double local_sum[3]  = {
+                        static_cast<double>(my_total_parts),
+                        my_theo_sum,
+                        static_cast<double>(my_theo_counted),
+                    };
+                    double global_sum[3] = {0.0, 0.0, 0.0};
+                    MPI_Reduce(local_sum, global_sum, 3, MPI_DOUBLE,
                                MPI_SUM, 0, MPI_COMM_WORLD);
                     const double avg_parts =
-                        (nq > 0) ? static_cast<double>(global_parts) / static_cast<double>(nq)
-                                 : -1.0;
+                        (nq > 0) ? global_sum[0] / static_cast<double>(nq) : -1.0;
+                    const double theoretical_recall =
+                        (global_sum[2] > 0.0) ? global_sum[1] / global_sum[2] : -1.0;
 
                     using KNNVec = std::vector<std::pair<float, uint32_t>>;
                     std::vector<KNNVec> neighbors(my_qe - my_qs);
@@ -1079,11 +1258,13 @@ int main(int argc, char** argv)
                               << "  mode=" << sweep_mode_str
                               << "  param=" << sweep_param
                               << "  recall@" << k << "=" << recall
+                              << "  theo_recall@" << k << "=" << theoretical_recall
                               << "  qps=" << qps
                               << "  avg_parts=" << avg_parts << "\n";
 
                     combo_results.push_back({sweep_mode_str, sweep_param,
-                                             max_t, qps, recall, avg_parts});
+                                             max_t, qps, recall, avg_parts,
+                                             theoretical_recall});
                 }
 
                 // No rebuild after search.
@@ -1096,7 +1277,9 @@ int main(int argc, char** argv)
                     write_row(step.step_num, "search",
                               cr.mode_str, cr.param,
                               0, static_cast<int>(nq),
-                              cr.time_s, cr.qps, cr.recall, cr.avg_parts,
+                              cr.time_s, cr.qps, cr.recall,
+                              cr.theoretical_recall,
+                              cr.avg_parts,
                               kNoRebuild, sizes);
                 }
 
@@ -1429,6 +1612,38 @@ int main(int argc, char** argv)
                     MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
                 }
 
+                // ── Theoretical-recall setup (mirrors coordinator) ───────
+                // Per-neighbour partition list (length kk, -1 for unresolved);
+                // neighbor-frequency recall, divides by k.
+                std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
+                if (have_gt) {
+                    BaseMmap base_view(base_file, file_format);
+                    #pragma omp parallel
+                    {
+                        std::vector<float> tmp_vec;
+                        #pragma omp for schedule(static)
+                        for (size_t q = my_qs; q < my_qe; q++) {
+                            if (q >= gt.size()) continue;
+                            const auto& gt_q = gt[q];
+                            const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
+                            auto&       glist = gt_partitions[q - my_qs];
+                            glist.assign(kk, -1);
+                            for (int i = 0; i < kk; i++) {
+                                const int gid = gt_q[i];
+                                if (gid < 0 || static_cast<uint32_t>(gid) >= base_view.n())
+                                    continue;
+                                base_view.readVector(static_cast<uint32_t>(gid), tmp_vec);
+                                auto pq = routing_hnsw->searchKnn(tmp_vec.data(), 1);
+                                if (pq.empty()) continue;
+                                const int cid = static_cast<int>(pq.top().second);
+                                if (cid < 0 || cid >= static_cast<int>(routing_partitions.size()))
+                                    continue;
+                                glist[i] = routing_partitions[cid];
+                            }
+                        }
+                    }
+                }
+
                 // Run once per combo — must match coordinator's combo loop exactly.
                 for (int ci = 0; ci < n_combos; ci++) {
                     const auto& [sweep_mode_ex, sweep_param_ex] = sweep_combos[ci];
@@ -1437,12 +1652,17 @@ int main(int argc, char** argv)
                     std::vector<std::vector<uint32_t>> send_qids(world_size);
                     std::vector<std::vector<float>>    send_qvecs(world_size);
                     long long my_total_parts = 0;
+                    // Theoretical-recall accumulator (mirrors coordinator).
+                    double    my_theo_sum     = 0.0;
+                    long long my_theo_counted = 0;
 
                     #pragma omp parallel
                     {
                         std::vector<std::vector<uint32_t>> local_qids(world_size);
                         std::vector<std::vector<float>>    local_qvecs(world_size);
-                        long long thread_parts = 0;
+                        long long thread_parts      = 0;
+                        double    thread_theo_sum   = 0.0;
+                        long long thread_theo_count = 0;
 
                         #pragma omp for nowait schedule(static)
                         for (size_t q = my_qs; q < my_qe; q++) {
@@ -1456,6 +1676,18 @@ int main(int argc, char** argv)
                                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
                                 local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
                             }
+
+                            const auto& glist = gt_partitions[q - my_qs];
+                            if (!glist.empty()) {
+                                int inter = 0;
+                                for (int pid : glist) {
+                                    if (pid < 0) continue;
+                                    if (targets.count(pid + 1)) ++inter;
+                                }
+                                thread_theo_sum   += static_cast<double>(inter)
+                                                   / static_cast<double>(k);
+                                thread_theo_count += 1;
+                            }
                         }
 
                         #pragma omp critical
@@ -1466,7 +1698,9 @@ int main(int argc, char** argv)
                                 send_qvecs[r].insert(send_qvecs[r].end(),
                                                      local_qvecs[r].begin(), local_qvecs[r].end());
                             }
-                            my_total_parts += thread_parts;
+                            my_total_parts  += thread_parts;
+                            my_theo_sum     += thread_theo_sum;
+                            my_theo_counted += thread_theo_count;
                         }
                     }
 
@@ -1522,8 +1756,15 @@ int main(int argc, char** argv)
                     }
 
                     {
-                        long long dummy_recv = 0;
-                        MPI_Reduce(&my_total_parts, &dummy_recv, 1, MPI_LONG_LONG,
+                        // Mirror coordinator's fused SUM reduce:
+                        // (total_parts, theo_sum, theo_counted) as double[3].
+                        double local_sum[3]  = {
+                            static_cast<double>(my_total_parts),
+                            my_theo_sum,
+                            static_cast<double>(my_theo_counted),
+                        };
+                        double dummy_recv[3] = {0.0, 0.0, 0.0}; // unused on non-root
+                        MPI_Reduce(local_sum, dummy_recv, 3, MPI_DOUBLE,
                                    MPI_SUM, 0, MPI_COMM_WORLD);
                     }
 
