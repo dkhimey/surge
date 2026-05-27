@@ -850,7 +850,12 @@ if __name__ == "__main__":
     per_query_path = None
     dump_every     = max(1, int(args.per_query_every))
     if args.per_query_rankings and mode in RANKED_MODES:
-        per_query_path = f"{partitions_directory}/per_query_rankings{suffix}.csv"
+        # Include mode in the sidecar filename so RecallTarget and
+        # RecallTargetExtended runs on the same partitions_dir don't clobber
+        # each other.
+        per_query_path = (
+            f"{partitions_directory}/per_query_rankings_{mode}{suffix}.csv"
+        )
         with open(per_query_path, "w") as _pq:
             _pq.write("step,query_id,rt_ranking,rt_scores,"
                       "oracle_ranking,oracle_scores\n")
