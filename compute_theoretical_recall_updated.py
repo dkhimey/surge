@@ -409,6 +409,173 @@ def compute_recall_recall_target(
     return results
 
 
+def compute_recall_recall_target_extended(
+    queries: np.ndarray,
+    base_mmap,
+    gt_file: str,
+    base_dir: str,
+    partition_dir: str,
+    hnsw_step: int,
+    partition_step: int,
+    targets: List[float],
+    k_neighbors: int,
+    num_partitions: int,
+    k_rt: int = 50,
+    k_kl: int = 3,
+    partitions: np.ndarray = None,
+    per_query_out: dict = None,
+) -> List[Tuple]:
+    """RecallTargetExtended routing: Kozachenko-Leonenko-style kNN density
+    estimator per partition, with softmax normalisation.
+
+    For each query q and partition p we look at p's centers within the top
+    ``k_rt`` globally-nearest centers and form
+
+        density(q, p) ∝ k_p / d_{k_p, p}(q) ** dim
+
+    where ``k_p = min(k_kl, count of p-centers in top-k_rt)`` and
+    ``d_{k_p, p}`` is the distance from q to p's k_p-th closest center.
+    Under uniform per-center base-vector mass this is a Kozachenko–Leonenko
+    style estimate of base-vector density at q from partition p; with the
+    dimensionality exponent it has a proper volume-normalised density
+    interpretation, in contrast to the plain RecallTarget sum-of-exp-decays.
+
+    Improvements vs ``compute_recall_recall_target``:
+
+    * No ``part_size`` factor.  Empirically biased when partitions are
+      balanced (uniform multiplier, no information) and harmful when they are
+      imbalanced (largest partitions get over-promoted).
+    * Top ``k_kl`` cap per partition.  A beacon partition with one
+      ultra-close center and the rest far has a large d_{k_kl}, so its
+      density estimate is small — one lucky hit can't dominate.
+    * Volume-normalised density (``d ** dim`` denominator) rather than a
+      sum of unbounded exp-decays.  Probability mass is concentrated on
+      partitions that are both close *and* densely covered in the local
+      neighbourhood.
+    * Adaptive scale: d_{k_kl} grows for sparse partitions and shrinks for
+      dense ones, with no bandwidth hyperparameter to tune.
+
+    Not implemented (the original analysis showed these need held-out
+    queries and ground truth, which the theoretical-recall pipeline is
+    explicitly designed to do without):
+
+    * Empirical calibration of the cumulative model score to true recall.
+      Cumulating to ≥ τ therefore does not formally guarantee recall ≥ τ,
+      but the ranking and shape of the probability distribution should be
+      substantially better than the plain RecallTarget heuristic.
+    """
+    ground_truth = read_fbin_ground_truth(gt_file)
+    Q = ground_truth.shape[0]
+
+    router = hnswlib.Index(space='l2', dim=queries.shape[1])
+    router.load_index(f"{base_dir}/step_{hnsw_step:06d}_hnsw.bin")
+    router.set_ef(max(100, k_rt))
+
+    if partitions is None:
+        partitions = np.loadtxt(
+            f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
+            delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
+
+    # GT partition assignment — identical convention to all other routing modes.
+    gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
+    gt_vecs = np.ascontiguousarray(base_mmap[gt_indices]).astype(np.float32)
+    gt_labels, _ = router.knn_query(gt_vecs, k=1)
+    gt_parts = partitions[gt_labels[:, 0]].reshape(Q, k_neighbors)
+
+    # Top-k_rt nearest centers per query
+    k_capped = min(k_rt, router.get_current_count())
+    t0 = time.perf_counter()
+    labels, distances = router.knn_query(queries, k=k_capped)
+    elapsed = time.perf_counter() - t0
+
+    # hnswlib L2 space returns squared distances; take sqrt so the dim-exponent
+    # treats them as proper L2 distances.
+    distances = np.sqrt(np.maximum(distances, 0.0)).astype(np.float64)
+
+    pids = partitions[labels]                                # (Q, k_rt)
+    dim = int(queries.shape[1])
+
+    # For each (q, p), find the k_kl-th nearest p-center (or the m_p-th if
+    # fewer than k_kl p-centers appeared in the top-k_rt slice).
+    d_kth_per_p = np.full((Q, num_partitions), np.inf, dtype=np.float64)
+    count_per_p = np.zeros((Q, num_partitions), dtype=np.int32)
+
+    for p in range(num_partitions):
+        masked = np.where(pids == p, distances, np.inf)      # (Q, k_rt)
+        sorted_masked = np.sort(masked, axis=1)
+        count_p = np.sum(np.isfinite(masked), axis=1)
+        count_per_p[:, p] = count_p
+        # Index into sorted_masked for the k_kl-th (or m_p-th if smaller) entry.
+        k_idx = np.clip(np.minimum(count_p - 1, k_kl - 1), 0, k_capped - 1)
+        has_centers = count_p > 0
+        if has_centers.any():
+            rows = np.where(has_centers)[0]
+            d_kth_per_p[rows, p] = sorted_masked[rows, k_idx[rows]]
+
+    # Effective k used per (q, p): capped at the actual count
+    k_used = np.minimum(count_per_p, k_kl).astype(np.float64)
+    # Avoid log(0) for degenerate near-zero distances.
+    d_kth_clipped = np.clip(d_kth_per_p, 1e-10, None)
+
+    # Kozachenko-Leonenko log-density.  Partitions with no centers in the
+    # top-k_rt slice are treated as zero density (log -inf), which excludes
+    # them from softmax mass.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_density = np.where(
+            count_per_p > 0,
+            np.log(k_used) - dim * np.log(d_kth_clipped),
+            -np.inf,
+        )
+
+    # Softmax across partitions.  Stable subtraction of per-query max.
+    finite_log = np.where(np.isfinite(log_density), log_density, -np.inf)
+    log_density_max = np.max(finite_log, axis=1, keepdims=True)
+    log_density_max = np.where(np.isfinite(log_density_max), log_density_max, 0.0)
+    shifted = log_density - log_density_max
+    density_unnorm = np.where(np.isfinite(shifted), np.exp(shifted), 0.0)
+    norm = density_unnorm.sum(axis=1, keepdims=True)
+    norm = np.where(norm > 0.0, norm, 1.0)
+    partition_probs = density_unnorm / norm                  # (Q, P)
+
+    # Sort partitions by descending probability; cumulative sum drives the
+    # stopping rule (same shape as plain RecallTarget so downstream
+    # comparison code is unchanged).
+    ordered_pids = np.argsort(-partition_probs, axis=1).astype(np.int32)
+    sorted_probs = np.take_along_axis(partition_probs, ordered_pids, axis=1)
+    cumprobs = np.cumsum(sorted_probs, axis=1)
+
+    # Per-step ranking summary (same convention as RecallTarget / Oracle).
+    mean_probs        = partition_probs.mean(axis=0)
+    mean_ranking      = np.argsort(-mean_probs).astype(np.int32)
+    mean_ranked_probs = mean_probs[mean_ranking]
+    ranking_list = mean_ranking.tolist()
+    probs_list   = [float(p) for p in mean_ranked_probs]
+
+    # Optional per-query sidecar output, matching RecallTarget so the two
+    # modes can be diffed row-for-row.
+    if per_query_out is not None:
+        per_query_out["ordering"] = ordered_pids
+        per_query_out["sorted_probs"] = sorted_probs
+
+    results = []
+    for target in targets:
+        reached = cumprobs >= target
+        first_idx = np.where(reached.any(axis=1),
+                             reached.argmax(axis=1),
+                             num_partitions - 1)
+        visited_mask = np.zeros((Q, num_partitions), dtype=bool)
+        for i in range(Q):
+            n = int(first_idx[i]) + 1
+            visited_mask[i, ordered_pids[i, :n]] = True
+
+        r = _recall(visited_mask, gt_parts, k_neighbors)
+        act = _activation(visited_mask, num_partitions)
+        ppc = visited_mask.sum(axis=0).astype(np.int64)
+        results.append((r, act, ppc, elapsed, ranking_list, probs_list))
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Oracle
 # ---------------------------------------------------------------------------
@@ -422,6 +589,7 @@ DEFAULT_PARAMS = {
     "BranchingFactor": BRANCHING_FACTOR_PARAMS,
     "NProbe":          NPROBE_PARAMS,
     "RecallTarget":    TARGET_PARAMS,
+    "RecallTargetExtended": TARGET_PARAMS,
 }
 
 ORACLE_TARGETS = TARGET_PARAMS
@@ -532,7 +700,12 @@ ROUTING_FUNCS = {
     "BranchingFactor": compute_recall_branching_factor,
     "NProbe": compute_recall_nprobe,
     "RecallTarget": compute_recall_recall_target,
+    "RecallTargetExtended": compute_recall_recall_target_extended,
 }
+
+# Routing modes whose result tuples carry the per-step ranking/probs fields
+# and whose runs trigger oracle comparison + per-query rankings sidecar.
+RANKED_MODES = {"RecallTarget", "RecallTargetExtended"}
 
 
 def _call_routing(mode, queries, base_mmap, gt_file,
@@ -545,10 +718,10 @@ def _call_routing(mode, queries, base_mmap, gt_file,
         params_cast = [int(p) for p in params]
     else:
         params_cast = [float(p) for p in params]
-    # per_query_out is only meaningful for RecallTarget; the other routing
-    # functions don't accept the keyword.
+    # per_query_out is only meaningful for the ranked modes; the other
+    # routing functions don't accept the keyword.
     extra_kwargs = {}
-    if mode == "RecallTarget" and per_query_out is not None:
+    if mode in RANKED_MODES and per_query_out is not None:
         extra_kwargs["per_query_out"] = per_query_out
     try:
         return fn(queries, base_mmap, gt_file,
@@ -575,8 +748,13 @@ def parse_args():
     parser.add_argument("--partitions-dir", required=True,
                         help="Directory containing step_NNNNNN_partitions.csv files")
     parser.add_argument("--mode", required=True,
-                        choices=["BranchingFactor", "NProbe", "RecallTarget"],
-                        help="Routing mode to evaluate")
+                        choices=["BranchingFactor", "NProbe",
+                                 "RecallTarget", "RecallTargetExtended"],
+                        help="Routing mode to evaluate.  RecallTargetExtended "
+                             "uses a kNN-density probabilistic scorer per "
+                             "partition (no part_size, top-k_kl cap, dim-aware "
+                             "density); see compute_recall_recall_target_extended "
+                             "for the rationale.")
     parser.add_argument("--params", nargs="+", type=float, default=None,
                         help="Parameter values for the chosen mode "
                              "(integers for BranchingFactor/NProbe, "
@@ -603,12 +781,14 @@ def parse_args():
                         help="Directory containing stepN.gt100 ground-truth files")
     parser.add_argument("--per-query-rankings", action="store_true",
                         help="Dump per-query partition rankings and scores from "
-                             "RecallTarget and Oracle every 100 processed steps. "
-                             "Writes a sidecar CSV per_query_rankings{suffix}.csv "
-                             "with one row per (step, query_id) containing both "
-                             "the routing's per-query ordering+scores and the "
-                             "oracle's per-query ordering+densities for 1:1 "
-                             "comparison.  Only effective with --mode RecallTarget.")
+                             "the routing mode and the Oracle every 100 processed "
+                             "steps.  Writes a sidecar CSV "
+                             "per_query_rankings{suffix}.csv with one row per "
+                             "(step, query_id) containing both the routing's "
+                             "per-query ordering+scores and the oracle's "
+                             "per-query ordering+densities for 1:1 comparison. "
+                             "Only effective with --mode RecallTarget or "
+                             "RecallTargetExtended.")
     parser.add_argument("--per-query-every", type=int, default=100,
                         help="Iteration interval (in processed steps) at which "
                              "per-query rankings are dumped when "
@@ -669,7 +849,7 @@ if __name__ == "__main__":
     # ── Per-query rankings sidecar setup ──────────────────────────────────
     per_query_path = None
     dump_every     = max(1, int(args.per_query_every))
-    if args.per_query_rankings and mode == "RecallTarget":
+    if args.per_query_rankings and mode in RANKED_MODES:
         per_query_path = f"{partitions_directory}/per_query_rankings{suffix}.csv"
         with open(per_query_path, "w") as _pq:
             _pq.write("step,query_id,rt_ranking,rt_scores,"
@@ -721,7 +901,7 @@ if __name__ == "__main__":
                 break
 
             dump_now = (per_query_path is not None
-                        and mode == "RecallTarget"
+                        and mode in RANKED_MODES
                         and pass_iter % dump_every == 0)
             rt_pq     = {} if dump_now else None
             oracle_pq = {} if dump_now else None
@@ -747,12 +927,12 @@ if __name__ == "__main__":
                     "cof": _cof(ppc),
                     "query_time_s": t,
                 }
-                if mode == "RecallTarget":
+                if mode in RANKED_MODES:
                     _, _, _, _, ranking, probs = result
                     row["partition_ranking"] = str(ranking)
                     row["partition_probs"]   = str([round(p, 6) for p in probs])
                 rows.append(row)
-            if mode == "RecallTarget":
+            if mode in RANKED_MODES:
                 oracle_results = _call_oracle(
                     queries, base_mmap, gt_test,
                     base_directory, partitions_directory,
@@ -798,7 +978,7 @@ if __name__ == "__main__":
                 continue
 
             dump_now = (per_query_path is not None
-                        and mode == "RecallTarget"
+                        and mode in RANKED_MODES
                         and pass_iter % dump_every == 0)
             rt_pq     = {} if dump_now else None
             oracle_pq = {} if dump_now else None
@@ -824,12 +1004,12 @@ if __name__ == "__main__":
                     "cof": _cof(ppc),
                     "query_time_s": t,
                 }
-                if mode == "RecallTarget":
+                if mode in RANKED_MODES:
                     _, _, _, _, ranking, probs = result
                     row["partition_ranking"] = str(ranking)
                     row["partition_probs"]   = str([round(p, 6) for p in probs])
                 rows.append(row)
-            if mode == "RecallTarget":
+            if mode in RANKED_MODES:
                 oracle_results = _call_oracle(
                     queries, base_mmap, gt_test,
                     base_directory, partitions_directory,
@@ -904,7 +1084,7 @@ if __name__ == "__main__":
                   f"active={last_rebuild}")
 
             dump_now = (per_query_path is not None
-                        and mode == "RecallTarget"
+                        and mode in RANKED_MODES
                         and pass_iter % dump_every == 0)
             rt_pq     = {} if dump_now else None
             oracle_pq = {} if dump_now else None
@@ -934,12 +1114,12 @@ if __name__ == "__main__":
                     "did_rebuild": did_rebuild,
                     "active_step": last_rebuild,
                 }
-                if mode == "RecallTarget":
+                if mode in RANKED_MODES:
                     _, _, _, _, ranking, probs = result
                     row["partition_ranking"] = str(ranking)
                     row["partition_probs"]   = str([round(p, 6) for p in probs])
                 rows.append(row)
-            if mode == "RecallTarget":
+            if mode in RANKED_MODES:
                 oracle_results = _call_oracle(
                     queries, base_mmap, gt_test,
                     base_directory, partitions_directory,
