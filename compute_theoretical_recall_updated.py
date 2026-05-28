@@ -692,6 +692,86 @@ def _call_oracle(queries, base_mmap, gt_file,
         return None
 
 
+def _compute_nprobe_oracle(
+    queries: np.ndarray,
+    base_mmap,
+    gt_file: str,
+    base_dir: str,
+    partition_dir: str,
+    hnsw_step: int,
+    partition_step: int,
+    k_neighbors: int,
+    num_partitions: int,
+    nprobe_values: List[int],
+    partitions: np.ndarray = None,
+) -> List[Tuple]:
+    """NProbe oracle: for each nprobe value, probe the nprobe partitions that
+    hold the maximum number of GT neighbours for each query, and report the
+    theoretical recall achievable.
+
+    For every query q the oracle ranks partitions by descending fraction of
+    GT neighbours they contain (query_dist[q, p]).  The top-nprobe partitions
+    are selected — this is the best any nprobe-limited router could ever do
+    given perfect knowledge of where the GT vectors live.
+
+    Returns List[(nprobe, activation, recall)] — one entry per nprobe value."""
+    ground_truth = read_fbin_ground_truth(gt_file)
+    Q = ground_truth.shape[0]
+
+    router = hnswlib.Index(space='l2', dim=queries.shape[1])
+    router.load_index(f"{base_dir}/step_{hnsw_step:06d}_hnsw.bin")
+    router.set_ef(100)
+
+    if partitions is None:
+        partitions = np.loadtxt(
+            f"{partition_dir}/step_{partition_step:06d}_partitions.csv",
+            delimiter=",", dtype=int)[:-1]   # drop trailing moved_nodes entry
+
+    # Map each GT neighbour to its partition via the routing HNSW —
+    # identical convention to every other routing mode and the RecallTarget oracle.
+    gt_indices = ground_truth[:, :k_neighbors].ravel().astype(np.int64)
+    gt_vecs = np.ascontiguousarray(base_mmap[gt_indices]).astype(np.float32)
+    gt_labels, _ = router.knn_query(gt_vecs, k=1)
+    gt_part_ids = partitions[gt_labels[:, 0]]
+    gt_parts_2d = gt_part_ids.reshape(Q, k_neighbors)   # (Q, k)
+
+    # query_dist[q, p] = fraction of query q's GT neighbours in partition p
+    flat    = gt_parts_2d.ravel().astype(np.intp)
+    row_idx = np.repeat(np.arange(Q), k_neighbors)
+    linear  = row_idx * num_partitions + flat
+    query_dist = np.bincount(
+        linear, minlength=Q * num_partitions,
+    ).reshape(Q, num_partitions).astype(np.float64) / k_neighbors
+
+    # Sort per query in descending GT-density order; cumsum gives recall if
+    # the top-n optimal partitions are probed.
+    sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]   # (Q, P) descending
+    cumsum      = np.cumsum(sorted_dist, axis=1)          # (Q, P)
+
+    results = []
+    for nprobe in nprobe_values:
+        n          = min(nprobe, num_partitions)
+        recall     = float(cumsum[:, n - 1].mean())
+        activation = n / num_partitions
+        results.append((nprobe, activation, recall))
+    return results
+
+
+def _call_nprobe_oracle(queries, base_mmap, gt_file,
+                        base_dir, partition_dir, hnsw_step, partition_step,
+                        k_neighbors, num_partitions, nprobe_values,
+                        partitions: np.ndarray = None):
+    try:
+        return _compute_nprobe_oracle(queries, base_mmap, gt_file,
+                                      base_dir, partition_dir,
+                                      hnsw_step, partition_step,
+                                      k_neighbors, num_partitions, nprobe_values,
+                                      partitions=partitions)
+    except RuntimeError as e:
+        print(f"WARNING: skipping NProbe oracle (hnsw_step={hnsw_step}): {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Routing dispatch
 # ---------------------------------------------------------------------------
@@ -957,6 +1037,24 @@ if __name__ == "__main__":
                             "partition_ranking": str(ranking),
                             "partition_probs":   str([round(p, 6) for p in probs]),
                         })
+            if mode == "NProbe":
+                nprobe_oracle_results = _call_nprobe_oracle(
+                    queries, base_mmap, gt_test,
+                    base_directory, partitions_directory,
+                    step, step, 10, num_partitions,
+                    [int(p) for p in params])
+                if nprobe_oracle_results is not None:
+                    for nprobe, act, rec in nprobe_oracle_results:
+                        rows.append({
+                            "step": step,
+                            "rebuild": "rebuild",
+                            "mode": "NProbeOracle",
+                            "param": nprobe,
+                            "recall": rec,
+                            "activation": act,
+                            "cof": float("nan"),
+                            "query_time_s": float("nan"),
+                        })
             if dump_now:
                 _append_per_query(step, rt_pq, oracle_pq)
                 print(f"  [per-query] dumped step {step} "
@@ -1033,6 +1131,24 @@ if __name__ == "__main__":
                             "query_time_s": float("nan"),
                             "partition_ranking": str(ranking),
                             "partition_probs":   str([round(p, 6) for p in probs]),
+                        })
+            if mode == "NProbe":
+                nprobe_oracle_results = _call_nprobe_oracle(
+                    queries, base_mmap, gt_test,
+                    base_directory, partitions_directory,
+                    step_start, step_start, 10, num_partitions,
+                    [int(p) for p in params])
+                if nprobe_oracle_results is not None:
+                    for nprobe, act, rec in nprobe_oracle_results:
+                        rows.append({
+                            "step": step,
+                            "rebuild": "no_rebuild",
+                            "mode": "NProbeOracle",
+                            "param": nprobe,
+                            "recall": rec,
+                            "activation": act,
+                            "cof": float("nan"),
+                            "query_time_s": float("nan"),
                         })
             if dump_now:
                 _append_per_query(step, rt_pq, oracle_pq)
@@ -1147,6 +1263,28 @@ if __name__ == "__main__":
                             "active_step": last_rebuild,
                             "partition_ranking": str(ranking),
                             "partition_probs":   str([round(p, 6) for p in probs]),
+                        })
+            if mode == "NProbe":
+                nprobe_oracle_results = _call_nprobe_oracle(
+                    queries, base_mmap, gt_test,
+                    base_directory, partitions_directory,
+                    last_rebuild, last_rebuild, 10, num_partitions,
+                    [int(p) for p in params],
+                    partitions=active_partition)
+                if nprobe_oracle_results is not None:
+                    for nprobe, act, rec in nprobe_oracle_results:
+                        rows.append({
+                            "step": step,
+                            "rebuild": f"threshold_{tau:.4g}",
+                            "mode": "NProbeOracle",
+                            "param": nprobe,
+                            "recall": rec,
+                            "activation": act,
+                            "cof": float("nan"),
+                            "query_time_s": float("nan"),
+                            "phi": phi,
+                            "did_rebuild": did_rebuild,
+                            "active_step": last_rebuild,
                         })
             if dump_now:
                 _append_per_query(step, rt_pq, oracle_pq)
