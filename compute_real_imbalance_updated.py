@@ -19,18 +19,28 @@ def detect_last_step(base_dir):
     return max(steps)
 
 
-def mmap_fbin(filename):
+def _safe_memmap(filename, dtype, bytes_per_element):
+    file_size = os.path.getsize(filename)
     with open(filename, "rb") as f:
         header = np.frombuffer(f.read(8), dtype=np.uint32)
-        num_points, dim = header
-    mm = np.memmap(
-        filename,
-        dtype=np.float32,
-        mode="r",
-        offset=8,
-        shape=(num_points, dim)
-    )
-    return mm
+    num_points_hdr, dim = int(header[0]), int(header[1])
+    num_points = (file_size - 8) // (dim * bytes_per_element)
+    if num_points != num_points_hdr:
+        print(f"Warning: {os.path.basename(filename)} header says {num_points_hdr} "
+              f"points but file size implies {num_points}; using {num_points}.")
+    return np.memmap(filename, dtype=dtype, mode="r",
+                     offset=8, shape=(num_points, dim))
+
+def mmap_fbin(filename):
+    return _safe_memmap(filename, np.float32, 4)
+
+def mmap_u8bin(filename):
+    return _safe_memmap(filename, np.uint8, 1)
+
+def open_vectors(filename):
+    if filename.endswith(".u8bin"):
+        return mmap_u8bin(filename)
+    return mmap_fbin(filename)
 
 def get_vectors_at_step(runbook_data, stepNum):
     # Top-level key (e.g., "msturing-30M-clustered")
@@ -82,10 +92,10 @@ def process_step(args):
     router.load_index(hnsw_file)
     router.set_ef(100)
 
-    base_mm = mmap_fbin(base_file)
+    base_mm = open_vectors(base_file)
 
     step_idx = get_vectors_at_step(runbook_data, stepNum)
-    vectors = base_mm[step_idx]
+    vectors = np.asarray(base_mm[step_idx], dtype=np.float32)
 
     # route vectors through hnsw and compute imbalance
     labels, distances = router.knn_query(vectors, k=1, num_threads=8)
