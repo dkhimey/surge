@@ -22,6 +22,9 @@ Key changes vs. the original
    per-element add/remove inside Python loops.
 """
 
+import glob
+import os
+import re
 import yaml
 import hnswlib
 import numpy as np
@@ -31,18 +34,61 @@ import sys
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def mmap_fbin(filename):
-    """Memory-map a .fbin file (uint32 header: num_points, dim)."""
+def detect_last_step(base_dir):
+    """
+    Scan base_dir for step_XXXXXX_hnsw.bin files and return the highest
+    step number found.  Exits with an error if no files are present.
+    """
+    pattern = os.path.join(base_dir, "step_*_hnsw.bin")
+    matches = glob.glob(pattern)
+    if not matches:
+        print(f"Error: no step_*_hnsw.bin files found in {base_dir}")
+        sys.exit(1)
+    step_re = re.compile(r"step_(\d+)_hnsw\.bin$")
+    steps = [int(step_re.search(os.path.basename(p)).group(1)) for p in matches]
+    return max(steps)
+
+
+def _safe_memmap(filename, dtype, bytes_per_element):
+    """
+    Core helper: read the 8-byte (num_points, dim) header, then derive
+    num_points from the actual file size instead of trusting the header.
+    Avoids 'mmap length greater than file size' when the file is still being
+    written or the header is stale from a larger previous run.
+    """
+    file_size = os.path.getsize(filename)
     with open(filename, "rb") as f:
         header = np.frombuffer(f.read(8), dtype=np.uint32)
-        num_points, dim = header
-    return np.memmap(
-        filename,
-        dtype=np.float32,
-        mode="r",
-        offset=8,
-        shape=(num_points, dim),
-    )
+    num_points_hdr, dim = int(header[0]), int(header[1])
+
+    data_bytes = file_size - 8
+    num_points = data_bytes // (dim * bytes_per_element)
+
+    if num_points != num_points_hdr:
+        print(
+            f"Warning: {os.path.basename(filename)} header says {num_points_hdr} "
+            f"points but file size implies {num_points}; using {num_points}."
+        )
+
+    return np.memmap(filename, dtype=dtype, mode="r",
+                     offset=8, shape=(num_points, dim))
+
+
+def mmap_fbin(filename):
+    """Memory-map a float32 .fbin file."""
+    return _safe_memmap(filename, np.float32, 4)
+
+
+def mmap_u8bin(filename):
+    """Memory-map a uint8 .u8bin file."""
+    return _safe_memmap(filename, np.uint8, 1)
+
+
+def open_vectors(filename):
+    """Dispatch to the correct mmap helper based on file extension."""
+    if filename.endswith(".u8bin"):
+        return mmap_u8bin(filename)
+    return mmap_fbin(filename)
 
 
 def precompute_active_sets(runbook_data, step_numbers):
@@ -168,13 +214,14 @@ def _pool_init_static(hnsw_file, partitions_file, base_file):
     """
     Pool initialiser: load shared resources once per worker process.
     Called automatically by multiprocessing.Pool before any tasks are sent.
+    Supports both .fbin (float32) and .u8bin (uint8) base files.
     """
     global _router, _get_partition, _base_mm
     _router = hnswlib.Index(space="l2", dim=100)
     _router.load_index(hnsw_file)
     _router.set_ef(100)
     _get_partition = np.loadtxt(partitions_file, dtype=np.int64)[:10000]
-    _base_mm       = mmap_fbin(base_file)
+    _base_mm       = open_vectors(base_file)
 
 
 # ── worker functions ──────────────────────────────────────────────────────────
@@ -193,7 +240,7 @@ def process_step_static(args):
     if step_idx.size == 0:
         return []
 
-    vectors     = _base_mm[step_idx]
+    vectors     = np.asarray(_base_mm[step_idx], dtype=np.float32)
     labels, _   = _router.knn_query(vectors, k=1, num_threads=_HNSW_THREADS)
     labels_flat = labels[:, 0]
 
@@ -224,8 +271,8 @@ def process_step_rebuild(args):
     router.load_index(hnsw_file)
     router.set_ef(100)
 
-    base_mm     = mmap_fbin(base_file)
-    vectors     = base_mm[step_idx]
+    base_mm     = open_vectors(base_file)
+    vectors     = np.asarray(base_mm[step_idx], dtype=np.float32)
     labels, _   = router.knn_query(vectors, k=1, num_threads=_HNSW_THREADS)
     labels_flat = labels[:, 0]
 
@@ -272,8 +319,10 @@ def main():
         if f.tell() == 0:
             f.write("stepNum,partition,count,dispersion,entropy\n")
 
-    # Step numbers to process (identical to the original range).
-    step_numbers = [sn - 255 for sn in range(256, 946, 2)]   # 1, 3, …, 691
+    # Detect the last available step from the HNSW files in base_dir.
+    last_step = detect_last_step(base_dir)
+    print(f"Last step detected: {last_step}")
+    step_numbers = list(range(1, last_step + 1, 2))
 
     # ── ONE-TIME: precompute all active-vector sets incrementally ─────────────
     print("Pre-computing active vector sets (single incremental pass)…")
