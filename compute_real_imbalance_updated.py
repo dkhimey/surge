@@ -1,9 +1,23 @@
+import glob
+import os
+import re
 import yaml
 import hnswlib
 import numpy as np
 import multiprocessing
 import sys
 from collections import defaultdict
+
+def detect_last_step(base_dir):
+    pattern = os.path.join(base_dir, "step_*_hnsw.bin")
+    matches = glob.glob(pattern)
+    if not matches:
+        print(f"Error: no step_*_hnsw.bin files found in {base_dir}")
+        sys.exit(1)
+    step_re = re.compile(r"step_(\d+)_hnsw\.bin$")
+    steps = [int(step_re.search(os.path.basename(p)).group(1)) for p in matches]
+    return max(steps)
+
 
 def mmap_fbin(filename):
     with open(filename, "rb") as f:
@@ -182,9 +196,13 @@ def main():
     manager = multiprocessing.Manager()
     lock = manager.Lock()
 
+    # Detect step range from directory
+    last_step = detect_last_step(base_dir)
+    print(f"Last step detected: {last_step}")
+
     # Parallelize the steps
     with multiprocessing.Pool(processes=8) as pool:
-        args_list = [(stepNum-255, lock, output_file, runbook_data, base_file, base_dir, partitions_dir, to_rebuild) for stepNum in range(256, 946, 2)]
+        args_list = [(stepNum, lock, output_file, runbook_data, base_file, base_dir, partitions_dir, to_rebuild) for stepNum in range(1, last_step + 1, 2)]
         pool.map(process_step, args_list)
 
 if __name__ == "__main__":
