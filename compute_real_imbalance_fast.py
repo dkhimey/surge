@@ -3,23 +3,28 @@ compute_real_imbalance_fast.py  –  optimised rewrite of compute_real_imbalance
 
 Key changes vs. the original
 ─────────────────────────────
-1. Precompute all active-vector sets in one incremental O(S) pass instead of
-   replaying the runbook from scratch for every step  (was O(S²)).
+1. Runbook is parsed into a compact sorted op-list and stored as a module
+   global before the pool is forked.  Workers inherit it via Linux CoW fork —
+   nothing is pickled through the IPC pipe.  Eliminates the ~138 GB
+   precomputed-active-sets dict that caused OOM on the 100M dataset.
 
-2. to_rebuild=False  →  pool initialiser loads the HNSW index + partitions file
-   once per *worker process* (8 loads) instead of once per *step* (345 loads).
+2. Active-set replay inside each worker uses a numpy boolean array + slice
+   assignment instead of a Python set.  O(max_vectors) space (100 MB for
+   100M vectors) and vectorised O(1) per insert/delete op.
 
-3. All per-vector Python loops replaced with vectorised NumPy operations
+3. to_rebuild=False  →  pool initialiser loads the HNSW index + partitions
+   file once per worker process (N loads) instead of once per step (345 loads).
+
+4. All per-vector Python loops replaced with vectorised NumPy operations
    (np.add.at, np.unique) for counts, dispersion, and entropy.
 
-4. Results are returned from workers and written by the main process;
+5. Results are returned from workers and written by the main process;
    the multiprocessing.Manager lock is gone entirely.
 
-5. Reduced HNSW query threads per worker to avoid over-subscription
-   (8 processes × 4 threads vs. the original 8×8 on a typical machine).
-
-6. Active-set construction uses set.update/difference_update instead of
-   per-element add/remove inside Python loops.
+6. num_processes is sized conservatively for large datasets: each worker
+   copies ~(active_vectors × dim × 4) bytes of vector data, so 4–6 workers
+   are typically safe on a 128 GB machine with a 40 GB base file.
+   Tune _NUM_PROCESSES below if needed.
 """
 
 import glob
@@ -32,12 +37,33 @@ import multiprocessing
 import sys
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── tuneable constants ────────────────────────────────────────────────────────
+
+# Number of worker processes.  Each worker holds ~(active_frac × base_file_GB)
+# of vector data in RAM at peak.  For a 40 GB fbin with ~50% active vectors
+# that's ~20 GB per worker.  On a 128 GB machine, 4–6 workers is safe.
+_NUM_PROCESSES = 4
+
+# HNSW query threads per worker.  _NUM_PROCESSES × _HNSW_THREADS should not
+# exceed the physical core count (64 here → 4 × 16 = 64, or 6 × 10 ≈ 60).
+_HNSW_THREADS = 16
+
+
+# ── module globals shared with workers via fork (never pickled) ───────────────
+
+_runbook_ops   = None   # list[(step:int, op:str, start:int, end:int)], sorted
+_max_vectors   = None   # int — size of the boolean active-set scratch array
+_router        = None   # to_rebuild=False: loaded once per worker
+_get_partition = None   # to_rebuild=False: loaded once per worker
+_base_mm       = None   # to_rebuild=False: loaded once per worker
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def detect_last_step(base_dir):
     """
     Scan base_dir for step_XXXXXX_hnsw.bin files and return the highest
-    step number found.  Exits with an error if no files are present.
+    step number found.
     """
     pattern = os.path.join(base_dir, "step_*_hnsw.bin")
     matches = glob.glob(pattern)
@@ -49,12 +75,52 @@ def detect_last_step(base_dir):
     return max(steps)
 
 
+def _build_runbook_ops(runbook_data):
+    """
+    Parse the runbook YAML into a compact sorted list of
+    (step, op, start, end) tuples.  This tiny structure is set as a module
+    global so workers inherit it via CoW fork — no IPC overhead.
+    """
+    root = next(iter(runbook_data.values()))
+    ops = []
+    for step, payload in root.items():
+        if not isinstance(step, int):
+            continue
+        op    = payload.get("operation")
+        start = payload.get("start")
+        end   = payload.get("end")
+        if op in ("insert", "delete") and start is not None and end is not None:
+            ops.append((step, op, start, end))
+    ops.sort(key=lambda x: x[0])
+    return ops
+
+
+def get_active_set(step_num):
+    """
+    Replay runbook operations up to step_num and return active vector indices.
+
+    Uses a numpy boolean array of length _max_vectors:
+      • insert [s, e)  →  active[s:e] = True    (vectorised memset)
+      • delete [s, e)  →  active[s:e] = False   (vectorised memset)
+
+    Peak memory: _max_vectors bytes (100 MB for 100M vectors).
+    Uses module globals _runbook_ops and _max_vectors, inherited via fork.
+    """
+    active = np.zeros(_max_vectors, dtype=bool)
+    for step, op, start, end in _runbook_ops:
+        if step > step_num:
+            break
+        if op == "insert":
+            active[start:end] = True
+        else:
+            active[start:end] = False
+    return np.nonzero(active)[0].astype(np.int64)
+
+
 def _safe_memmap(filename, dtype, bytes_per_element):
     """
-    Core helper: read the 8-byte (num_points, dim) header, then derive
-    num_points from the actual file size instead of trusting the header.
-    Avoids 'mmap length greater than file size' when the file is still being
-    written or the header is stale from a larger previous run.
+    Derive num_points from actual file size to avoid 'mmap length greater
+    than file size' when the header is stale or the file is still being written.
     """
     file_size = os.path.getsize(filename)
     with open(filename, "rb") as f:
@@ -75,12 +141,10 @@ def _safe_memmap(filename, dtype, bytes_per_element):
 
 
 def mmap_fbin(filename):
-    """Memory-map a float32 .fbin file."""
     return _safe_memmap(filename, np.float32, 4)
 
 
 def mmap_u8bin(filename):
-    """Memory-map a uint8 .u8bin file."""
     return _safe_memmap(filename, np.uint8, 1)
 
 
@@ -89,55 +153,6 @@ def open_vectors(filename):
     if filename.endswith(".u8bin"):
         return mmap_u8bin(filename)
     return mmap_fbin(filename)
-
-
-def precompute_active_sets(runbook_data, step_numbers):
-    """
-    Single incremental pass over the runbook → active index set for every
-    requested step number.  O(total operations) instead of O(S × total ops).
-
-    Handles the case where no runbook operation lands exactly on a requested
-    step: the snapshot is taken from the most recent prior state.
-    """
-    sorted_steps = sorted(step_numbers)
-    root = next(iter(runbook_data.values()))
-
-    # Collect (step, payload) pairs in ascending order.
-    ordered_ops = sorted(
-        [(s, p) for s, p in root.items() if isinstance(s, int)],
-        key=lambda x: x[0],
-    )
-
-    active: set = set()
-    result: dict = {}
-    req_idx = 0
-
-    for rb_step, payload in ordered_ops:
-        # Capture state for every requested step that falls *before* this op.
-        while req_idx < len(sorted_steps) and sorted_steps[req_idx] < rb_step:
-            result[sorted_steps[req_idx]] = np.array(list(active), dtype=np.int64)
-            req_idx += 1
-
-        op = payload.get("operation")
-        start = payload.get("start")
-        end = payload.get("end")
-        if start is not None and end is not None:
-            if op == "insert":
-                active.update(range(start, end))
-            elif op == "delete":
-                active.difference_update(range(start, end))
-
-        # Capture state for requested steps that coincide with this op.
-        while req_idx < len(sorted_steps) and sorted_steps[req_idx] == rb_step:
-            result[sorted_steps[req_idx]] = np.array(list(active), dtype=np.int64)
-            req_idx += 1
-
-    # Any remaining requested steps after all runbook ops.
-    while req_idx < len(sorted_steps):
-        result[sorted_steps[req_idx]] = np.array(list(active), dtype=np.int64)
-        req_idx += 1
-
-    return result
 
 
 def compute_metrics(vectors, labels_flat, get_partition, num_partitions):
@@ -154,47 +169,40 @@ def compute_metrics(vectors, labels_flat, get_partition, num_partitions):
     Returns
     -------
     counts       : (P,) int64
-    dispersions  : (P,) float64  – mean squared distance from partition centroid / dim
-    entropy      : (P,) float64  – normalised Shannon entropy over label distribution
+    dispersions  : (P,) float64  – mean squared distance from centroid / dim
+    entropy      : (P,) float64  – normalised Shannon entropy over labels
     """
     dim = vectors.shape[1]
-    vf = vectors.astype(np.float64)
+    vf  = vectors.astype(np.float64)
 
-    # Map each vector to its partition via its nearest-neighbour label.
     partitions = get_partition[labels_flat]   # (N,)
 
-    # ── counts ────────────────────────────────────────────────────────────────
+    # counts
     counts = np.zeros(num_partitions, dtype=np.int64)
     np.add.at(counts, partitions, 1)
 
-    # ── means ─────────────────────────────────────────────────────────────────
-    sums = np.zeros((num_partitions, dim), dtype=np.float64)
+    # means
+    sums  = np.zeros((num_partitions, dim), dtype=np.float64)
     np.add.at(sums, partitions, vf)
-
     valid = counts > 0
     means = np.zeros((num_partitions, dim), dtype=np.float64)
     means[valid] = sums[valid] / counts[valid, None]
 
-    # ── dispersion ────────────────────────────────────────────────────────────
-    diffs = vf - means[partitions]                  # (N, dim)
-    sq_norms = (diffs ** 2).sum(axis=1)             # (N,)
+    # dispersion
+    diffs     = vf - means[partitions]
+    sq_norms  = (diffs ** 2).sum(axis=1)
     dispersions = np.zeros(num_partitions, dtype=np.float64)
     np.add.at(dispersions, partitions, sq_norms)
     dispersions[valid] /= (counts[valid] * dim)
 
-    # ── entropy over label distribution within each partition ─────────────────
-    # Find unique (partition, label) pairs and their counts.
-    pl_pairs = np.stack([partitions, labels_flat], axis=1)   # (N, 2)
+    # entropy over label distribution within each partition
+    pl_pairs          = np.stack([partitions, labels_flat], axis=1)
     unique_pl, pl_counts = np.unique(pl_pairs, axis=0, return_counts=True)
-    part_col = unique_pl[:, 0]                               # partition for each unique pair
-
-    p = pl_counts.astype(np.float64) / counts[part_col]     # prob of label within partition
-    entropy_contrib = -p * np.log(p)
-
-    entropy = np.zeros(num_partitions, dtype=np.float64)
+    part_col          = unique_pl[:, 0]
+    p                 = pl_counts.astype(np.float64) / counts[part_col]
+    entropy_contrib   = -p * np.log(p)
+    entropy           = np.zeros(num_partitions, dtype=np.float64)
     np.add.at(entropy, part_col, entropy_contrib)
-
-    # Normalise H by log(#unique_labels) where there is more than one label.
     unique_parts, label_counts_per_part = np.unique(part_col, return_counts=True)
     multi = label_counts_per_part > 1
     if multi.any():
@@ -203,18 +211,12 @@ def compute_metrics(vectors, labels_flat, get_partition, num_partitions):
     return counts, dispersions, entropy
 
 
-# ── worker globals (to_rebuild=False path) ────────────────────────────────────
-
-_router        = None
-_get_partition = None
-_base_mm       = None
-
+# ── pool initialiser (to_rebuild=False path) ──────────────────────────────────
 
 def _pool_init_static(hnsw_file, partitions_file, base_file):
     """
-    Pool initialiser: load shared resources once per worker process.
-    Called automatically by multiprocessing.Pool before any tasks are sent.
-    Supports both .fbin (float32) and .u8bin (uint8) base files.
+    Load shared resources once per worker process.
+    _runbook_ops and _max_vectors are already in memory via fork.
     """
     global _router, _get_partition, _base_mm
     _router = hnswlib.Index(space="l2", dim=100)
@@ -226,17 +228,11 @@ def _pool_init_static(hnsw_file, partitions_file, base_file):
 
 # ── worker functions ──────────────────────────────────────────────────────────
 
-# 64 cores ÷ 16 worker processes = 4 threads each → all 64 cores fully used
-# with no over-subscription.  Increase num_processes further (e.g. 32 w/ 2
-# threads) if step-level parallelism matters more than per-step throughput.
-_HNSW_THREADS = 4
-
-
-def process_step_static(args):
-    """Worker for to_rebuild=False.  Uses globals set by _pool_init_static."""
-    stepNum, step_idx = args
+def process_step_static(stepNum):
+    """Worker for to_rebuild=False.  Active set computed inline from fork'd globals."""
     print(f"evaluating step {stepNum}")
 
+    step_idx = get_active_set(stepNum)
     if step_idx.size == 0:
         return []
 
@@ -257,9 +253,10 @@ def process_step_static(args):
 
 def process_step_rebuild(args):
     """Worker for to_rebuild=True.  Loads per-step HNSW + partitions."""
-    stepNum, step_idx, base_file, base_dir, partitions_dir = args
+    stepNum, base_file, base_dir, partitions_dir = args
     print(f"evaluating step {stepNum}")
 
+    step_idx = get_active_set(stepNum)
     if step_idx.size == 0:
         return []
 
@@ -314,51 +311,41 @@ def main():
         else f"{partitions_dir}/full_real_imbalance_no_rebuilding_results.csv"
     )
 
-    # Write CSV header if the file is new / empty.
     with open(output_file, "a") as f:
         if f.tell() == 0:
             f.write("stepNum,partition,count,dispersion,entropy\n")
 
-    # Detect the last available step from the HNSW files in base_dir.
-    last_step = detect_last_step(base_dir)
-    print(f"Last step detected: {last_step}")
+    # ── Parse runbook into a compact global before forking ────────────────────
+    # Workers inherit _runbook_ops and _max_vectors via CoW fork.
+    # Nothing large is ever pickled into the IPC pipe.
+    global _runbook_ops, _max_vectors
+    _runbook_ops = _build_runbook_ops(runbook_data)
+    _max_vectors = max(end for _, op, start, end in _runbook_ops if op == "insert")
+    print(f"Runbook: {len(_runbook_ops)} ops, max vector id: {_max_vectors - 1}")
+
+    last_step    = detect_last_step(base_dir)
     step_numbers = list(range(1, last_step + 1, 2))
-
-    # ── ONE-TIME: precompute all active-vector sets incrementally ─────────────
-    print("Pre-computing active vector sets (single incremental pass)…")
-    active_sets = precompute_active_sets(runbook_data, step_numbers)
-    print(f"Done: {len(active_sets)} steps captured.")
-
-    num_processes = 16   # 16 workers × 4 HNSW threads = 64 cores
+    print(f"Steps to evaluate: {len(step_numbers)}  (1 … {last_step})")
 
     if to_rebuild:
-        # Each step needs a different HNSW index → load inside the worker.
         args_list = [
-            (sn,
-             active_sets.get(sn, np.array([], dtype=np.int64)),
-             base_file, base_dir, partitions_dir)
+            (sn, base_file, base_dir, partitions_dir)
             for sn in step_numbers
         ]
-        with multiprocessing.Pool(processes=num_processes) as pool:
+        with multiprocessing.Pool(processes=_NUM_PROCESSES) as pool:
             all_results = pool.map(process_step_rebuild, args_list)
 
     else:
-        # All steps share the same HNSW index → load once per worker process.
         hnsw_file       = f"{base_dir}/step_{1:06d}_hnsw.bin"
         partitions_file = f"{partitions_dir}/step_{1:06d}_partitions.csv"
 
-        args_list = [
-            (sn, active_sets.get(sn, np.array([], dtype=np.int64)))
-            for sn in step_numbers
-        ]
         with multiprocessing.Pool(
-            processes=num_processes,
+            processes=_NUM_PROCESSES,
             initializer=_pool_init_static,
             initargs=(hnsw_file, partitions_file, base_file),
         ) as pool:
-            all_results = pool.map(process_step_static, args_list)
+            all_results = pool.map(process_step_static, step_numbers)
 
-    # ── Write all results in the main process (no lock needed) ────────────────
     with open(output_file, "a") as f:
         for step_rows in all_results:
             if step_rows:
