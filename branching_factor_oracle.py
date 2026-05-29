@@ -196,7 +196,7 @@ def compute_branching_factor_oracle(
         p5_oracle_recall, p95_oracle_recall
     """
     if branching_factors is None:
-        branching_factors = [1, 2, 5, 10, 20, 40, 80]
+        branching_factors = [1, 2, 5, 10, 15, 20, 25, 30, 35, 40, 50]
 
     # ── Load ground truth ─────────────────────────────────────────────────
     gt          = read_fbin_ground_truth(gt_file)       # (Q_gt, K_gt)
@@ -399,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument("--branching-factors", nargs="+", type=int, default=None,
                         dest="branching_factors",
                         help="Branching factor values to evaluate "
-                             "(default: 1 2 5 10 20 40 80)")
+                             "(default: 1 2 5 10 15 20 25 30 35 40 50)")
     parser.add_argument("--max-queries",       default=10000, type=int,
                         dest="max_queries",
                         help="Maximum number of queries to load (default: 10000)")
@@ -440,6 +440,6 @@ if __name__ == "__main__":
 #   --format           u8bin \
 #   --query-format     fbin \
 #   --ef               100 \
-#   --branching-factors 1 2 5 10 20 40 80 \
+#   --branching-factors 1 2 5 10 15 20 25 30 35 40 50 \
 #   --dataset-name     msturing-500M \
 #   --out-file         /dataset/surge/results/.../branching_factor_oracle_results.csv
