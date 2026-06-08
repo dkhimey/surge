@@ -69,10 +69,10 @@ def set_style():
 
 # Single source of truth for every series' style + label.
 STYLE = {
-    "with_maint":  dict(color="C0",        ls="-",  label="fresh routing"),
-    "no_maint":    dict(color="firebrick", ls="-",  label="stale routing"),
-    "oracle_maint": dict(color="C0",        ls="--", alpha=0.6, label="oracle, fresh"),
-    "oracle_no":   dict(color="firebrick", ls="--", alpha=0.6, label="oracle, stale"),
+    "with_maint":  dict(color="C0",        ls="-",  label="SURGE, fresh routing"),
+    "no_maint":    dict(color="firebrick", ls="-",  label="SURGE, stale routing"),
+    "oracle_maint": dict(color="C0",        ls="--", alpha=0.6, label="Oracle, fresh"),
+    "oracle_no":   dict(color="firebrick", ls="--", alpha=0.6, label="Oracle, stale"),
     "gpann":       dict(color="C8",        ls="-",  label="GP-ANN"),
 }
 LEGEND_KEYS = {
@@ -207,6 +207,128 @@ def load_runbook(ds, rb):
     else:
         d["gpann"] = None
     return d
+
+
+# --------------------------------------------------------------------------- #
+# Recall-gap analysis
+#
+# Same-step recall gaps that the paper quotes. The baseline is always the stale
+# (no-maintenance, t=100) routing line; the reference is one of:
+#
+#   routing       fresh routing (t=0)  -- "stale falls short of a maintained system
+#                                          by up to X pp"      (rebuild vs no rebuild)
+#   oracle-stale  stale oracle  (t=100) -- "stale routing is X pp below the oracle":
+#                                          recall lost purely to the routing decision,
+#                                          holding the (stale) partition layout fixed
+#   oracle-fresh  fresh oracle  (t=0)   -- recall lost vs the best a maintained layout
+#                                          could achieve (layout + routing combined)
+#
+# Every delta is taken ONLY at runbook steps present in BOTH series (inner join on
+# `step`), so it is always a same-step comparison -- we never subtract recall at
+# step i from recall at step j. If the two series are sampled on different step
+# grids, the unmatched steps are counted and flagged rather than interpolated.
+# --------------------------------------------------------------------------- #
+# (label, which series, t) for the reference line; baseline is always stale routing.
+GAP_KINDS = {
+    "routing":      ("rebuild vs no rebuild (fresh routing - stale routing)", "routing", 0),
+    "oracle-stale": ("stale oracle - stale routing (routing-decision loss, fixed layout)", "oracle", 100),
+    "oracle-fresh": ("fresh oracle - stale routing (loss vs best maintained layout)", "oracle", 0),
+}
+
+
+def _recall_line(surge, mode, ds, t, which):
+    """[step, recall] for a SURGE series, sorted and de-duped on step.
+    which in {'routing','oracle'};  t: 0 = fresh/maintained, 100 = stale."""
+    if mode == "recalltarget":
+        m, p = ("RecallTarget" if which == "routing" else "Oracle"), RECALL_TARGET_PARAM
+    else:
+        m, p = ("NProbe" if which == "routing" else "NProbeOracle"), ds.nprobe_param
+    s = surge[(surge["t"] == t) & (surge["mode"] == m) & (surge["param"] == p)]
+    return (s[["step", "recall"]]
+            .dropna()
+            .drop_duplicates("step")
+            .sort_values("step")
+            .reset_index(drop=True))
+
+
+def _same_step_gap(ref, base):
+    """Max/mean of (ref.recall - base.recall) over steps present in BOTH series."""
+    if ref.empty or base.empty:
+        return None
+    m = ref.merge(base, on="step", suffixes=("_ref", "_base"))   # inner join => same step
+    if m.empty:
+        return None
+    m["delta"] = m["recall_ref"] - m["recall_base"]
+    i = int(m["delta"].idxmax())
+    n_union = len(set(ref["step"]) | set(base["step"]))
+    return {
+        "matched_steps": len(m),
+        "unmatched_steps": n_union - len(m),
+        "max_gap": float(m.loc[i, "delta"]),
+        "at_step": int(m.loc[i, "step"]),
+        "ref_at_max": float(m.loc[i, "recall_ref"]),
+        "base_at_max": float(m.loc[i, "recall_base"]),
+        "mean_gap": float(m["delta"].mean()),
+    }
+
+
+def recall_gap(d, ds, mode, kind="routing"):
+    """Same-step recall gap for one cell. baseline = stale routing (t=100);
+    reference chosen by `kind` (see GAP_KINDS). Returns a summary dict or None."""
+    surge = d["surge"]
+    _, ref_which, ref_t = GAP_KINDS[kind]
+    base = _recall_line(surge, mode, ds, t=100, which="routing")
+    ref = _recall_line(surge, mode, ds, t=ref_t, which=ref_which)
+    return _same_step_gap(ref, base)
+
+
+def report_recall_gaps(loaded, modes, datasets, runbooks,
+                       kinds=("routing", "oracle-stale", "oracle-fresh"), out_csv=None):
+    """Print a per-cell table (and overall max) for each requested gap kind. Returns
+    a combined DataFrame; if out_csv is set, all kinds are written with a `kind` column."""
+    all_rows = []
+    for kind in kinds:
+        desc, _, _ = GAP_KINDS[kind]
+        rows = []
+        for mode in modes:
+            for ds in datasets:
+                for rb in runbooks:
+                    dd = loaded.get((ds.title, rb.title))
+                    if dd is None:
+                        continue
+                    g = recall_gap(dd, ds, mode, kind)
+                    if g is not None:
+                        rows.append({"kind": kind, "mode": mode, "dataset": ds.title,
+                                     "runbook": rb.title, **g})
+        if not rows:
+            print(f"\n[{kind}] no data found")
+            continue
+        df = pd.DataFrame(rows)
+        all_rows.extend(rows)
+
+        print(f"\n=== Max recall gap [{kind}]: {desc}, same-step ===")
+        hdr = (f"{'mode':<14}{'dataset':<15}{'runbook':<11}{'max gap':>9}{'pp':>7}"
+               f"{'@step':>7}{'ref':>7}{'base':>7}{'mean':>8}{'matched':>9}{'unmatched':>10}")
+        print(hdr)
+        print("-" * len(hdr))
+        for _, r in df.sort_values("max_gap", ascending=False).iterrows():
+            warn = "  <-- step grids differ" if r["unmatched_steps"] else ""
+            print(f"{r['mode']:<14}{r['dataset']:<15}{r['runbook']:<11}"
+                  f"{r['max_gap']:>9.4f}{100 * r['max_gap']:>7.1f}{int(r['at_step']):>7}"
+                  f"{r['ref_at_max']:>7.3f}{r['base_at_max']:>7.3f}{r['mean_gap']:>8.4f}"
+                  f"{int(r['matched_steps']):>9}{int(r['unmatched_steps']):>10}{warn}")
+        top = df.loc[df["max_gap"].idxmax()]
+        print(f"Largest [{kind}] gap overall: {100 * top['max_gap']:.1f} pp "
+              f"({top['dataset']}, {top['runbook']}, {top['mode']} mode) at step "
+              f"{int(top['at_step'])} [ref {top['ref_at_max']:.3f} vs stale {top['base_at_max']:.3f}]")
+
+    if not all_rows:
+        return None
+    out = pd.DataFrame(all_rows)
+    if out_csv:
+        out.to_csv(out_csv, index=False)
+        print(f"\nwrote {out_csv}")
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -433,10 +555,17 @@ def main():
                     help="output path; for --mode both, used as a prefix")
     ap.add_argument("--mode", choices=["recalltarget", "nprobe", "both"], default="both")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--gap-csv", default=None,
+                    help="also write the per-cell recall-gap table to this CSV")
+    ap.add_argument("--gap-kind", default="all",
+                    choices=["routing", "oracle-stale", "oracle-fresh", "all"],
+                    help="which same-step gap(s) to report (default: all)")
     args = ap.parse_args()
 
     set_style()
     modes = ["recalltarget", "nprobe"] if args.mode == "both" else [args.mode]
+    gap_kinds = (["routing", "oracle-stale", "oracle-fresh"]
+                 if args.gap_kind == "all" else [args.gap_kind])
 
     def render(loaded, ext):
         for m in modes:
@@ -454,10 +583,14 @@ def main():
             loaded = {(ds.title, rb.title): load_runbook(ds, rb)
                       for ds in DATASETS for rb in RUNBOOKS}
             render(loaded, ".png")
+            report_recall_gaps(loaded, modes, DATASETS, RUNBOOKS,
+                                kinds=gap_kinds, out_csv=args.gap_csv)
     else:
         loaded = {(ds.title, rb.title): load_runbook(ds, rb)
                   for ds in DATASETS for rb in RUNBOOKS}
         render(loaded, ".pdf")
+        report_recall_gaps(loaded, modes, DATASETS, RUNBOOKS,
+                           kinds=gap_kinds, out_csv=args.gap_csv)
 
 
 if __name__ == "__main__":

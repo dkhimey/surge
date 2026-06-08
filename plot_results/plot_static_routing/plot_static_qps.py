@@ -40,7 +40,7 @@ from matplotlib.lines import Line2D
 # Style
 # --------------------------------------------------------------------------- #
 def set_style():
-    # Compact sizes: the 2x2 grid is meant to fit one column of a two-column layout.
+    # Single row of four dataset panels spanning the full text width (figure*).
     plt.rcParams.update({
         "text.usetex": False,
         "mathtext.fontset": "stix",
@@ -157,12 +157,13 @@ def plot_dataset(ax_top, ax_bot, ds, d):
 # --------------------------------------------------------------------------- #
 # Figure assembly
 # --------------------------------------------------------------------------- #
-def build_figure(datasets, data, grid_ncols=2):
+def build_figure(datasets, data, grid_ncols=4):
     n = len(datasets)
     grid_nrows = (n + grid_ncols - 1) // grid_ncols
-    # Sized for one column of a two-column paper (~3.3in wide).
-    fig = plt.figure(figsize=(6.5, 3 * grid_nrows))
-    outer = fig.add_gridspec(grid_nrows, grid_ncols, hspace=0.22, wspace=0.27)
+    # Full \textwidth, one row of dataset panels -- matches the static-routing
+    # quality figure layout (the four datasets across columns).
+    fig = plt.figure(figsize=(3.5 * grid_ncols, 3 * grid_nrows))
+    outer = fig.add_gridspec(grid_nrows, grid_ncols, hspace=0.25, wspace=0.27)
 
     for i, (ds, d) in enumerate(zip(datasets, data)):
         gr, gc = divmod(i, grid_ncols)
@@ -178,12 +179,12 @@ def build_figure(datasets, data, grid_ncols=2):
         if gr < grid_nrows - 1:           # x-label only on the bottom grid row
             ax_bot.set_xlabel("")
 
-    # --- single shared legend across the TOP (2 cols to fit the narrow width) ---
+    # --- single shared legend across the TOP (all entries in one row) ---
     handles = [Line2D([0], [0], **{k: v for k, v in STYLE[key].items() if k != "label"})
                for key in LEGEND_ORDER]
     labels = [STYLE[key]["label"] for key in LEGEND_ORDER]
-    fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False,
-               bbox_to_anchor=(0.5, 0.91), columnspacing=1.2, handletextpad=0.4)
+    fig.legend(handles, labels, loc="lower center", ncol=len(LEGEND_ORDER), frameon=False,
+               bbox_to_anchor=(0.5, 0.95), columnspacing=1.6, handletextpad=0.5)
     return fig
 
 

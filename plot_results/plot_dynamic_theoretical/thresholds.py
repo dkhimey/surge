@@ -60,9 +60,9 @@ def set_style():
 
 # Thresholds to draw (t in 0..100; t/100 = tau). Subset of the figure4 sweep.
 THRESHOLDS = [0, 40, 60, 80, 100]
-CMAP = plt.get_cmap("viridis")        # sequential -> no clash with routing colors
+CMAP = plt.get_cmap("plasma")        # sequential -> no clash with routing colors
 REBUILD_MARKER = "x"                   # thin x so dense rebuilds don't blob together
-REBUILD_SIZE = 11                      # scatter point area
+REBUILD_SIZE = 15                      # scatter point area
 REBUILD_LW = 0.8                       # marker stroke width
 REBUILD_COLOR = "0.25"                 # neutral grey for the rebuild-marker legend key
 
@@ -74,24 +74,28 @@ def is_reference(t):
     return t == THRESHOLDS[0] or t == THRESHOLDS[-1]
 
 
-# Only the intermediate thresholds carry color (spread wide across the colormap
-# so they stay distinct); the two reference bounds are faded grey dashed lines.
+# The two reference bounds reuse the fresh/stale routing colors from the runbook
+# figures: tau=0 (always rebuild) == fresh routing (blue); tau=1 (never rebuild)
+# == stale routing (firebrick). The intermediate thresholds carry the sequential
+# colormap, sampled in its teal->yellow range so they stay clear of the C0 blue.
 MAIN_THRESHOLDS = [t for t in THRESHOLDS if not is_reference(t)]
-REFERENCE_COLORS = {THRESHOLDS[0]: "0", THRESHOLDS[-1]: "0.55"}
+REFERENCE_COLORS = {THRESHOLDS[0]: "#1f77b4", THRESHOLDS[-1]: "firebrick"}
 
 
 def color_for(t):
     if is_reference(t):
         return REFERENCE_COLORS[t]
-    xs = (np.linspace(0.12, 0.85, len(MAIN_THRESHOLDS)) if len(MAIN_THRESHOLDS) > 1
-          else [0.5])
+    # start past viridis's blue zone (>=0.45) so intermediates read teal->yellow
+    # and never collide with the C0 blue used for the tau=0 bound.
+    xs = (np.linspace(0.25, 0.75, len(MAIN_THRESHOLDS)) if len(MAIN_THRESHOLDS) > 1
+          else [0.6])
     return CMAP(xs[MAIN_THRESHOLDS.index(t)])
 
 
 def line_style(t):
     if is_reference(t):
-        return dict(ls="--", alpha=0.55, lw=1.3)   # faded dashed reference bound
-    return dict(ls="-", alpha=1.0, lw=1.8)
+        return dict(ls="--", alpha=0.95, lw=2.0)    # solid, opaque reference bound (fresh/stale)
+    return dict(ls="-", alpha=1.0, lw=1.7)
 
 
 def tau_label(t):
@@ -163,6 +167,67 @@ def load_threshold(ds, rb):
 
 
 # --------------------------------------------------------------------------- #
+# Rebuild-count analysis
+#
+# How many maintenance rebuilds each threshold actually fires. tau=0 (always)
+# rebuilds on every update batch and is the baseline the paper reduces from
+# (640 on clustered, 310 on shifting); the intermediate thresholds -- tau=0.6 in
+# particular -- are the counts that fill the \TODO placeholders in the text.
+# Count = number of steps with did_rebuild == True, per (dataset, runbook, tau).
+# --------------------------------------------------------------------------- #
+def _rebuild_flag(series):
+    """Robust truthy mask for did_rebuild, whether stored as bool or as text."""
+    if series.dtype == object:
+        return series.astype(str).str.strip().str.lower().isin(("true", "1"))
+    return series.astype(bool)
+
+
+def rebuild_counts(loaded, datasets, runbooks, out_csv=None):
+    """Print rebuild operations per (dataset, runbook, threshold) and, for each
+    runbook, the tau=0 baseline -> tau=0.6 reduction used in the paper."""
+    rows = []
+    for ds in datasets:
+        for rb in runbooks:
+            df = loaded.get((ds.title, rb.title))
+            if df is None or df.empty or "did_rebuild" not in df.columns:
+                continue
+            for t in THRESHOLDS:
+                sub = df[(df["t"] == t) & (df["mode"] == MODE)
+                         & (df["param"] == ds.nprobe_param)].drop_duplicates("step")
+                if sub.empty:
+                    continue
+                rows.append({"dataset": ds.title, "runbook": rb.title, "tau": t / 100,
+                             "rebuilds": int(_rebuild_flag(sub["did_rebuild"]).sum()),
+                             "logged_steps": int(sub["step"].nunique())})
+    if not rows:
+        print("[rebuild-counts] no did_rebuild data found")
+        return None
+    out = pd.DataFrame(rows)
+
+    print("\n=== Rebuild operations per threshold ===")
+    hdr = f"{'dataset':<15}{'runbook':<11}{'tau':>6}{'rebuilds':>10}{'logged_steps':>14}"
+    print(hdr)
+    print("-" * len(hdr))
+    for _, r in out.sort_values(["runbook", "dataset", "tau"]).iterrows():
+        print(f"{r['dataset']:<15}{r['runbook']:<11}{r['tau']:>6.1f}"
+              f"{int(r['rebuilds']):>10}{int(r['logged_steps']):>14}")
+
+    print("\nFor the paper (\\TODO: rebuild count at tau=0.6, baseline = tau=0):")
+    for rb in runbooks:
+        sub = out[out["runbook"] == rb.title]
+        base = sub[np.isclose(sub["tau"], 0.0)]["rebuilds"]
+        base_str = str(int(base.iloc[0])) if len(base) else "?"
+        for _, r in sub[np.isclose(sub["tau"], 0.6)].iterrows():
+            print(f"  {rb.title:<10} {r['dataset']:<14} "
+                  f"{base_str} -> {int(r['rebuilds'])} rebuilds (tau=0 -> tau=0.6)")
+
+    if out_csv:
+        out.to_csv(out_csv, index=False)
+        print(f"\nwrote {out_csv}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Plotting
 # --------------------------------------------------------------------------- #
 def plot_cell(ax, ds, rb, df):
@@ -172,7 +237,8 @@ def plot_cell(ax, ds, rb, df):
                  & (df["param"] == ds.nprobe_param)].sort_values("step")
         if not len(sub):
             continue
-        ax.plot(sub["step"], sub["recall"], color=color, zorder=2, **line_style(t))
+        zo = 5 if is_reference(t) else 2          # keep tau=0/tau=1 bounds on top
+        ax.plot(sub["step"], sub["recall"], color=color, zorder=zo, **line_style(t))
         if is_reference(t):
             continue                                  # no rebuild markers on the bounds
         rb_pts = sub[sub["did_rebuild"] == True]      # noqa: E712 (pandas mask)
@@ -212,7 +278,7 @@ def build_figure(datasets, runbooks, loaded):
                           ls="none", markersize=6, markeredgewidth=1.0))
     labels.append("rebuild")
     fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False,
-               bbox_to_anchor=(0.5, 0.96), columnspacing=1.4, handletextpad=0.5)
+               bbox_to_anchor=(0.5, 0.93), columnspacing=1.4, handletextpad=0.5)
     return fig
 
 
@@ -261,6 +327,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--output", default="threshold_sweep.pdf")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--rebuild-csv", default=None,
+                    help="also write the per-threshold rebuild-count table to this CSV")
     args = ap.parse_args()
 
     set_style()
@@ -277,6 +345,7 @@ def main():
         fig = build_figure(DATASETS, RUNBOOKS, loaded)
         fig.savefig(args.output, bbox_inches="tight")
     print(f"wrote {args.output}")
+    rebuild_counts(loaded, DATASETS, RUNBOOKS, out_csv=args.rebuild_csv)
 
 
 if __name__ == "__main__":
