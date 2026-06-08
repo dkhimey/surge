@@ -215,12 +215,18 @@ static std::set<int> routeQuery(
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
+        std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
+        for (int p : partitions) part_size[static_cast<size_t>(p)]++;
+
+        const double d0 = static_cast<double>(centers[0].first) + 1e-10;
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
-            const float d  = centers[r].first;
-            const int   pid = partitions[static_cast<int>(centers[r].second)];
-            const double w  = 1.0 / std::pow(static_cast<double>(d) + 1e-5, 3.0);
-            part_probs[static_cast<size_t>(pid)] += w / static_cast<double>(r + 1);
+            const double rel_d   = static_cast<double>(centers[r].first) / d0;
+            const int    pid     = partitions[static_cast<int>(centers[r].second)];
+            const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
+            // Canonical scoring (paper Eq. for w(c_r), matches src/index.cpp):
+            //   w(c_r) = |rho(c_r)| * exp(-d_r / d0)
+            part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
         }
         double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
         if (prob_sum <= 0.0) {
