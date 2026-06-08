@@ -250,7 +250,7 @@ def plot_cell(ax, ds, rb, df):
 
 def build_figure(datasets, runbooks, loaded):
     nrows, ncols = len(datasets), len(runbooks)
-    fig = plt.figure(figsize=(3.7 * ncols, 2.7 * nrows + 0.4))
+    fig = plt.figure(figsize=(3.7 * ncols, 2.7 * nrows))
     axes = fig.subplots(nrows, ncols, squeeze=False, sharex="col")
 
     for r, ds in enumerate(datasets):
@@ -278,7 +278,7 @@ def build_figure(datasets, runbooks, loaded):
                           ls="none", markersize=6, markeredgewidth=1.0))
     labels.append("rebuild")
     fig.legend(handles, labels, loc="lower center", ncol=len(handles), frameon=False,
-               bbox_to_anchor=(0.5, 0.93), columnspacing=1.4, handletextpad=0.5)
+               bbox_to_anchor=(0.45, 0.93), columnspacing=1, handletextpad=0.5)
     return fig
 
 
