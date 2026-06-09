@@ -134,36 +134,51 @@ static std::set<int> routeQuery(
         if (centers.empty()) return target_ranks;
 
         const double d0_raw   = static_cast<double>(centers[0].first);
-        const double d0_denom = d0_raw + 1e-10;
+        const double dmax_raw = static_cast<double>(centers.back().first);
+        // Normalise by the spread of the candidate set, not the absolute scale.
+        // This maps [d_0, d_max] -> [0, 1] so the nearest centroid always gets
+        // exp(0)=1 and the farthest exp(-1)≈0.37, giving real discrimination
+        // even on concentrated-distance datasets like MSTuring where d_r ≈ d_0
+        // makes (d_r - d_0)/d_0 ≈ 0 for every candidate.
+        const double d_spread = (dmax_raw - d0_raw) + 1e-10;
 
-        // Per-centroid weight: |rho(c)| * exp(-(d_r - d_0) / d_0).
-        // Nearest centroid gets weight 1 * |rho|; farther ones decay.
-        std::vector<double> weights(centers.size());
-        double total_mass = 0.0;
+        // Accumulate per-partition scores: |rho(c)| * exp(-(d_r - d_0) / d_spread).
+        // Aggregating by partition lets a dominant nearby partition accumulate
+        // enough mass to be selected alone for low recall targets.
+        std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
             const double rel_d = (static_cast<double>(centers[r].first) - d0_raw)
-                                 / d0_denom;
-            weights[r] = static_cast<double>(
-                             center_counts[static_cast<int>(centers[r].second)])
-                         * std::exp(-rel_d);
-            total_mass += weights[r];
+                                 / d_spread;
+            const int    pid   = partitions[static_cast<int>(centers[r].second)];
+            const double wt    = static_cast<double>(
+                                     center_counts[static_cast<int>(centers[r].second)])
+                                 * std::exp(-rel_d);
+            part_probs[static_cast<size_t>(pid)] += wt;
         }
-        if (total_mass <= 0.0) {
+
+        double prob_sum = 0.0;
+        for (double p : part_probs) prob_sum += p;
+        if (prob_sum <= 0.0) {
             target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
             return target_ranks;
         }
+        for (double& p : part_probs) p /= prob_sum;
 
-        // Walk nearest-first, accumulate captured probability until recall_target.
-        // Matches index.cpp getPartitionsForSearch_RecallTgt_: proximity-ordered
-        // selection avoids the sort-by-partition-prob bias that systematically
-        // routes every query to the largest/densest partitions.
-        double captured = 0.0;
-        for (size_t r = 0; r < centers.size(); r++) {
-            const int pid = partitions[static_cast<int>(centers[r].second)];
+        // Select partitions highest-probability-first until recall_target is met.
+        std::vector<int> ordered(num_partitions);
+        std::iota(ordered.begin(), ordered.end(), 0);
+        std::sort(ordered.begin(), ordered.end(),
+                  [&](int a, int b){ return part_probs[a] > part_probs[b]; });
+
+        double acc = 0.0;
+        for (int pid : ordered) {
+            if (part_probs[static_cast<size_t>(pid)] <= 0.0) break;
             target_ranks.insert(pid + 1);
-            captured += weights[r] / total_mass;
-            if (captured >= recall_target) break;
+            acc += part_probs[static_cast<size_t>(pid)];
+            if (acc >= recall_target) break;
         }
+        if (target_ranks.empty())
+            target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
     }
 
     return target_ranks;
@@ -561,6 +576,50 @@ int main(int argc, char** argv)
         std::cout << "[Static] Loaded " << nq << " queries"
                   << (have_gt ? " with ground truth" : " (no ground truth)")
                   << "\n";
+
+    // ── Distance-spread diagnostic (rank 0 only) ─────────────────────────────
+    // Measures (d_max - d_0) / d_0 over a sample of queries to verify whether
+    // the RecallTarget distance normaliser assumption holds on this dataset.
+    if (rank == 0) {
+        const size_t knn_diag  = 50;
+        const size_t n_sample  = std::min<size_t>(1000, nq);
+        std::vector<double> ratios;   // (d_max - d_0) / (d_0 + 1e-10)
+        std::vector<double> spreads;  // d_max - d_0
+        ratios.reserve(n_sample);
+        spreads.reserve(n_sample);
+        for (size_t q = 0; q < n_sample; q++) {
+            float* Q = const_cast<float*>(queries.data()) + q * dim;
+            auto centers = routing_hnsw->searchKnnCloserFirst(Q, knn_diag);
+            if (centers.size() < 2) continue;
+            const double d0   = static_cast<double>(centers.front().first);
+            const double dmax = static_cast<double>(centers.back().first);
+            ratios.push_back((dmax - d0) / (d0 + 1e-10));
+            spreads.push_back(dmax - d0);
+        }
+        std::sort(ratios.begin(), ratios.end());
+        std::sort(spreads.begin(), spreads.end());
+        const size_t n = ratios.size();
+        auto pct = [&](const std::vector<double>& v, double p) {
+            return v[static_cast<size_t>(p * (v.size() - 1))];
+        };
+        double mean_ratio = 0.0, mean_spread = 0.0;
+        for (double r : ratios)  mean_ratio  += r;
+        for (double s : spreads) mean_spread += s;
+        mean_ratio  /= n;
+        mean_spread /= n;
+        std::cout << "[Diag] Distance spread over " << n << " queries (knn=" << knn_diag << ")\n"
+                  << "[Diag]   (d_max - d_0) / d_0 :  "
+                  << "p5=" << pct(ratios, 0.05)
+                  << "  median=" << pct(ratios, 0.50)
+                  << "  p95=" << pct(ratios, 0.95)
+                  << "  mean=" << mean_ratio << "\n"
+                  << "[Diag]   d_max - d_0          :  "
+                  << "p5=" << pct(spreads, 0.05)
+                  << "  median=" << pct(spreads, 0.50)
+                  << "  p95=" << pct(spreads, 0.95)
+                  << "  mean=" << mean_spread << "\n";
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
 
     // ── Open CSV (rank 0 only) ─────────────────────────────────────────────────
     std::ofstream csv;
