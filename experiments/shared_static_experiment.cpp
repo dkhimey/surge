@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -126,6 +127,21 @@ static std::set<int> routeQuery(
         }
 
     } else { // RecallTarget
+        // Per-partition score aggregation mode (env SURGE_RT_AGG):
+        //   "sum" (default) — Σ exp(-d/d0) over the query's near centroids that
+        //                     fall in the partition. This implicitly weights by
+        //                     how many near centroids a partition owns (a density
+        //                     / size bias) and, under MSTuring's flat exp(-d/d0),
+        //                     collapses to "centroid count", concentrating load
+        //                     on the central shard.
+        //   "max"           — the single nearest centroid per partition. This
+        //                     mirrors the ordering NProbe uses and removes the
+        //                     density bias; use it to test the skew hypothesis.
+        static const bool use_max_agg = [](){
+            const char* e = std::getenv("SURGE_RT_AGG");
+            return e && std::string(e) == "max";
+        }();
+
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
         size_t knn = std::min<size_t>(50, ncenters);
@@ -141,7 +157,12 @@ static std::set<int> routeQuery(
             // static_cast<double>(part_size[static_cast<size_t>(pid)]);
             // Canonical scoring (paper Eq. for w(c_r), matches src/index.cpp):
             //   w(c_r) = |rho(c_r)| * exp(-d_r / d0)
-            part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
+            const double w = size_wt * std::exp(-1.0 * rel_d);
+            if (use_max_agg)
+                part_probs[static_cast<size_t>(pid)] =
+                    std::max(part_probs[static_cast<size_t>(pid)], w);
+            else
+                part_probs[static_cast<size_t>(pid)] += w;
         }
 
         double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
@@ -575,6 +596,11 @@ int main(int argc, char** argv)
         }
     }
 
+    // Hot-node tracking (rank 0): per-mode cumulative per-executor query load,
+    // and how often each executor is THE hottest, summed over that mode's combos.
+    std::unordered_map<std::string, std::vector<long long>> cum_load;   // mode → load[world_size]
+    std::unordered_map<std::string, std::vector<int>>       hot_count;  // mode → times-hottest[world_size]
+
     // ══════════════════════════════════════════════════════════════════════════
     //  Sweep: for each (mode, param) combo:
     //    1. Warmup pass   – measures recall, not timed
@@ -726,10 +752,32 @@ int main(int argc, char** argv)
             const double load_skew = load_mean > 0 ? load_max / load_mean : 0.0;
             const double st_skew   = st_mean   > 0 ? st_max   / st_mean   : 0.0;
 
+            // ── Hot node: which executor carries the peak load this combo ──
+            int hot_exec = -1;
+            long long hot_val = -1;
+            for (int e = 1; e < world_size; e++) {
+                if (best_load[e] > hot_val) { hot_val = best_load[e]; hot_exec = e; }
+            }
+            // Accumulate per-mode totals to test whether the SAME node is hot
+            // across modes (popularity skew) vs mode-specific.
+            auto& cl = cum_load[mode_str];
+            auto& hc = hot_count[mode_str];
+            if (cl.empty()) cl.assign(world_size, 0);
+            if (hc.empty()) hc.assign(world_size, 0);
+            for (int e = 1; e < world_size; e++) cl[e] += best_load[e];
+            if (hot_exec >= 0) hc[hot_exec]++;
+
             std::cout << "  [diag]   load_skew(max/mean)=" << load_skew
                       << "  search_skew=" << st_skew
                       << "  route_t(mean/max)=" << rt_mean << "/" << rt_max
                       << "  search_t(mean/max)=" << st_mean << "/" << st_max << "\n";
+            std::cout << "  [hot]    exec" << hot_exec
+                      << " load=" << hot_val
+                      << " (" << (load_mean > 0 ? hot_val / load_mean : 0.0) << "x mean)"
+                      << "  per-exec(load/mean):";
+            for (int e = 1; e < world_size; e++)
+                std::cout << " e" << e << "=" << (load_mean > 0 ? best_load[e] / load_mean : 0.0);
+            std::cout << "\n";
 
             // Per-executor breakdown to a companion CSV (output_file + ".diag.csv").
             diag << mode_str << "," << param << "," << recall << "," << qps;
@@ -741,6 +789,39 @@ int main(int argc, char** argv)
             diag << "\n";
             diag.flush();
         }
+    }
+
+    // ── Hot-node summary across the whole sweep (rank 0) ───────────────────────
+    // For each mode, print per-executor cumulative load normalised by the mean,
+    // and which executor was hottest most often.  If the same executor tops every
+    // mode, the skew is a property of the partitioning (popularity), and the
+    // recall-target router merely amplifies it.
+    if (rank == 0) {
+        std::cout << "\n[Static] ===== HOT-NODE SUMMARY (per-executor load / mean) =====\n";
+        for (auto& [mode_str, cl] : cum_load) {
+            long long tot = 0;
+            for (int e = 1; e < world_size; e++) tot += cl[e];
+            const double mean = (world_size > 1) ? double(tot) / (world_size - 1) : 0.0;
+            int hot_e = -1; double hot_mult = 0.0;
+            std::cout << "  " << mode_str << ":";
+            for (int e = 1; e < world_size; e++) {
+                const double mult = mean > 0 ? cl[e] / mean : 0.0;
+                std::cout << " e" << e << "=" << mult;
+                if (mult > hot_mult) { hot_mult = mult; hot_e = e; }
+            }
+            std::cout << "  | hottest=exec" << hot_e << " (" << hot_mult << "x)";
+            const auto& hc = hot_count[mode_str];
+            int champ = -1, champ_n = -1, mode_combos = 0;
+            for (int e = 1; e < world_size; e++) {
+                if (e < static_cast<int>(hc.size())) {
+                    mode_combos += hc[e];
+                    if (hc[e] > champ_n) { champ_n = hc[e]; champ = e; }
+                }
+            }
+            std::cout << "  topped " << champ_n << "/" << mode_combos
+                      << " combos by exec" << champ << "\n";
+        }
+        std::cout << "[Static] =========================================================\n";
     }
 
     if (rank == 0) {
