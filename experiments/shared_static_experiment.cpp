@@ -127,7 +127,7 @@ static std::set<int> routeQuery(
     } else { // RecallTarget
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        size_t knn = std::min<size_t>(200, ncenters);
+        size_t knn = std::min<size_t>(20, ncenters);
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
