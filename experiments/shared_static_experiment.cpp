@@ -498,6 +498,10 @@ int main(int argc, char** argv)
         sub_index = new Executor(rank, dim, comm, &logger);
         sub_index->load(filename_prefix, EF_SEARCH);
 
+        std::cout << "[Static] Executor " << rank
+                  << " loaded " << sub_index->getElementCount()
+                  << " vectors in local graph\n";
+
         bcastRoutingState(rank, dim, nullptr, nullptr,
                           routing_hnsw, routing_partitions,
                           &meta_space);
