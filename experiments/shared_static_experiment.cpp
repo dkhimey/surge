@@ -29,8 +29,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -88,7 +88,7 @@ static std::set<int> routeQuery(
     int                              num_partitions,
     RoutingMode                      mode,
     float                            param,
-    const std::vector<int>&          part_size)   // centroids per partition, precomputed once
+    const std::vector<int>&          center_counts)  // |rho(c)|: #vectors each centroid owns
 {
     std::set<int> target_ranks;
 
@@ -127,65 +127,41 @@ static std::set<int> routeQuery(
         }
 
     } else { // RecallTarget
-        // Per-partition score aggregation mode (env SURGE_RT_AGG):
-        //   "sum" (default) — Σ exp(-d/d0) over the query's near centroids that
-        //                     fall in the partition. This implicitly weights by
-        //                     how many near centroids a partition owns (a density
-        //                     / size bias) and, under MSTuring's flat exp(-d/d0),
-        //                     collapses to "centroid count", concentrating load
-        //                     on the central shard.
-        //   "max"           — the single nearest centroid per partition. This
-        //                     mirrors the ordering NProbe uses and removes the
-        //                     density bias; use it to test the skew hypothesis.
-        static const bool use_max_agg = [](){
-            const char* e = std::getenv("SURGE_RT_AGG");
-            return e && std::string(e) == "max";
-        }();
-
+        // Fetch a deep candidate list of the closest centroids, then trim its tail
+        // so that the kept prefix is expected to contain `recall_target` of the
+        // query's true neighbours.
+        //
+        // Distance is used ONLY to order the candidates (nearest first).  The cut
+        // point is driven by the requested recall: each centroid is expected to hold
+        // a share of the query's neighbours proportional to the number of vectors it
+        // owns, |rho(c)| (center_counts).  Walking nearest-first, we accumulate that
+        // captured-neighbour fraction and stop once it reaches recall_target —
+        // exactly the quantity the oracle accumulates from the ground-truth
+        // partition distribution, estimated here by per-centroid point mass.
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        size_t knn = std::min<size_t>(50, ncenters);
-        auto centers = hnsw->searchKnnCloserFirst(vec, knn);
+        const size_t knn      = std::min<size_t>(200, ncenters);
+        auto centers = hnsw->searchKnnCloserFirst(vec, knn);   // ascending by distance
         if (centers.empty()) return target_ranks;
 
-        const double d0 = static_cast<double>(centers[0].first) + 1e-10;
-        std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
-        for (size_t r = 0; r < centers.size(); r++) {
-            const double rel_d   = static_cast<double>(centers[r].first) / d0;
-            const int    pid     = partitions[static_cast<int>(centers[r].second)];
-            const double size_wt = 1;
-            // static_cast<double>(part_size[static_cast<size_t>(pid)]);
-            // Canonical scoring (paper Eq. for w(c_r), matches src/index.cpp):
-            //   w(c_r) = |rho(c_r)| * exp(-d_r / d0)
-            const double w = size_wt * std::exp(-1.0 * rel_d);
-            if (use_max_agg)
-                part_probs[static_cast<size_t>(pid)] =
-                    std::max(part_probs[static_cast<size_t>(pid)], w);
-            else
-                part_probs[static_cast<size_t>(pid)] += w;
-        }
-
-        double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
-        if (prob_sum <= 0.0) {
+        // Total point mass over the candidate list = denominator of the recall est.
+        double total_mass = 0.0;
+        for (const auto& c : centers)
+            total_mass += static_cast<double>(center_counts[static_cast<int>(c.second)]);
+        if (total_mass <= 0.0) {
             target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
             return target_ranks;
         }
-        for (double& p : part_probs) p /= prob_sum;
 
-        std::vector<int> ordered(num_partitions);
-        std::iota(ordered.begin(), ordered.end(), 0);
-        std::sort(ordered.begin(), ordered.end(),
-                  [&](int a, int b){ return part_probs[a] > part_probs[b]; });
-
-        double acc = 0.0;
-        for (int pid : ordered) {
-            if (part_probs[static_cast<size_t>(pid)] <= 0.0) break;
-            target_ranks.insert(pid + 1);
-            acc += part_probs[static_cast<size_t>(pid)];
-            if (acc >= recall_target) break;
+        // Keep centroids (and their partitions) nearest-first until the cumulative
+        // captured-neighbour fraction reaches the requested recall; trim the rest.
+        double captured = 0.0;
+        for (size_t r = 0; r < centers.size(); r++) {
+            const int center_id = static_cast<int>(centers[r].second);
+            target_ranks.insert(partitions[center_id] + 1);
+            captured += static_cast<double>(center_counts[center_id]) / total_mass;
+            if (captured >= recall_target) break;
         }
-        if (target_ranks.empty())
-            target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
     }
 
     return target_ranks;
@@ -228,8 +204,10 @@ static void bcastRoutingState(
     int                              dim,
     hnswlib::HierarchicalNSW<float>* coord_meta,   // non-null only on rank 0
     const std::vector<int>*          coord_parts,  // non-null only on rank 0
+    const std::vector<int>*          coord_counts, // non-null only on rank 0
     hnswlib::HierarchicalNSW<float>*& out_meta,
     std::vector<int>&                 out_parts,
+    std::vector<int>&                 out_counts,
     hnswlib::SpaceInterface<float>*   space)
 {
     // 1. Partitions vector
@@ -241,6 +219,16 @@ static void bcastRoutingState(
             (rank == 0) ? const_cast<int*>(coord_parts->data()) : out_parts.data(),
             n, MPI_INT, 0, MPI_COMM_WORLD);
         if (rank == 0) out_parts = *coord_parts;
+    }
+    // 1b. Per-centroid point counts |rho(c)| (same indexing as partitions)
+    {
+        int n = (rank == 0) ? static_cast<int>(coord_counts->size()) : 0;
+        MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (rank != 0) out_counts.resize(n);
+        MPI_Bcast(
+            (rank == 0) ? const_cast<int*>(coord_counts->data()) : out_counts.data(),
+            n, MPI_INT, 0, MPI_COMM_WORLD);
+        if (rank == 0) out_counts = *coord_counts;
     }
     // 2. Meta-HNSW serialised bytes
     {
@@ -290,6 +278,7 @@ static void runSearchPass(
     int                              dim,
     hnswlib::HierarchicalNSW<float>* routing_hnsw,
     const std::vector<int>&          routing_partitions,
+    const std::vector<int>&          routing_counts,   // |rho(c)| per centroid
     RoutingMode                      mode,
     float                            param,
     Executor*                        sub_index,        // null on coordinator
@@ -310,12 +299,6 @@ static void runSearchPass(
     std::vector<std::vector<float>>    send_qvecs(world_size);
     long long my_total_parts = 0;
 
-    // Centroids-per-partition histogram is constant across queries; compute
-    // it once here (the recall-target size prior reads it) instead of
-    // rebuilding it per query inside routeQuery.
-    std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
-    for (int p : routing_partitions) part_size[static_cast<size_t>(p)]++;
-
     const double t_route0 = MPI_Wtime();
     #pragma omp parallel
     {
@@ -328,7 +311,7 @@ static void runSearchPass(
             float* Q = const_cast<float*>(queries.data()) + q * dim;
             std::set<int> targets = routeQuery(
                 Q, routing_hnsw, routing_partitions,
-                num_partitions, mode, param, part_size);
+                num_partitions, mode, param, routing_counts);
             thread_parts += static_cast<long long>(targets.size());
             for (int tgt : targets) {
                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
@@ -502,6 +485,7 @@ int main(int argc, char** argv)
 
     // ── Shared routing state (all ranks) ─────────────────────────────────────
     std::vector<int>                  routing_partitions;
+    std::vector<int>                  routing_counts;     // |rho(c)| per centroid
     hnswlib::L2Space                  meta_space(dim);
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
@@ -523,7 +507,8 @@ int main(int argc, char** argv)
         bcastRoutingState(rank, dim,
                           meta_index->getMetaHNSW(),
                           &meta_index->getPartitions(),
-                          routing_hnsw, routing_partitions,
+                          &meta_index->getCenterCounts(),
+                          routing_hnsw, routing_partitions, routing_counts,
                           &meta_space);
 
         std::cout << "[Static] Coordinator routing state broadcast complete\n";
@@ -542,8 +527,8 @@ int main(int argc, char** argv)
                   << " loaded " << sub_index->getElementCount()
                   << " vectors in local graph\n";
 
-        bcastRoutingState(rank, dim, nullptr, nullptr,
-                          routing_hnsw, routing_partitions,
+        bcastRoutingState(rank, dim, nullptr, nullptr, nullptr,
+                          routing_hnsw, routing_partitions, routing_counts,
                           &meta_space);
 
         std::cout << "[Static] Executor " << rank << " ready\n";
@@ -623,7 +608,7 @@ int main(int argc, char** argv)
         runSearchPass(rank, world_size, num_partitions, k,
                       nq, my_qs, my_qe,
                       queries, dim,
-                      routing_hnsw, routing_partitions,
+                      routing_hnsw, routing_partitions, routing_counts,
                       mode, param,
                       sub_index,
                       have_gt ? &gt : nullptr,
@@ -674,7 +659,7 @@ int main(int argc, char** argv)
             runSearchPass(rank, world_size, num_partitions, k,
                           nq, my_qs, my_qe,
                           queries, dim,
-                          routing_hnsw, routing_partitions,
+                          routing_hnsw, routing_partitions, routing_counts,
                           mode, param,
                           sub_index,
                           /*gt=*/nullptr,   // skip recall in timed passes
