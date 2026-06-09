@@ -9,12 +9,11 @@
 // ─── Usage ───────────────────────────────────────────────────────────────────
 //  mpirun -np <P+1> ./shared_batch_experiment_sweep \
 //      <dataset> <num_partitions> <full_threshold> <k> <gt_prefix> <output_file>
-//      [rebuild_mode]
 //
-//  rebuild_mode : "full" (default) or "delta"
-//                 full  – discard and reconstruct each shard's index
-//                 delta – mark-delete departing elements and insert arriving
-//                         ones in-place (keeps graph topology)
+//  Rebuild policy: delta always — shadow-delete departing elements and insert
+//  arriving ones using replace_deleted=true (keeps existing graph topology).
+//  Falls back to a full reconstruction if any shard's tombstone ratio exceeds
+//  TOMBSTONE_RATIO_THRESHOLD (currently 0.5 = 50% unused slots).
 //
 // ─── Sweep parameter grids ───────────────────────────────────────────────────
 //  BranchingFactor : {1, 2, 5, 10, 15, 20, 25, 30}
@@ -438,22 +437,23 @@ static void bcastRoutingState(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    if (argc != 7 && argc != 8) {
+    if (argc != 7) {
         std::cerr
             << "Usage: " << argv[0]
             << " <dataset> <num_partitions>"
             << " <full_threshold>"
-            << " <k> <gt_prefix> <output_file>"
-            << " [rebuild_mode]\n"
+            << " <k> <gt_prefix> <output_file>\n"
             << "\n"
-            << "  full_threshold : min centers to migrate to trigger a full rebuild;\n"
+            << "  full_threshold : min centers to migrate to trigger a rebuild;\n"
             << "                   set >= " << NCENTERS << " to disable\n"
             << "  gt_prefix      : directory with per-step GT files (step<N>.gt100),"
                " or \"\" for static GT only\n"
-            << "  rebuild_mode   : \"full\" (default) or \"delta\"\n"
-            << "                   full  – discard and reconstruct each shard's index\n"
-            << "                   delta – mark-delete departing elements and insert\n"
-            << "                           arriving ones in-place (keeps graph topology)\n";
+            << "\n"
+            << "  Rebuild policy: delta always (shadow-delete departing elements,\n"
+            << "  insert arriving ones with replace_deleted=true, keep graph topology).\n"
+            << "  Falls back to full graph reconstruction if any shard's tombstone\n"
+            << "  ratio exceeds " << TOMBSTONE_RATIO_THRESHOLD
+            << " (" << static_cast<int>(TOMBSTONE_RATIO_THRESHOLD * 100) << "% unused slots).\n";
         return 1;
     }
 
@@ -464,8 +464,9 @@ int main(int argc, char** argv)
     const int         k              = std::stoi(argv[4]);
     const std::string gt_prefix      = argv[5];
     const std::string output_file    = argv[6];
-    const std::string rebuild_mode      = (argc == 8) ? argv[7] : "full";
-    const bool        use_delta_rebuild = (rebuild_mode == "delta");
+    // Rebuild policy: always attempt delta (shadow-delete + replace_deleted insert).
+    // Falls back to full if the tombstone ratio check fires (see TOMBSTONE_RATIO_THRESHOLD).
+    const bool        use_delta_rebuild = true;
 
     // Build the sweep list — identical on all ranks so collective counts match.
     const auto sweep_combos = build_sweep_combos();
@@ -844,7 +845,6 @@ int main(int argc, char** argv)
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
                     std::cout << "[Sweep] Step " << step.step_num
-                              << "  rebuild mode=" << rebuild_mode
                               << "  rebuild_type=" << rb_stats.rebuild_type
                               << "  type=" << rb_type
                               << "  centers_moved=" << rb_stats.centers_moved
@@ -984,7 +984,6 @@ int main(int argc, char** argv)
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
                     std::cout << "[Sweep] Step " << step.step_num
-                              << "  rebuild mode=" << rebuild_mode
                               << "  rebuild_type=" << rb_stats.rebuild_type
                               << "  type=" << rb_type
                               << "  centers_moved=" << rb_stats.centers_moved
