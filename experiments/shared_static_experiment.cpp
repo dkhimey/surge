@@ -135,40 +135,35 @@ static std::set<int> routeQuery(
 
         const double d0_raw   = static_cast<double>(centers[0].first);
         const double d0_denom = d0_raw + 1e-10;
-        std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
-        for (size_t r = 0; r < centers.size(); r++) {
-            const double rel_d   = (static_cast<double>(centers[r].first) - d0_raw)
-                                   / d0_denom;
-            const int    pid     = partitions[static_cast<int>(centers[r].second)];
-            const double size_wt = static_cast<double>(
-                                       center_counts[static_cast<int>(centers[r].second)]);
-            // w(c_r) = |rho(c_r)| * exp(-(d_r - d_0) / d_0)
-            // Uses actual per-centroid vector count and distance relative to nearest
-            // centroid so that weight = 1 at d_r = d_0 and decays for farther ones.
-            part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
-        }
 
-        double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
-        if (prob_sum <= 0.0) {
+        // Per-centroid weight: |rho(c)| * exp(-(d_r - d_0) / d_0).
+        // Nearest centroid gets weight 1 * |rho|; farther ones decay.
+        std::vector<double> weights(centers.size());
+        double total_mass = 0.0;
+        for (size_t r = 0; r < centers.size(); r++) {
+            const double rel_d = (static_cast<double>(centers[r].first) - d0_raw)
+                                 / d0_denom;
+            weights[r] = static_cast<double>(
+                             center_counts[static_cast<int>(centers[r].second)])
+                         * std::exp(-rel_d);
+            total_mass += weights[r];
+        }
+        if (total_mass <= 0.0) {
             target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
             return target_ranks;
         }
-        for (double& p : part_probs) p /= prob_sum;
 
-        std::vector<int> ordered(num_partitions);
-        std::iota(ordered.begin(), ordered.end(), 0);
-        std::sort(ordered.begin(), ordered.end(),
-                  [&](int a, int b){ return part_probs[a] > part_probs[b]; });
-
-        double acc = 0.0;
-        for (int pid : ordered) {
-            if (part_probs[static_cast<size_t>(pid)] <= 0.0) break;
+        // Walk nearest-first, accumulate captured probability until recall_target.
+        // Matches index.cpp getPartitionsForSearch_RecallTgt_: proximity-ordered
+        // selection avoids the sort-by-partition-prob bias that systematically
+        // routes every query to the largest/densest partitions.
+        double captured = 0.0;
+        for (size_t r = 0; r < centers.size(); r++) {
+            const int pid = partitions[static_cast<int>(centers[r].second)];
             target_ranks.insert(pid + 1);
-            acc += part_probs[static_cast<size_t>(pid)];
-            if (acc >= recall_target) break;
+            captured += weights[r] / total_mass;
+            if (captured >= recall_target) break;
         }
-        if (target_ranks.empty())
-            target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
     }
 
     return target_ranks;
