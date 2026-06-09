@@ -127,7 +127,7 @@ static std::set<int> routeQuery(
     } else { // RecallTarget
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        size_t knn = std::min<size_t>(50, ncenters);
+        size_t knn = std::min<size_t>(200, ncenters);
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
@@ -139,8 +139,7 @@ static std::set<int> routeQuery(
         for (size_t r = 0; r < centers.size(); r++) {
             const double rel_d   = static_cast<double>(centers[r].first) / d0;
             const int    pid     = partitions[static_cast<int>(centers[r].second)];
-            const double size_wt = 1;
-            // static_cast<double>(part_size[static_cast<size_t>(pid)]);
+            const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
             // Canonical scoring (paper Eq. for w(c_r), matches src/index.cpp):
             //   w(c_r) = |rho(c_r)| * exp(-d_r / d0)
             part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
