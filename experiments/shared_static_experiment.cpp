@@ -86,7 +86,8 @@ static std::set<int> routeQuery(
     const std::vector<int>&          partitions,
     int                              num_partitions,
     RoutingMode                      mode,
-    float                            param)
+    float                            param,
+    const std::vector<int>&          part_size)   // centroids per partition, precomputed once
 {
     std::set<int> target_ranks;
 
@@ -130,9 +131,6 @@ static std::set<int> routeQuery(
         size_t knn = std::min<size_t>(20, ncenters);
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
-
-        std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
-        for (int p : partitions) part_size[static_cast<size_t>(p)]++;
 
         const double d0 = static_cast<double>(centers[0].first) + 1e-10;
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
@@ -283,6 +281,12 @@ static void runSearchPass(
     std::vector<std::vector<float>>    send_qvecs(world_size);
     long long my_total_parts = 0;
 
+    // Centroids-per-partition histogram is constant across queries; compute
+    // it once here (the recall-target size prior reads it) instead of
+    // rebuilding it per query inside routeQuery.
+    std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
+    for (int p : routing_partitions) part_size[static_cast<size_t>(p)]++;
+
     #pragma omp parallel
     {
         std::vector<std::vector<uint32_t>> local_qids(world_size);
@@ -294,7 +298,7 @@ static void runSearchPass(
             float* Q = const_cast<float*>(queries.data()) + q * dim;
             std::set<int> targets = routeQuery(
                 Q, routing_hnsw, routing_partitions,
-                num_partitions, mode, param);
+                num_partitions, mode, param, part_size);
             thread_parts += static_cast<long long>(targets.size());
             for (int tgt : targets) {
                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
