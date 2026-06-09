@@ -225,6 +225,63 @@ def make_selftest_datasets(tmp):
 
 
 # --------------------------------------------------------------------------- #
+# TODO extraction
+# --------------------------------------------------------------------------- #
+def compute_qps_ratios(ds: DatasetSpec, d: dict) -> None:
+    """
+    Print the GP-ANN / SURGE QPS ratio at equal recall for the paper TODOs:
+      'GP-ANN delivers X× higher QPS than SURGE on SIFT-100M'
+      'GP-ANN delivers X× higher QPS than SURGE on MSTuring-100M'
+
+    For each GP-ANN recall point, the best SURGE QPS across all routing modes
+    is found by linear interpolation, then the ratio is computed.
+    Only runs for datasets that have GP-ANN data (i.e. the 100M datasets).
+    """
+    if d["gpann"] is None:
+        return
+
+    surge = d["surge"]
+    gpann = d["gpann"].sort_values("recall@10")
+
+    ratios = []
+    for _, row in gpann.iterrows():
+        r = row["recall@10"]
+        best_surge_qps = 0.0
+        for mode_name, _ in SURGE_MODES:
+            sub = surge[surge["mode"] == mode_name].sort_values("recall@10")
+            if len(sub) < 2:
+                continue
+            if r < sub["recall@10"].min() or r > sub["recall@10"].max():
+                continue
+            qps_at_r = float(np.interp(r, sub["recall@10"].values, sub["qps"].values))
+            best_surge_qps = max(best_surge_qps, qps_at_r)
+
+        if best_surge_qps > 0:
+            ratios.append((r, row["qps"] / best_surge_qps))
+
+    if not ratios:
+        print(f"[TODO] {ds.title}: no overlapping recall range between GP-ANN and SURGE.")
+        return
+
+    recall_vals = [r for r, _ in ratios]
+    ratio_vals  = [v for _, v in ratios]
+
+    print(f"\n[TODO] {ds.title}: GP-ANN / best-SURGE QPS ratio at equal recall")
+    print(f"  Recall range : [{min(recall_vals):.3f}, {max(recall_vals):.3f}]")
+    print(f"  Ratio range  : {min(ratio_vals):.2f}x – {max(ratio_vals):.2f}x")
+    print(f"  Mean ratio   : {np.mean(ratio_vals):.2f}x")
+
+    # Report at recall=0.9 if in range, otherwise at the midpoint
+    target = 0.9
+    if min(recall_vals) <= target <= max(recall_vals):
+        ratio_at_target = float(np.interp(target, recall_vals, ratio_vals))
+        print(f"  At recall=0.90: {ratio_at_target:.2f}x  ← suggested TODO value")
+    else:
+        mid = len(ratios) // 2
+        print(f"  At recall={recall_vals[mid]:.3f}: {ratio_vals[mid]:.2f}x  ← suggested TODO value")
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--output", default="qps_combined.pdf")
@@ -241,6 +298,12 @@ def main():
             fig.savefig(args.output, bbox_inches="tight", dpi=150)
     else:
         data = [load_dataset(ds) for ds in DATASETS]
+        # ---- TODO measurements ----
+        print("=== TODO: GP-ANN vs SURGE QPS ratio at equal recall ===")
+        for ds, d in zip(DATASETS, data):
+            compute_qps_ratios(ds, d)
+        print("=======================================================\n")
+        # ---------------------------
         fig = build_figure(DATASETS, data)
         fig.savefig(args.output, bbox_inches="tight")
     print(f"wrote {args.output}")
