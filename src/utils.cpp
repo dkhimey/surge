@@ -63,9 +63,9 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_100000000.fbin"},
             {"runbook", "TODO"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/query10K.fbin"},
             {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-100M-gt100-private10K-queries.bin"}
+            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-100M.query10K.bin"}
         }
     },
 
