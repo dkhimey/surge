@@ -51,7 +51,7 @@ static constexpr int EF_SEARCH = 200;
 static constexpr int NUM_RUNS  = 10;  // timed passes per (mode, param) combo
 
 // ─── Sweep grids (must match shared_batch_experiment_sweep.cpp) ───────────────
-static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 15, 20, 25, 30};
+static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 15, 20, 25, 30, 40, 60, 80, 100};
 static const std::vector<int>   NPROBE_PARAMS           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 static const std::vector<float> TARGET_PARAMS           = {.6f, .7f, .75f, .8f, .85f,
                                                             .9f, .95f, .97f, .98f, .99f};
