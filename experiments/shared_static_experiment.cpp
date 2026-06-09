@@ -129,15 +129,15 @@ static std::set<int> routeQuery(
     } else { // RecallTarget
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        // Scale knn with recall_target: low targets need fewer centroids to
-        // identify the 1-2 dominant partitions; high targets need more to
-        // cover the tail partitions.  Floor at num_partitions so we always
-        // see at least one centroid per partition; cap at 50.
+        // knn scales as recall_target^3 * 50: very low for easy targets,
+        // ramps steeply near 1.0.  Range: 0.60->11, 0.90->37, 0.99->49.
         size_t knn = std::min(
             ncenters,
-            static_cast<size_t>(std::max(
-                static_cast<float>(num_partitions),
-                std::ceil(recall_target * 20.0f))));
+            static_cast<size_t>(std::ceil(
+                static_cast<double>(recall_target)
+                * static_cast<double>(recall_target)
+                * static_cast<double>(recall_target)
+                * 50.0)));
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
