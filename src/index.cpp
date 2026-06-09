@@ -385,8 +385,12 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int 
 }
 
 std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, float recall_target, float* dist) {
-    // search with a recall target
-    size_t knn = std::min<size_t>(50, ncenters_);
+    // knn scales as recall_target^13 * 113.9574: 0.60->1, 0.90->29, 0.99->100.
+    const double rt_ = static_cast<double>(std::clamp(recall_target, 0.0f, 1.0f));
+    const double rt2_ = rt_ * rt_; const double rt4_ = rt2_ * rt2_;
+    const double rt8_ = rt4_ * rt4_;
+    size_t knn = std::min(ncenters_,
+        static_cast<size_t>(std::ceil(rt8_ * rt4_ * rt_ * 113.9574)));
     std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, knn);
 
     if (centers.empty()) {
@@ -397,9 +401,11 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
         *dist = centers[0].first;
     }
 
-    // Normalise all distances by the nearest-centroid distance so the
-    // exponential weighting is scale-invariant across datasets.
-    const double d0 = static_cast<double>(centers[0].first) + 1e-10;
+    // Spread-normalised weights: map [d_0, d_max] -> [0,1] so the nearest
+    // centroid always gets exp(0)=1 and the farthest exp(-1)~=0.37.
+    const double d0_raw_   = static_cast<double>(centers.front().first);
+    const double dmax_raw_ = static_cast<double>(centers.back().first);
+    const double d_spread_ = (dmax_raw_ - d0_raw_) + 1e-10;
 
     // Choose the size prior: if any center_counts_ entry is nonzero the
     // index has seen real vectors and we use per-center membership counts.
@@ -418,11 +424,11 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
     std::vector<double> partition_probs(num_partitions_, 0.0);
     for (const auto& [d, center_id] : centers) {
         const int    pid     = partitions[center_id];
-        const double rel_d   = static_cast<double>(d) / d0;
+        const double rel_d   = (static_cast<double>(d) - d0_raw_) / d_spread_;
         const double size_wt = counts_live
             ? static_cast<double>(center_counts_[center_id])
             : static_cast<double>(part_size[static_cast<size_t>(pid)]);
-        partition_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
+        partition_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-rel_d);
     }
 
     const double prob_sum = std::accumulate(partition_probs.begin(), partition_probs.end(), 0.0);
