@@ -140,7 +140,7 @@ static std::set<int> routeQuery(
         // partition distribution, estimated here by per-centroid point mass.
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        const size_t knn      = std::min<size_t>(200, ncenters);
+        const size_t knn      = std::min<size_t>(40, ncenters);
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);   // ascending by distance
         if (centers.empty()) return target_ranks;
 
