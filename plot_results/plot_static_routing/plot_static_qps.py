@@ -94,22 +94,22 @@ _GP_MST = "/dataset/big-ann-benchmarks/data/MSTuringANNS/gpann_partitions"
 DATASETS = [
     DatasetSpec(
         title="SIFT-100M",
-        surge_csv=f"{_SROOT}/shared_static_experiment_sift100M_results_newer_unoptimized.csv",
-        gpann_csv=f"{_GP_SIFT}/distributed_bench_results_bigann100M_withrouting_newer.csv",
+        surge_csv=f"{_SROOT}/shared_static_experiment_sift100M_results.csv",
+        gpann_csv=f"{_GP_SIFT}/distributed_bench_results_bigann100M_newestjune9.csv",
     ),
     DatasetSpec(
         title="MSTuring-100M",
-        surge_csv=f"{_SROOT}/shared_static_experiment_msturing100M_results_newer_unoptimized.csv",
-        gpann_csv=f"{_GP_MST}/distributed_bench_results_msturing100M_withrouting_newer.csv",
+        surge_csv=f"{_SROOT}/shared_static_experiment_msturing100M_results.csv",
+        gpann_csv=f"{_GP_MST}/distributed_bench_results_msturing100M_newestjune9.csv",
     ),
     DatasetSpec(
         title="SIFT-500M",
-        surge_csv=f"{_SROOT}/shared_static_experiment_sift500M_results_newer_unoptimized.csv",
+        surge_csv=f"{_SROOT}/shared_static_experiment_sift500M_results.csv",
         gpann_csv=None,
     ),
     DatasetSpec(
         title="MSTuring-500M",
-        surge_csv=f"{_SROOT}/shared_static_experiment_msturing500M_results_newer_unoptimized.csv",
+        surge_csv=f"{_SROOT}/shared_static_experiment_msturing500M_results.csv",
         gpann_csv=None,
     ),
 ]
