@@ -339,7 +339,7 @@ int main(int argc, char **argv) {
     std::cout << "Finished computing routing metrics for branching factor strategy\n";
 
         // routing stategy: recall target
-    std::vector<float> recall_targets = {0.5, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.97, 0.98, 0.99};
+    std::vector<float> recall_targets = {0.65, 0.75, 0.8, 0.85, 0.9, 0.95, 0.97, 0.98, 0.99};
     for (float rt: recall_targets) {
            auto start = std::chrono::high_resolution_clock::now();
         std::vector<std::vector<size_t>> query_partitions = metaIndex.route_queries(query_vectors, RoutingMode::RecallTarget, rt);
