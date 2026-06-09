@@ -129,15 +129,13 @@ static std::set<int> routeQuery(
     } else { // RecallTarget
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        // knn scales as recall_target^3 * 50: very low for easy targets,
-        // ramps steeply near 1.0.  Range: 0.60->11, 0.90->37, 0.99->49.
+        // knn scales as recall_target^8 * 108: 0.60->2, 0.90->47, 0.99->100.
+        const double rt = static_cast<double>(recall_target);
+        const double rt2 = rt * rt;
+        const double rt4 = rt2 * rt2;
         size_t knn = std::min(
             ncenters,
-            static_cast<size_t>(std::ceil(
-                static_cast<double>(recall_target)
-                * static_cast<double>(recall_target)
-                * static_cast<double>(recall_target)
-                * 50.0)));
+            static_cast<size_t>(std::ceil(rt4 * rt4 * 108.0)));
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
