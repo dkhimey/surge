@@ -670,6 +670,7 @@ int main(int argc, char** argv)
                           nq, my_qs, my_qe,
                           queries, dim,
                           routing_hnsw, routing_partitions,
+                          routing_counts,
                           mode, param,
                           sub_index,
                           /*gt=*/nullptr,   // skip recall in timed passes
