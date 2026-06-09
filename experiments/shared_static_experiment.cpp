@@ -274,8 +274,15 @@ static void runSearchPass(
     const std::vector<std::vector<int>>* gt,           // null → skip recall
     // outputs:
     long long&  out_total_parts,
-    uint64_t&   out_hits)
+    uint64_t&   out_hits,
+    // ── per-rank diagnostics (to separate routing overhead from load skew) ──
+    double&     out_route_time,    // Phase-1 local routing compute wall time (s)
+    double&     out_search_time,   // Phase-3 local shard-search wall time (s)
+    long long&  out_search_load)   // # queries this rank searched (column sum)
 {
+    out_route_time  = 0.0;
+    out_search_time = 0.0;
+    out_search_load = 0;
     // ── Phase 1: local routing ────────────────────────────────────────────────
     std::vector<std::vector<uint32_t>> send_qids(world_size);
     std::vector<std::vector<float>>    send_qvecs(world_size);
@@ -287,6 +294,7 @@ static void runSearchPass(
     std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
     for (int p : routing_partitions) part_size[static_cast<size_t>(p)]++;
 
+    const double t_route0 = MPI_Wtime();
     #pragma omp parallel
     {
         std::vector<std::vector<uint32_t>> local_qids(world_size);
@@ -317,6 +325,7 @@ static void runSearchPass(
             my_total_parts += thread_parts;
         }
     }
+    out_route_time = MPI_Wtime() - t_route0;
 
     // ── Phase 2: dispatch queries to executors ────────────────────────────────
     std::vector<std::vector<uint32_t>> recv_qids;
@@ -331,11 +340,14 @@ static void runSearchPass(
     std::vector<std::vector<uint32_t>> snd_rids(world_size);
     std::vector<std::vector<float>>    snd_rdists(world_size);
 
+    const double t_search0 = MPI_Wtime();
+    long long my_search_load = 0;
     if (sub_index != nullptr) {
         // Executor: search all received query batches.
         for (int src = 0; src < world_size; src++) {
             if (recv_qids[src].empty()) continue;
             const size_t nrecv = recv_qids[src].size();
+            my_search_load += static_cast<long long>(nrecv);
             auto results = sub_index->searchLocalBatch(recv_qvecs[src], nrecv, k);
 
             for (size_t j = 0; j < nrecv; j++) {
@@ -357,6 +369,8 @@ static void runSearchPass(
             }
         }
     }
+    out_search_time = MPI_Wtime() - t_search0;
+    out_search_load = my_search_load;
     // Coordinator: snd_r* buffers remain empty — it holds no shard.
 
     // ── Phase 4: return results to query owners ───────────────────────────────
@@ -548,6 +562,18 @@ int main(int argc, char** argv)
         csv << "mode,param,recall@" << k << ",qps,avg_parts_searched\n";
     }
 
+    // ── Open per-rank diagnostics CSV (rank 0 only) ───────────────────────────
+    // One row per combo; per-executor cells are "load:route_t:search_t".
+    std::ofstream diag;
+    if (rank == 0) {
+        diag.open(output_file + std::string(".diag.csv"), std::ios::out);
+        if (diag.is_open()) {
+            diag << "mode,param,recall,qps";
+            for (int e = 1; e < world_size; e++) diag << ",exec" << e;
+            diag << "\n";
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     //  Sweep: for each (mode, param) combo:
     //    1. Warmup pass   – measures recall, not timed
@@ -565,6 +591,8 @@ int main(int argc, char** argv)
         // ── Warmup pass (measures recall, not timed) ──────────────────────────
         long long warmup_parts = 0;
         uint64_t  warmup_hits  = 0;
+        double    dbg_rt = 0.0, dbg_st = 0.0;
+        long long dbg_load = 0;
         runSearchPass(rank, world_size, num_partitions, k,
                       nq, my_qs, my_qe,
                       queries, dim,
@@ -572,7 +600,8 @@ int main(int argc, char** argv)
                       mode, param,
                       sub_index,
                       have_gt ? &gt : nullptr,
-                      warmup_parts, warmup_hits);
+                      warmup_parts, warmup_hits,
+                      dbg_rt, dbg_st, dbg_load);
 
         uint64_t total_hits = 0;
         MPI_Reduce(&warmup_hits, &total_hits, 1, MPI_UINT64_T,
@@ -598,9 +627,19 @@ int main(int argc, char** argv)
         long long timed_parts_acc = 0;
         double    min_elapsed     = std::numeric_limits<double>::max();
 
+        // Per-rank diagnostics for the run that yields the QPS (min elapsed):
+        //   best_route[r] = Phase-1 routing time on rank r
+        //   best_search[r]= Phase-3 shard-search time on rank r
+        //   best_load[r]  = # queries rank r searched (column sum)
+        std::vector<double>    best_route (rank == 0 ? world_size : 0, 0.0);
+        std::vector<double>    best_search(rank == 0 ? world_size : 0, 0.0);
+        std::vector<long long> best_load  (rank == 0 ? world_size : 0, 0);
+
         for (int r = 0; r < NUM_RUNS; r++) {
             long long pass_parts = 0;
             uint64_t  pass_hits  = 0;
+            double    rt = 0.0, st = 0.0;
+            long long load = 0;
 
             MPI_Barrier(MPI_COMM_WORLD);
             const double t0 = MPI_Wtime();
@@ -612,7 +651,8 @@ int main(int argc, char** argv)
                           mode, param,
                           sub_index,
                           /*gt=*/nullptr,   // skip recall in timed passes
-                          pass_parts, pass_hits);
+                          pass_parts, pass_hits,
+                          rt, st, load);
 
             const double t1 = MPI_Wtime();
 
@@ -620,8 +660,20 @@ int main(int argc, char** argv)
             double run_max     = 0.0;
             MPI_Reduce(&run_elapsed, &run_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-            if (rank == 0)
-                min_elapsed = std::min(min_elapsed, run_max);
+            // Gather this run's per-rank breakdown to rank 0.
+            std::vector<double>    g_route (rank == 0 ? world_size : 0);
+            std::vector<double>    g_search(rank == 0 ? world_size : 0);
+            std::vector<long long> g_load  (rank == 0 ? world_size : 0);
+            MPI_Gather(&rt,   1, MPI_DOUBLE,    g_route.data(),  1, MPI_DOUBLE,    0, MPI_COMM_WORLD);
+            MPI_Gather(&st,   1, MPI_DOUBLE,    g_search.data(), 1, MPI_DOUBLE,    0, MPI_COMM_WORLD);
+            MPI_Gather(&load, 1, MPI_LONG_LONG, g_load.data(),   1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+
+            if (rank == 0 && run_max < min_elapsed) {
+                min_elapsed = run_max;
+                best_route  = g_route;
+                best_search = g_search;
+                best_load   = g_load;
+            }
 
             timed_parts_acc += pass_parts;
         }
@@ -649,11 +701,50 @@ int main(int argc, char** argv)
                 << "," << avg_parts_timed
                 << "\n";
             csv.flush();
+
+            // ── Diagnostics over executor ranks (rank >= 1) from the QPS run ──
+            // load skew  → max/mean of per-rank queries-searched (column sums)
+            // route_time → Phase-1 per-rank routing compute (uniform if no skew)
+            // search_time→ Phase-3 per-rank shard search (tracks load skew)
+            long long load_sum = 0, load_max = 0;
+            double    rt_sum = 0.0,  rt_max = 0.0;
+            double    st_sum = 0.0,  st_max = 0.0;
+            int       nexec  = 0;
+            for (int e = 1; e < world_size; e++) {     // skip coordinator (rank 0)
+                nexec++;
+                load_sum += best_load[e];
+                load_max  = std::max(load_max, best_load[e]);
+                rt_sum   += best_route[e];
+                rt_max    = std::max(rt_max, best_route[e]);
+                st_sum   += best_search[e];
+                st_max    = std::max(st_max, best_search[e]);
+            }
+            const double load_mean = nexec ? double(load_sum) / nexec : 0.0;
+            const double rt_mean   = nexec ? rt_sum / nexec : 0.0;
+            const double st_mean   = nexec ? st_sum / nexec : 0.0;
+            const double load_skew = load_mean > 0 ? load_max / load_mean : 0.0;
+            const double st_skew   = st_mean   > 0 ? st_max   / st_mean   : 0.0;
+
+            std::cout << "  [diag]   load_skew(max/mean)=" << load_skew
+                      << "  search_skew=" << st_skew
+                      << "  route_t(mean/max)=" << rt_mean << "/" << rt_max
+                      << "  search_t(mean/max)=" << st_mean << "/" << st_max << "\n";
+
+            // Per-executor breakdown to a companion CSV (output_file + ".diag.csv").
+            diag << mode_str << "," << param << "," << recall << "," << qps;
+            for (int e = 1; e < world_size; e++) {
+                diag << "," << best_load[e]
+                     << ":" << best_route[e]
+                     << ":" << best_search[e];
+            }
+            diag << "\n";
+            diag.flush();
         }
     }
 
     if (rank == 0) {
         csv.close();
+        if (diag.is_open()) diag.close();
         std::cout << "[Static] Done. Results written to " << output_file << "\n";
     }
 
