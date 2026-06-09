@@ -29,7 +29,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -135,13 +134,10 @@ static std::set<int> routeQuery(
         std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
         for (int p : partitions) part_size[static_cast<size_t>(p)]++;
 
-        // hnswlib L2Space returns SQUARED L2 distances; take the square root so
-        // d_r / d0 is a ratio of Euclidean distances, matching the paper's
-        // w(c_r) = |rho(c_r)| * exp(-d_r / d0) with d_r = ||q - c_r||.
-        const double d0 = std::sqrt(static_cast<double>(centers[0].first)) + 1e-10;
+        const double d0 = static_cast<double>(centers[0].first) + 1e-10;
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
-            const double rel_d   = std::sqrt(static_cast<double>(centers[r].first)) / d0;
+            const double rel_d   = static_cast<double>(centers[r].first) / d0;
             const int    pid     = partitions[static_cast<int>(centers[r].second)];
             const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
             // Canonical scoring (paper Eq. for w(c_r), matches src/index.cpp):
