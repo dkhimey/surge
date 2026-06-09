@@ -129,7 +129,15 @@ static std::set<int> routeQuery(
     } else { // RecallTarget
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        size_t knn = std::min<size_t>(50, ncenters);
+        // Scale knn with recall_target: low targets need fewer centroids to
+        // identify the 1-2 dominant partitions; high targets need more to
+        // cover the tail partitions.  Floor at num_partitions so we always
+        // see at least one centroid per partition; cap at 50.
+        size_t knn = std::min(
+            ncenters,
+            static_cast<size_t>(std::max(
+                static_cast<float>(num_partitions),
+                std::ceil(recall_target * 20.0f))));
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
@@ -607,6 +615,24 @@ int main(int argc, char** argv)
         for (double s : spreads) mean_spread += s;
         mean_ratio  /= n;
         mean_spread /= n;
+        // Also report center_counts population status
+        {
+            const auto& cc = routing_counts;
+            int n_zero = 0, n_nonzero = 0;
+            long long cc_sum = 0, cc_min = INT_MAX, cc_max = 0;
+            for (int v : cc) {
+                if (v == 0) { ++n_zero; } else { ++n_nonzero; cc_sum += v; }
+                if (v < cc_min) cc_min = v;
+                if (v > cc_max) cc_max = v;
+            }
+            std::cout << "[Diag] center_counts: total=" << cc.size()
+                      << "  nonzero=" << n_nonzero
+                      << "  zero=" << n_zero
+                      << "  min=" << cc_min
+                      << "  max=" << cc_max
+                      << "  mean=" << (n_nonzero ? (double)cc_sum/n_nonzero : 0.0)
+                      << "\n";
+        }
         std::cout << "[Diag] Distance spread over " << n << " queries (knn=" << knn_diag << ")\n"
                   << "[Diag]   (d_max - d_0) / d_0 :  "
                   << "p5=" << pct(ratios, 0.05)
