@@ -20,6 +20,24 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
+    {"msturing-100M-random",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/msturing-100M-random.fbin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/runbook-msturing-100M-random.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/100000000/runbook-msturing-100M-random.yaml"},
+        }
+    },
+
+    {"msturing-100M-shift",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100M-msturing-shift.fbin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/msturing-100M-shift_runbookfinal.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100000000/msturing-100M-shift_runbookfinal.yaml"},
+        }
+    },
+
     {"sift-500M-clustered",
         {
             {"base_file", "TODO"},
