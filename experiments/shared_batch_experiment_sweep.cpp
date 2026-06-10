@@ -158,6 +158,11 @@ static constexpr size_t SAMPLE_SIZE          = 100000;
 // If the maximum tombstone ratio across all executor shards meets or exceeds
 // this threshold during a delta-rebuild event, a full rebuild is used instead.
 static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.5;
+// Write a checkpoint every this many runbook steps.  The new checkpoint is
+// fully written and fsync'd (via close()) before the previous one is removed,
+// so disk space is never exhausted by holding two copies simultaneously in the
+// typical case (unless a single checkpoint exceeds half the available space).
+static constexpr size_t CHECKPOINT_INTERVAL       = 50;
 
 // ─── Sweep parameter grids (visible to all ranks so loop counts agree) ───────
 static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 20, 40, 80};
@@ -434,6 +439,33 @@ static void bcastRoutingState(
     }
 }
 
+// ─── find_latest_checkpoint ──────────────────────────────────────────────────
+// Scan <ckpt_base> for subdirectories named "ckpt_s<N>" and return the path of
+// the one with the highest N.  Returns "" if the base directory does not exist
+// or contains no valid checkpoint subdirectories.
+static std::string find_latest_checkpoint(const std::string& ckpt_base)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(ckpt_base, ec) || ec) return "";
+
+    long long best_s  = -1;
+    std::string best_dir;
+    for (const auto& entry : std::filesystem::directory_iterator(ckpt_base, ec)) {
+        if (ec || !entry.is_directory()) continue;
+        const std::string name = entry.path().filename().string();
+        // Expect "ckpt_s<N>" where N is a non-negative integer.
+        if (name.size() <= 6 || name.substr(0, 6) != "ckpt_s") continue;
+        try {
+            long long n = std::stoll(name.substr(6));
+            // Validate: metadata.bin must exist and be readable.
+            const std::string meta = entry.path().string() + "/metadata.bin";
+            if (!std::filesystem::exists(meta)) continue;
+            if (n > best_s) { best_s = n; best_dir = entry.path().string(); }
+        } catch (...) {}
+    }
+    return best_dir;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
@@ -464,6 +496,15 @@ int main(int argc, char** argv)
     const int         k              = std::stoi(argv[4]);
     const std::string gt_prefix      = argv[5];
     const std::string output_file    = argv[6];
+    // Checkpoint base directory: strip the output file extension, append
+    // "_checkpoints".  Each checkpoint occupies its own subdirectory
+    // "ckpt_s<loop_index>" inside this base.
+    // E.g. "results/run/dataset_t6000.csv" → "results/run/dataset_t6000_checkpoints/"
+    const std::string ckpt_base = [&]{
+        const auto dot = output_file.rfind('.');
+        return (dot == std::string::npos ? output_file : output_file.substr(0, dot))
+               + "_checkpoints";
+    }();
     // Rebuild policy: always attempt delta (shadow-delete + replace_deleted insert).
     // Falls back to full if the tombstone ratio check fires (see TOMBSTONE_RATIO_THRESHOLD).
     const bool        use_delta_rebuild = true;
@@ -521,6 +562,44 @@ int main(int argc, char** argv)
     hnswlib::L2Space                  meta_space(dim);
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
+    // ── Checkpoint detection ──────────────────────────────────────────────────
+    // Rank 0 scans the checkpoint base directory for the highest "ckpt_s<N>"
+    // subdirectory that has a valid metadata.bin.  The loop index of the first
+    // step to execute on resume (next_s = s_of_checkpoint + 1) is broadcast
+    // to all ranks so both coordinator and executor enter the same code path.
+    //
+    // resume_s == 1  →  no checkpoint found, fresh start.
+    // resume_s >  1  →  resume from checkpoint ckpt_base/ckpt_s<resume_s-1>.
+    long long ckpt_resume_s_ll = 1LL;
+    if (rank == 0) {
+        const std::string found = find_latest_checkpoint(ckpt_base);
+        if (!found.empty()) {
+            std::ifstream meta(found + "/metadata.bin", std::ios::binary);
+            if (meta) {
+                size_t next_s; int step_num_v;
+                meta.read(reinterpret_cast<char*>(&next_s),    sizeof(next_s));
+                meta.read(reinterpret_cast<char*>(&step_num_v), sizeof(step_num_v));
+                ckpt_resume_s_ll = static_cast<long long>(next_s);
+                std::cout << "[Sweep] Found checkpoint " << found
+                          << "  --  resuming at loop s=" << next_s
+                          << " (last completed runbook step=" << step_num_v << ")\n";
+            } else {
+                std::cerr << "[Sweep] WARNING: checkpoint found at " << found
+                          << " but metadata.bin is unreadable; starting fresh.\n";
+            }
+        } else {
+            std::cout << "[Sweep] No checkpoint found; starting fresh.\n";
+        }
+    }
+    MPI_Bcast(&ckpt_resume_s_ll, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
+    const size_t resume_s  = static_cast<size_t>(ckpt_resume_s_ll);
+    const bool   resuming  = (resume_s > 1);
+    // All ranks reconstruct the resume checkpoint path from resume_s.
+    // (Checkpoint at loop index s stores next_s = s+1, so ckpt dir = ckpt_s<resume_s-1>.)
+    const std::string resume_ckpt = resuming
+        ? ckpt_base + "/ckpt_s" + std::to_string(resume_s - 1)
+        : "";
+
     // ══════════════════════════════════════════════════════════════════════════
     //                         PHASE 1 : INITIAL BUILD
     // ══════════════════════════════════════════════════════════════════════════
@@ -529,23 +608,33 @@ int main(int argc, char** argv)
         const RunbookStep& init = steps[0];
         const int init_n = init.end;
 
-        const size_t ss = std::min(static_cast<size_t>(init_n), SAMPLE_SIZE);
-        std::vector<float> sample = getSample(base_file, init_n, dim, ss);
-
         Coordinator metaIndex(dim, &comm, &logger);
-        metaIndex.setSampleData(sample.data(), ss);
-        metaIndex.build(NCENTERS, num_partitions, EF_CONSTRUCTION, M_META);
 
-        std::cout << "[Sweep] Distributing initial " << init_n << " vectors\n";
-        metaIndex.distribute_vectors(base_file, init_n, false, NUM_BUILDING_THREADS);
-        comm.broadcast_termination(world_size);
-        MPI_Barrier(MPI_COMM_WORLD);
-        std::cout << "[Sweep] Initial build complete\n";
-
-        comm.broadcast_ef_search(EF_SEARCH, world_size);
+        if (!resuming) {
+            // ── Phase 1: fresh build ──────────────────────────────────────────
+            const size_t ss = std::min(static_cast<size_t>(init_n), SAMPLE_SIZE);
+            std::vector<float> sample = getSample(base_file, init_n, dim, ss);
+            metaIndex.setSampleData(sample.data(), ss);
+            metaIndex.build(NCENTERS, num_partitions, EF_CONSTRUCTION, M_META);
+            std::cout << "[Sweep] Distributing initial " << init_n << " vectors\n";
+            metaIndex.distribute_vectors(base_file, init_n, false, NUM_BUILDING_THREADS);
+            comm.broadcast_termination(world_size);
+            MPI_Barrier(MPI_COMM_WORLD);
+            std::cout << "[Sweep] Initial build complete\n";
+            comm.broadcast_ef_search(EF_SEARCH, world_size);
+        } else {
+            // ── Phase 1: resume from checkpoint ──────────────────────────────
+            // Loads metaHNSW, partitions, center pos/counts, and the
+            // authoritative labels_to_centers.bin written during checkpointing.
+            std::cout << "[Sweep] Loading coordinator state from "
+                      << resume_ckpt << "/coordinator\n";
+            metaIndex.load(resume_ckpt + "/coordinator", EF_SEARCH);
+        }
 
         routing_hnsw = metaIndex.getMetaHNSW();
 
+        // Broadcast routing state to all executors (fresh or resume — same call).
+        // include_ltc=true so label_to_center is also synced on every rank.
         bcastRoutingState(rank, dim,
                           metaIndex.getMetaHNSW(),
                           &metaIndex.getPartitions(),
@@ -564,26 +653,33 @@ int main(int argc, char** argv)
         }
 
         // ── Open CSV ─────────────────────────────────────────────────────────
-        std::ofstream csv(output_file, std::ios::out);
+        // Fresh start: overwrite and write the header.
+        // Resume:      append (header already present from the previous run).
+        const auto csv_open_mode = resuming
+            ? (std::ios::out | std::ios::app)
+            : std::ios::out;
+        std::ofstream csv(output_file, csv_open_mode);
         if (!csv.is_open()) {
             std::cerr << "ERROR: cannot open output file: " << output_file << "\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        csv << "step,operation,mode,param"
-            << ",range_start,range_end,time_s,throughput,recall@" << k
-            << ",theoretical_recall@" << k
-            << ",avg_parts_searched"
-            << ",centers_moved,elements_moved"
-            << ",repart_hnsw_s,repart_bottom_s,repart_kaffpa_s,repart_relabel_s"
-            << ",exec_iterate_s,exec_exchange_s,exec_graph_s,dorebuild_wall_s"
-            // actual rebuild variant used ("full" or "delta"); empty for non-rebuild rows.
-            // may differ from the run-level rebuild_mode if tombstone ratio forced full.
-            << ",rebuild_type"
-            // delta-rebuild specific: total unreplaced tombstone slots across shards
-            // (-1 for full rebuilds; 0+ for delta rebuilds)
-            << ",remaining_deleted_slots";
-        for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_size";
-        csv << "\n";
+        if (!resuming) {
+            csv << "step,operation,mode,param"
+                << ",range_start,range_end,time_s,throughput,recall@" << k
+                << ",theoretical_recall@" << k
+                << ",avg_parts_searched"
+                << ",centers_moved,elements_moved"
+                << ",repart_hnsw_s,repart_bottom_s,repart_kaffpa_s,repart_relabel_s"
+                << ",exec_iterate_s,exec_exchange_s,exec_graph_s,dorebuild_wall_s"
+                // actual rebuild variant used ("full" or "delta"); empty for non-rebuild rows.
+                // may differ from the run-level rebuild_mode if tombstone ratio forced full.
+                << ",rebuild_type"
+                // delta-rebuild specific: total unreplaced tombstone slots across shards
+                // (-1 for full rebuilds; 0+ for delta rebuilds)
+                << ",remaining_deleted_slots";
+            for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_size";
+            csv << "\n";
+        }
 
         // ── Rebuild statistics struct ─────────────────────────────────────────
         struct RebuildStats {
@@ -662,8 +758,9 @@ int main(int argc, char** argv)
                               &meta_space, false);
         };
 
-        // Initial insert row (build not timed as a streaming operation).
-        {
+        // Initial insert row (written on fresh start only; on resume the row
+        // is already present in the CSV from the previous run).
+        if (!resuming) {
             auto sizes = collect_sizes();
             write_row(init.step_num, "insert", "", -1.0f,
                       init.start, init.end, 0.0, 0.0, -1.0, -1.0, -1.0,
@@ -673,7 +770,12 @@ int main(int argc, char** argv)
         // ══════════════════════════════════════════════════════════════════════
         //                    COORDINATOR STREAMING LOOP
         // ══════════════════════════════════════════════════════════════════════
-        for (size_t s = 1; s < steps.size(); s++) {
+        // On resume, last_ckpt_dir is initialised to the checkpoint we loaded so
+        // it is removed after the next checkpoint is successfully written.
+        // On a fresh start it remains empty until the first checkpoint is taken.
+        std::string last_ckpt_dir = resume_ckpt;
+
+        for (size_t s = resume_s; s < steps.size(); s++) {
             const RunbookStep& step = steps[s];
 
             int bcast_buf[3] = { step.step_num, step.start, step.end };
@@ -1297,6 +1399,84 @@ int main(int argc, char** argv)
                 MPI_Gather(&dummy, 1, MPI_UNSIGNED_LONG_LONG,
                            sizes_tmp.data(), 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             }
+
+            // ── CHECKPOINT ────────────────────────────────────────────────────
+            // Taken at the end of every CHECKPOINT_INTERVAL-th step so the
+            // binary can be restarted from a recent point after a failure.
+            // Protocol:
+            //   1. Write new checkpoint files (coordinator + executor sides).
+            //   2. MPI_Barrier — all ranks finish writing before any deletion.
+            //   3. Rank 0 removes the *previous* checkpoint directory.
+            //
+            // The new checkpoint is completely on disk before the old one is
+            // touched, so the system always has at least one valid checkpoint.
+            if (s % CHECKPOINT_INTERVAL == 0) {
+                const std::string ckpt_dir =
+                    ckpt_base + "/ckpt_s" + std::to_string(s);
+                const std::string coord_dir = ckpt_dir + "/coordinator";
+
+                std::cout << "[Sweep] Step " << step.step_num
+                          << "  checkpoint -> " << ckpt_dir << "\n";
+
+                // ── 1a. Write coordinator state ───────────────────────────────
+                std::filesystem::create_directories(coord_dir);
+
+                // Save meta-HNSW, partitions, center positions, center counts.
+                // (Coordinator::save() also writes labels_to_centers.bin but
+                // that file is stale — it is only populated at build time and
+                // never updated during streaming.  We overwrite it below.)
+                metaIndex.save(coord_dir);
+
+                // Overwrite labels_to_centers.bin with the authoritative map
+                // that is kept live via Allgatherv on every INSERT/DELETE step.
+                {
+                    std::ofstream ltc(coord_dir + "/labels_to_centers.bin",
+                                      std::ios::binary | std::ios::trunc);
+                    if (!ltc) {
+                        std::cerr << "[Sweep] ERROR: cannot write "
+                                  << coord_dir << "/labels_to_centers.bin\n";
+                    } else {
+                        const std::size_t n = label_to_center.size();
+                        ltc.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                        for (const auto& [key, val] : label_to_center) {
+                            ltc.write(reinterpret_cast<const char*>(&key), sizeof(key));
+                            ltc.write(reinterpret_cast<const char*>(&val), sizeof(val));
+                        }
+                    }
+                }
+
+                // Write metadata: loop index of the next step to execute on
+                // resume, and the corresponding runbook step_num for sanity.
+                {
+                    std::ofstream meta(ckpt_dir + "/metadata.bin",
+                                       std::ios::binary | std::ios::trunc);
+                    const size_t next_s    = s + 1;
+                    const int    step_num_v = step.step_num;
+                    meta.write(reinterpret_cast<const char*>(&next_s),    sizeof(next_s));
+                    meta.write(reinterpret_cast<const char*>(&step_num_v), sizeof(step_num_v));
+                }
+
+                // ── 1b. Executors write their shards (happens concurrently) ──
+                // (Executor side mirrors this block; see executor streaming loop.)
+
+                // ── 2. Barrier: all ranks finish writing ──────────────────────
+                MPI_Barrier(MPI_COMM_WORLD);
+
+                // ── 3. Remove the previous checkpoint (rank 0 only) ──────────
+                if (!last_ckpt_dir.empty() &&
+                        std::filesystem::exists(last_ckpt_dir)) {
+                    std::error_code ec;
+                    std::filesystem::remove_all(last_ckpt_dir, ec);
+                    if (ec)
+                        std::cerr << "[Sweep] WARNING: failed to remove old checkpoint "
+                                  << last_ckpt_dir << ": " << ec.message() << "\n";
+                    else
+                        std::cout << "[Sweep] Removed old checkpoint "
+                                  << last_ckpt_dir << "\n";
+                }
+                last_ckpt_dir = ckpt_dir;
+            }
+
         } // end coordinator streaming loop
 
         csv.close();
@@ -1309,31 +1489,40 @@ int main(int argc, char** argv)
 
         Executor subIndex(rank, dim, comm, &logger);
 
-        // Phase 1: receive initial vectors and build sub-HNSW.
-        {
-            bool done = false;
-            while (!done) {
+        if (!resuming) {
+            // Phase 1: receive initial vectors and build sub-HNSW.
+            {
+                bool done = false;
+                while (!done) {
+                    MessageHeader hdr;
+                    comm.recv_header(hdr, 0);
+                    if (hdr.type == END_OF_COMMUNICATION) { done = true; }
+                    else { assert(hdr.type == VECTOR_SEND); subIndex.receiveData(hdr.size); }
+                }
+            }
+            subIndex.build(EF_CONSTRUCTION, M_SUB, NUM_BUILDING_THREADS);
+            MPI_Barrier(MPI_COMM_WORLD);
+
+            {
                 MessageHeader hdr;
                 comm.recv_header(hdr, 0);
-                if (hdr.type == END_OF_COMMUNICATION) { done = true; }
-                else { assert(hdr.type == VECTOR_SEND); subIndex.receiveData(hdr.size); }
+                if (hdr.type == SET_EF_SEARCH) subIndex.setEfSearch(hdr.size);
             }
-        }
-        subIndex.build(EF_CONSTRUCTION, M_SUB, NUM_BUILDING_THREADS);
-        MPI_Barrier(MPI_COMM_WORLD);
-
-        {
-            MessageHeader hdr;
-            comm.recv_header(hdr, 0);
-            if (hdr.type == SET_EF_SEARCH) subIndex.setEfSearch(hdr.size);
+        } else {
+            // Phase 1: resume — load this executor's shard from checkpoint.
+            std::cout << "[Sweep Executor " << rank
+                      << "] Loading shard from " << resume_ckpt << "\n";
+            subIndex.load(resume_ckpt + "/shard", EF_SEARCH);
         }
 
+        // Receive routing state broadcast from coordinator (fresh or resume).
         bcastRoutingState(rank, dim, nullptr, nullptr, nullptr,
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
-        // Participate in initial-row size gather.
-        {
+        // Participate in initial-row size gather (fresh start only; on resume
+        // the gather was already done in the original run).
+        if (!resuming) {
             unsigned long long my_size = subIndex.getElementCount();
             MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                        nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
@@ -1342,7 +1531,10 @@ int main(int argc, char** argv)
         // ══════════════════════════════════════════════════════════════════════
         //                    EXECUTOR STREAMING LOOP
         // ══════════════════════════════════════════════════════════════════════
-        for (size_t s = 1; s < steps.size(); s++) {
+        // Mirrors the coordinator's tracking variable (see coordinator loop).
+        std::string last_ckpt_dir = resume_ckpt;
+
+        for (size_t s = resume_s; s < steps.size(); s++) {
             int op_code, bcast_buf[3];
             MPI_Bcast(&op_code,  1, MPI_INT, 0, MPI_COMM_WORLD);
             MPI_Bcast(bcast_buf, 3, MPI_INT, 0, MPI_COMM_WORLD);
@@ -1834,6 +2026,36 @@ int main(int argc, char** argv)
                 MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                            nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             }
+
+            // ── CHECKPOINT ────────────────────────────────────────────────────
+            // Symmetric with the coordinator block above.  Every executor saves
+            // its sub-HNSW shard, then joins the barrier so rank 0 knows all
+            // writes are complete before it removes the previous checkpoint.
+            if (s % CHECKPOINT_INTERVAL == 0) {
+                const std::string ckpt_dir =
+                    ckpt_base + "/ckpt_s" + std::to_string(s);
+
+                // Ensure the checkpoint directory exists (create_directories is
+                // idempotent; the coordinator may have created it first via NFS,
+                // or we may arrive first — either way is fine).
+                std::filesystem::create_directories(ckpt_dir);
+
+                // Save this executor's sub-HNSW shard.
+                // Executor::save(prefix) appends "_<rank>.bin" to prefix.
+                subIndex.save(ckpt_dir + "/shard");
+
+                // ── Barrier: wait for coordinator + all other executors ───────
+                // Must be the SAME barrier as on the coordinator side; both
+                // loops iterate the same s values so this always matches.
+                MPI_Barrier(MPI_COMM_WORLD);
+
+                // Deletion of the old checkpoint is handled by rank 0 after
+                // the barrier.  Executors just track the current dir so they
+                // could optionally clean up their own stale shard file if the
+                // rank-0 remove_all ever fails (currently rank 0 removes all).
+                last_ckpt_dir = ckpt_dir;
+            }
+
         } // end executor streaming loop
 
         std::cout << "[Sweep Executor " << rank << "] Done.\n";
