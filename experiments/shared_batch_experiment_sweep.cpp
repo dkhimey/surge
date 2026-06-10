@@ -16,9 +16,9 @@
 //  TOMBSTONE_RATIO_THRESHOLD (currently 0.5 = 50% unused slots).
 //
 // ─── Sweep parameter grids ───────────────────────────────────────────────────
-//  BranchingFactor : {1, 2, 5, 10, 15, 20, 25, 30}
-//  NProbe          : {1, 2, 3, 4, 5, 6, 7, 8, 9}
-//  RecallTarget    : {0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.97, 0.98, 0.99}
+//  BranchingFactor : {20, 25, 30, 40, 50, 60, 80}
+//  NProbe          : {5, 6, 7, 8, 9}
+//  RecallTarget    : {0.85, 0.90, 0.95, 0.97, 0.98, 0.99}
 //
 // ─── Output CSV columns ──────────────────────────────────────────────────────
 //  All rows:
@@ -165,10 +165,9 @@ static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.5;
 static constexpr size_t CHECKPOINT_INTERVAL       = 50;
 
 // ─── Sweep parameter grids (visible to all ranks so loop counts agree) ───────
-static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 20, 40, 80};
-static const std::vector<int>   NPROBE_PARAMS           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-static const std::vector<float> TARGET_PARAMS           = {.6f, .7f, .75f, .8f, .85f,
-                                                            .9f, .95f, .97f, .98f, .99f};
+static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {20, 40, 60, 80};
+static const std::vector<int>   NPROBE_PARAMS           = {5, 6, 7, 8, 9};
+static const std::vector<float> TARGET_PARAMS           = {.90f, .95f, .97f, .99f};
 
 // Build the ordered (mode, param) list once.  Both coordinator and executor
 // iterate this same list so their MPI collective calls stay in lockstep.
