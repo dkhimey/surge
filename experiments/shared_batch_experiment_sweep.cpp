@@ -496,14 +496,13 @@ int main(int argc, char** argv)
     const std::string gt_prefix      = argv[5];
     const std::string output_file    = argv[6];
     // Checkpoint base directory: strip the output file extension, append
-    // "_checkpoints".  Each checkpoint occupies its own subdirectory
-    // "ckpt_s<loop_index>" inside this base.
-    // E.g. "results/run/dataset_t6000.csv" → "results/run/dataset_t6000_checkpoints/"
-    const std::string ckpt_base = [&]{
-        const auto dot = output_file.rfind('.');
-        return (dot == std::string::npos ? output_file : output_file.substr(0, dot))
-               + "_checkpoints";
-    }();
+    // Checkpoint base directory: stable across runs so that a restarted run
+    // automatically resumes from the previous run's checkpoint even when the
+    // output file path changes (e.g. due to a new timestamp in results/).
+    // Path: checkpoints/<dataset_name>_t<full_threshold>/
+    // E.g.  checkpoints/msturing-100M-clustered_t6000/
+    const std::string ckpt_base =
+        "checkpoints/" + dataset_name + "_t" + std::to_string(full_threshold);
     // Rebuild policy: always attempt delta (shadow-delete + replace_deleted insert).
     // Falls back to full if the tombstone ratio check fires (see TOMBSTONE_RATIO_THRESHOLD).
     const bool        use_delta_rebuild = true;
@@ -653,11 +652,9 @@ int main(int argc, char** argv)
 
         // ── Open CSV ─────────────────────────────────────────────────────────
         // Fresh start: overwrite and write the header.
-        // Resume:      append (header already present from the previous run).
-        const auto csv_open_mode = resuming
-            ? (std::ios::out | std::ios::app)
-            : std::ios::out;
-        std::ofstream csv(output_file, csv_open_mode);
+        // Always open in append mode: safe for both fresh starts (empty file)
+        // and resumes (header already present from previous run).
+        std::ofstream csv(output_file, std::ios::out | std::ios::app);
         if (!csv.is_open()) {
             std::cerr << "ERROR: cannot open output file: " << output_file << "\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
