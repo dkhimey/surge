@@ -773,6 +773,7 @@ int main(int argc, char** argv)
         // it is removed after the next checkpoint is successfully written.
         // On a fresh start it remains empty until the first checkpoint is taken.
         std::string last_ckpt_dir = resume_ckpt;
+        int my_ckpt_write_ok = 1;  // set in checkpoint block; used by Allreduce
 
         for (size_t s = resume_s; s < steps.size(); s++) {
             const RunbookStep& step = steps[s];
@@ -1458,20 +1459,44 @@ int main(int argc, char** argv)
                 // ── 1b. Executors write their shards (happens concurrently) ──
                 // (Executor side mirrors this block; see executor streaming loop.)
 
-                // ── 2. Barrier: all ranks finish writing ──────────────────────
+                // Verify coordinator writes succeeded (metadata.bin is last written).
+                {
+                    std::error_code ec;
+                    const auto sz = std::filesystem::file_size(
+                        ckpt_dir + "/metadata.bin", ec);
+                    my_ckpt_write_ok = (!ec && sz > 0) ? 1 : 0;
+                }
+                if (!my_ckpt_write_ok)
+                    std::cerr << "[Sweep] WARNING: coordinator checkpoint write failed "
+                              << "at " << ckpt_dir << "\n";
+
+                // ── 2. Barrier + all-ranks write validation ───────────────────
+                // Each rank reports whether its own write succeeded (1/0).
+                // MPI_Allreduce(MIN) gives 1 only if ALL ranks wrote successfully.
+                // If any rank failed (e.g. disk full), deletion is skipped so the
+                // previous checkpoint is kept as a valid fallback.
                 MPI_Barrier(MPI_COMM_WORLD);
+                int all_ckpt_writes_ok = 0;
+                MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
+                              1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
                 // ── 3. Remove the previous checkpoint (rank 0 only) ──────────
-                if (!last_ckpt_dir.empty() &&
-                        std::filesystem::exists(last_ckpt_dir)) {
-                    std::error_code ec;
-                    std::filesystem::remove_all(last_ckpt_dir, ec);
-                    if (ec)
-                        std::cerr << "[Sweep] WARNING: failed to remove old checkpoint "
-                                  << last_ckpt_dir << ": " << ec.message() << "\n";
-                    else
-                        std::cout << "[Sweep] Removed old checkpoint "
-                                  << last_ckpt_dir << "\n";
+                if (all_ckpt_writes_ok) {
+                    if (!last_ckpt_dir.empty() &&
+                            std::filesystem::exists(last_ckpt_dir)) {
+                        std::error_code ec;
+                        std::filesystem::remove_all(last_ckpt_dir, ec);
+                        if (ec)
+                            std::cerr << "[Sweep] WARNING: failed to remove old checkpoint "
+                                      << last_ckpt_dir << ": " << ec.message() << "\n";
+                        else
+                            std::cout << "[Sweep] Removed old checkpoint "
+                                      << last_ckpt_dir << "\n";
+                    }
+                } else {
+                    std::cout << "[Sweep] WARNING: new checkpoint incomplete "
+                              << "(disk full on some node?); keeping old checkpoint "
+                              << last_ckpt_dir << " as fallback.\n";
                 }
                 last_ckpt_dir = ckpt_dir;
             }
@@ -2040,18 +2065,35 @@ int main(int argc, char** argv)
                 std::filesystem::create_directories(ckpt_dir);
 
                 // Save this executor's sub-HNSW shard.
-                // Executor::save(prefix) appends "_<rank>.bin" to prefix.
-                subIndex.save(ckpt_dir + "/shard");
+                // Executor::save(prefix) appends "_<rank>.bin" to prefix and
+                // returns the full path written.
+                const std::string shard_path = subIndex.save(ckpt_dir + "/shard");
 
-                // ── Barrier: wait for coordinator + all other executors ───────
-                // Must be the SAME barrier as on the coordinator side; both
-                // loops iterate the same s values so this always matches.
+                // Verify the shard file was written successfully.
+                std::error_code shard_ec;
+                const auto shard_sz = std::filesystem::file_size(shard_path, shard_ec);
+                int my_ckpt_write_ok = (!shard_ec && shard_sz > 0) ? 1 : 0;
+                if (!my_ckpt_write_ok)
+                    std::cerr << "[Sweep Executor " << rank
+                              << "] WARNING: shard write failed or empty: "
+                              << shard_path << " (disk full?)\n";
+
+                // ── Barrier + all-ranks write validation ──────────────────────
+                // Matches the coordinator's barrier exactly.
                 MPI_Barrier(MPI_COMM_WORLD);
+                int all_ckpt_writes_ok = 0;
+                MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
+                              1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
-                // Deletion of the old checkpoint is handled by rank 0 after
-                // the barrier.  Executors just track the current dir so they
-                // could optionally clean up their own stale shard file if the
-                // rank-0 remove_all ever fails (currently rank 0 removes all).
+                // ── Delete old checkpoint (this rank's local copy) ────────────
+                // Only delete if ALL ranks confirmed successful writes.
+                // ~/surge may be local to each node rather than NFS-shared, so
+                // every rank removes the old checkpoint independently.
+                // On NFS this is idempotent (remove_all on a missing path is a no-op).
+                if (all_ckpt_writes_ok && !last_ckpt_dir.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove_all(last_ckpt_dir, ec);
+                }
                 last_ckpt_dir = ckpt_dir;
             }
 
