@@ -94,11 +94,12 @@ public:
     // std::vector<size_t> getPartition(float* vec, int n = 1, float* dist = nullptr);
     
     std::vector<int> distribute_vectors(
-        const std::string& base_file, 
-        int total_vectors, 
+        const std::string& base_file,
+        int total_vectors,
         bool log_partitions,
         int num_threads = -1,
-        std::vector<int>* preassigned_partitions = nullptr
+        std::vector<int>* preassigned_partitions = nullptr,
+        int start_offset = 0
     );
 
     int rePartition(

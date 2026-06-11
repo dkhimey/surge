@@ -489,7 +489,7 @@ typedef struct Log {
 
 FileFormat getFileFormat(const std::string& filename);
 std::pair<int, int> get_dataset_info(const std::string& base_file);
-std::vector<float> getSample(const std::string& filename, size_t max_elements, size_t dim, size_t sample_size);
+std::vector<float> getSample(const std::string& filename, size_t max_elements, size_t dim, size_t sample_size, size_t start_offset = 0);
 std::vector<float> readFvecs(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);
 std::vector<float> readBvecs(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);
 std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int n = INT_MAX, int offset = 0);

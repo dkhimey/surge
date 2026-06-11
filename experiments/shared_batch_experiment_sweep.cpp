@@ -543,8 +543,8 @@ int main(int argc, char** argv)
     // ── Runbook ──────────────────────────────────────────────────────────────
     const std::string runbook_path = DATASETS[dataset_name]["runbook"];
     std::vector<RunbookStep> steps = parse_runbook(runbook_path, dataset_name);
-    if (steps.empty() || steps[0].operation != "insert" || steps[0].start != 0) {
-        if (rank == 0) std::cerr << "ERROR: runbook must begin with insert at start=0\n";
+    if (steps.empty() || steps[0].operation != "insert") {
+        if (rank == 0) std::cerr << "ERROR: runbook must begin with an insert step\n";
         MPI_Finalize(); return 1;
     }
 
@@ -604,18 +604,19 @@ int main(int argc, char** argv)
 
     if (rank == 0) {
         const RunbookStep& init = steps[0];
-        const int init_n = init.end;
+        const int init_start = init.start;
+        const int init_n     = init.end - init.start;
 
         Coordinator metaIndex(dim, &comm, &logger);
 
         if (!resuming) {
             // ── Phase 1: fresh build ──────────────────────────────────────────
             const size_t ss = std::min(static_cast<size_t>(init_n), SAMPLE_SIZE);
-            std::vector<float> sample = getSample(base_file, init_n, dim, ss);
+            std::vector<float> sample = getSample(base_file, init_n, dim, ss, init_start);
             metaIndex.setSampleData(sample.data(), ss);
             metaIndex.build(NCENTERS, num_partitions, EF_CONSTRUCTION, M_META);
-            std::cout << "[Sweep] Distributing initial " << init_n << " vectors\n";
-            metaIndex.distribute_vectors(base_file, init_n, false, NUM_BUILDING_THREADS);
+            std::cout << "[Sweep] Distributing initial " << init_n << " vectors (offset " << init_start << ")\n";
+            metaIndex.distribute_vectors(base_file, init_n, false, NUM_BUILDING_THREADS, nullptr, init_start);
             comm.broadcast_termination(world_size);
             MPI_Barrier(MPI_COMM_WORLD);
             std::cout << "[Sweep] Initial build complete\n";

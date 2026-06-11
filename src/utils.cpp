@@ -166,12 +166,12 @@ std::pair<int, int> get_dataset_info(const std::string& base_file) {
     }
 }
 
-std::vector<float> getSample(const std::string& filename, size_t max_elements, size_t dim, size_t sample_size) {
+std::vector<float> getSample(const std::string& filename, size_t max_elements, size_t dim, size_t sample_size, size_t start_offset) {
     std::mt19937 gen(std::random_device{}());
     FileFormat filetype = getFileFormat(filename);
 
     std::vector<int> indices(max_elements);
-    std::iota(indices.begin(), indices.end(), 0);
+    std::iota(indices.begin(), indices.end(), static_cast<int>(start_offset));
 
     std::vector<int> sampled_indices;
     std::sample(indices.begin(), indices.end(), std::back_inserter(sampled_indices),

@@ -479,11 +479,12 @@ std::vector<size_t> Coordinator::getPartitionsForDelete_(size_t label) {
 }
 
 std::vector<int> Coordinator::distribute_vectors(
-        const std::string& base_file, 
-        int total_vectors, 
+        const std::string& base_file,
+        int total_vectors,
         bool log_partitions,
         int num_threads,
-        std::vector<int>* preassigned_partitions
+        std::vector<int>* preassigned_partitions,
+        int start_offset
     ) {
     bool partitions_assigned = (preassigned_partitions != nullptr);
     if (num_threads == -1){
@@ -510,14 +511,14 @@ std::vector<int> Coordinator::distribute_vectors(
     {
         int tid = omp_get_thread_num();
         // std::cout << "[Coordinator] Thread " << tid << " started for distributing vectors\n";
-        int thread_start = tid * vectors_per_thread;
-        int thread_end = std::min(thread_start + vectors_per_thread, total_vectors);
+        int thread_start = start_offset + tid * vectors_per_thread;
+        int thread_end = std::min(thread_start + vectors_per_thread, start_offset + total_vectors);
 
 
         // std::cout << "[Coordinator] Thread " << tid << " processing vectors " << thread_start << " to " << thread_end << "\n";
         for (int global_index = thread_start; global_index < thread_end; global_index += VECTOR_BATCH_SIZE) {
-            if (tid == 0 && global_index % 10000 == 0)
-                std::cout << "[Coordinator] - still sending " << MPI_Wtime() << "\n"; 
+            if (tid == 0 && (global_index - start_offset) % 10000 == 0)
+                std::cout << "[Coordinator] - still sending " << MPI_Wtime() << "\n";
             int num_to_read = std::min(VECTOR_BATCH_SIZE, thread_end - global_index);
             std::vector<float> X = readVecs(base_file, dim_, num_to_read, global_index);
 
