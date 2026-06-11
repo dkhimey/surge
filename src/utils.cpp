@@ -11,6 +11,24 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
+    {"bigann-100M-random",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-random/bigann-100M-random.u8bin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-random/runbook-bigann-100M-random.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-random/query.public.10K.u8bin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-random/100000000/runbook-bigann-100M-random.yaml"},
+        }
+    },
+
+    {"bigann-100M-shift",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-shift/100M-bigann-shift.u8bin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-shift/bigann-100M-shift_runbookfinal.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-shift/query.public.10K.u8bin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-shift/100000000/bigann-100M-shift_runbookfinal.yaml"},
+        }
+    },
+
     {"msturing-100M-clustered",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100M-msturing-clustered.fbin"},
