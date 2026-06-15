@@ -327,6 +327,11 @@ public:
     // Returns 0 before the first delta rebuild.
     size_t getLastRebuildRemainingDeleted() const { return last_rebuild_remaining_deleted_; }
 
+    // Labels of vectors that arrived at this executor during the most recent
+    // reBuild() / reBuildDelta() exchange.  Populated before REBUILD_SUCCESS is
+    // sent so the accessor is valid as soon as the rebuild call returns.
+    const std::vector<int>& getLastRebuildMovedLabels() const { return last_rebuild_moved_labels_; }
+
     void batch_search(size_t num_queries, size_t k, int tag);
 
     void reBuild(
@@ -397,4 +402,8 @@ private:
     // With allow_replace_deleted=true, this equals sub_HNSW_->deleted_elements.size()
     // immediately after all insertions complete.
     size_t last_rebuild_remaining_deleted_ = 0;
+
+    // Arrived labels from the most recent rebuild exchange, for sweep-side
+    // label_to_shard synchronisation via Allgatherv after each rebuild.
+    std::vector<int> last_rebuild_moved_labels_;
 };

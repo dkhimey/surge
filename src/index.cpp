@@ -1974,9 +1974,10 @@ void Executor::reBuild(
 
     // Cache per-phase timings before notifying coordinator (so getters are
     // valid as soon as reBuild() returns on the experiment side).
-    last_rebuild_iterate_s_  = end_iter     - start_iter;
-    last_rebuild_exchange_s_ = end_exchange - start_exchange;
-    last_rebuild_graph_s_    = end_hnsw     - start_hnsw;
+    last_rebuild_iterate_s_     = end_iter     - start_iter;
+    last_rebuild_exchange_s_    = end_exchange - start_exchange;
+    last_rebuild_graph_s_       = end_hnsw     - start_hnsw;
+    last_rebuild_moved_labels_  = std::move(all_recv_labels);
 
     MessageHeader header; header.type = REBUILD_SUCCESS;
     MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS, MPI_COMM_WORLD);
@@ -2215,6 +2216,7 @@ void Executor::reBuildDelta(
     last_rebuild_iterate_s_         = end_iter     - start_iter;
     last_rebuild_exchange_s_        = end_exchange - start_exchange;
     last_rebuild_graph_s_           = end_hnsw     - start_hnsw;
+    last_rebuild_moved_labels_      = std::move(flat_recv_labels);
 
     delete metaHNSW;
 

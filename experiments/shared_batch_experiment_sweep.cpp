@@ -239,7 +239,8 @@ static std::set<int> routeQuery(
     int                              num_partitions,
     RoutingMode                      mode,
     float                            param,
-    const std::vector<int>&          center_counts)
+    const std::vector<int>&          center_counts,
+    const std::vector<int>&          part_size)
 {
     std::set<int> target_ranks;
 
@@ -284,32 +285,17 @@ static std::set<int> routeQuery(
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
-        // Scale-invariant weights: normalize by nearest-center distance.
-        // Per-cluster membership count is the size prior — matching
-        // Coordinator::getPartitionsForSearch_RecallTgt_.
-        // If center_counts is empty or all-zero (e.g. theoretical routing
-        // without any inserted vectors), fall back to the number of centers
-        // per partition, which is always derivable from partitions[].
+        // Size weight: number of routing centers per partition (precomputed by
+        // caller), matching compute_theoretical_recall_updated.py
+        // (part_size = np.bincount(partitions)).
         const double d0 = static_cast<double>(centers[0].first) + 1e-10;
-
-        bool counts_live = false;
-        if (!center_counts.empty()) {
-            for (int c : center_counts) { if (c > 0) { counts_live = true; break; } }
-        }
-        std::vector<int> part_size;
-        if (!counts_live) {
-            part_size.assign(static_cast<size_t>(num_partitions), 0);
-            for (int p : partitions) ++part_size[static_cast<size_t>(p)];
-        }
 
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
             const double rel_d   = static_cast<double>(centers[r].first) / d0;
             const int    cid     = static_cast<int>(centers[r].second);
             const int    pid     = partitions[cid];
-            const double size_wt = counts_live
-                ? static_cast<double>(center_counts[static_cast<size_t>(cid)])
-                : static_cast<double>(part_size[static_cast<size_t>(pid)]);
+            const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
             part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-1.0 * rel_d);
         }
 
@@ -550,6 +536,7 @@ int main(int argc, char** argv)
 
     // ── Shared routing state (all ranks) ─────────────────────────────────────
     std::unordered_map<int,int>       label_to_center;
+    std::unordered_map<int,int>       label_to_shard;    // label → executor rank (1..P); exact even after delta rebuilds
     std::vector<int>                  routing_partitions;
     std::vector<int>                  routing_center_counts;  // center_id → active vector count
     hnswlib::L2Space                  meta_space(dim);
@@ -635,6 +622,48 @@ int main(int argc, char** argv)
                           &metaIndex.getLabelToCenter(),
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
+
+        // ── Populate label_to_shard ───────────────────────────────────────────
+        // label_to_shard[label] = executor_rank tracks exact ownership so deletes
+        // can be routed without throwing exceptions in hnswlib.
+        if (!resuming) {
+            // Fresh start: label_to_center is accurate — derive label_to_shard.
+            for (auto& [lbl, cid] : label_to_center)
+                if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
+                    label_to_shard[lbl] = routing_partitions[cid] + 1;
+        } else {
+            // Resume: load saved label_to_shard (accurate even after delta rebuilds).
+            {
+                std::ifstream lts(resume_ckpt + "/coordinator/labels_to_shards.bin",
+                                  std::ios::binary);
+                if (lts) {
+                    size_t n = 0; lts.read(reinterpret_cast<char*>(&n), sizeof(n));
+                    label_to_shard.reserve(n);
+                    for (size_t i = 0; i < n; i++) {
+                        int key, val;
+                        lts.read(reinterpret_cast<char*>(&key), sizeof(key));
+                        lts.read(reinterpret_cast<char*>(&val), sizeof(val));
+                        label_to_shard[key] = val;
+                    }
+                } else {
+                    std::cerr << "[Sweep] WARNING: labels_to_shards.bin not found; "
+                              << "deriving label_to_shard from label_to_center "
+                              << "(may be stale for vectors moved during prior delta rebuilds)\n";
+                    for (auto& [lbl, cid] : label_to_center)
+                        if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
+                            label_to_shard[lbl] = routing_partitions[cid] + 1;
+                }
+            }
+            // Broadcast to executors so all ranks share the same label_to_shard.
+            {
+                int n_lts = static_cast<int>(label_to_shard.size());
+                MPI_Bcast(&n_lts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
+                { int i = 0; for (auto& [k, v] : label_to_shard) { lts_keys[i] = k; lts_vals[i] = v; ++i; } }
+                MPI_Bcast(lts_keys.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
+                MPI_Bcast(lts_vals.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
+            }
+        }
 
         // ── Static ground truth ───────────────────────────────────────────────
         std::vector<std::vector<int>> static_gt;
@@ -750,6 +779,29 @@ int main(int argc, char** argv)
                               &meta_space, false);
         };
 
+        // ── Helper: sync label_to_shard after rebuild (coordinator side) ──────
+        // Each executor reports labels of vectors that arrived during the rebuild
+        // exchange via Allgatherv.  The coordinator contributes 0 labels and
+        // updates its label_to_shard from the received data.
+        // Must be called on ALL ranks (matching the executor-side lambda below)
+        // after every rebuild + bcastRoutingState sequence.
+        auto sync_label_to_shard_after_rebuild_coord = [&]() {
+            int my_n = 0;
+            std::vector<int> all_ns(world_size);
+            MPI_Allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+            std::vector<int> displs(world_size, 0);
+            for (int r = 1; r < world_size; r++) displs[r] = displs[r-1] + all_ns[r-1];
+            const int total_moved = displs[world_size-1] + all_ns[world_size-1];
+            std::vector<int> all_moved(total_moved);
+            int dummy = 0;
+            MPI_Allgatherv(&dummy, 0, MPI_INT,
+                           all_moved.data(), all_ns.data(), displs.data(),
+                           MPI_INT, MPI_COMM_WORLD);
+            for (int r = 0; r < world_size; r++)
+                for (int i = displs[r]; i < displs[r] + all_ns[r]; i++)
+                    label_to_shard[all_moved[i]] = r;
+        };
+
         // Initial insert row (written on fresh start only; on resume the row
         // is already present in the CSV from the previous run).
         if (!resuming) {
@@ -853,6 +905,12 @@ int main(int argc, char** argv)
                                    MPI_INT, MPI_COMM_WORLD);
                     for (int i = 0; i < total; i++)
                         label_to_center[all_labels[i]] = all_centers[i];
+                    // Mirror into label_to_shard (routing_partitions is valid here).
+                    for (int i = 0; i < total; i++) {
+                        const int cid = all_centers[i];
+                        if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
+                            label_to_shard[all_labels[i]] = routing_partitions[cid] + 1;
+                    }
                 }
 
                 const double t1 = MPI_Wtime();
@@ -936,6 +994,9 @@ int main(int argc, char** argv)
                         rb_stats.remaining_deleted_slots = del_recv;
                     }
 
+                    // Sync label_to_shard: each executor reports its arrived labels.
+                    sync_label_to_shard_after_rebuild_coord();
+
                     const double total_rb_s = rb_stats.repart_hnsw_s + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
@@ -983,8 +1044,9 @@ int main(int argc, char** argv)
                 for (int i = 0; i < n_delete; i++) {
                     const int cid = del_center_ids[i];
                     if (cid == -1) continue;
-                    // Coordinator has no shard — only erases from label_to_center.
+                    // Coordinator has no shard — only erases from routing maps.
                     label_to_center.erase(step.start + i);
+                    label_to_shard.erase(step.start + i);
                 }
 
                 const double t1 = MPI_Wtime();
@@ -1074,6 +1136,9 @@ int main(int argc, char** argv)
                                    MPI_SUM, 0, MPI_COMM_WORLD);
                         rb_stats.remaining_deleted_slots = del_recv;
                     }
+
+                    // Sync label_to_shard: each executor reports its arrived labels.
+                    sync_label_to_shard_after_rebuild_coord();
 
                     const double total_rb_s = rb_stats.repart_hnsw_s + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
@@ -1200,6 +1265,12 @@ int main(int argc, char** argv)
                 std::vector<ComboResult> combo_results;
                 combo_results.reserve(n_combos);
 
+                // Precompute once: number of routing centers per partition.
+                // Passed into routeQuery so RecallTarget mode doesn't recompute
+                // this per-query.  Matches np.bincount(partitions) in the Python.
+                std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
+                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
+
                 for (int ci = 0; ci < n_combos; ci++) {
                     const auto& [sweep_mode, sweep_param] = sweep_combos[ci];
                     const std::string sweep_mode_str = mode_to_string(sweep_mode);
@@ -1226,7 +1297,7 @@ int main(int argc, char** argv)
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
                                 num_partitions, sweep_mode, sweep_param,
-                                routing_center_counts);
+                                routing_center_counts, routing_part_size);
                             thread_parts += static_cast<long long>(targets.size());
                             for (int tgt : targets) {
                                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
@@ -1438,6 +1509,26 @@ int main(int argc, char** argv)
                     }
                 }
 
+                // Save label_to_shard for accurate resume.
+                // Mirrors labels_to_centers.bin but stores executor ranks instead
+                // of center IDs, so resume does not depend on deriving ownership
+                // from a potentially stale label_to_center.
+                {
+                    std::ofstream lts(coord_dir + "/labels_to_shards.bin",
+                                      std::ios::binary | std::ios::trunc);
+                    if (!lts) {
+                        std::cerr << "[Sweep] ERROR: cannot write "
+                                  << coord_dir << "/labels_to_shards.bin\n";
+                    } else {
+                        const std::size_t n = label_to_shard.size();
+                        lts.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                        for (const auto& [key, val] : label_to_shard) {
+                            lts.write(reinterpret_cast<const char*>(&key), sizeof(key));
+                            lts.write(reinterpret_cast<const char*>(&val), sizeof(val));
+                        }
+                    }
+                }
+
                 // Write metadata: loop index of the next step to execute on
                 // resume, and the corresponding runbook step_num for sanity.
                 {
@@ -1537,6 +1628,23 @@ int main(int argc, char** argv)
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
+        // ── Populate label_to_shard ───────────────────────────────────────────
+        if (!resuming) {
+            // Fresh start: label_to_center is accurate — derive label_to_shard.
+            for (auto& [lbl, cid] : label_to_center)
+                if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
+                    label_to_shard[lbl] = routing_partitions[cid] + 1;
+        } else {
+            // Resume: receive label_to_shard broadcast from coordinator.
+            int n_lts = 0;
+            MPI_Bcast(&n_lts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
+            MPI_Bcast(lts_keys.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
+            MPI_Bcast(lts_vals.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
+            label_to_shard.reserve(n_lts);
+            for (int j = 0; j < n_lts; j++) label_to_shard[lts_keys[j]] = lts_vals[j];
+        }
+
         // Participate in initial-row size gather (fresh start only; on resume
         // the gather was already done in the original run).
         if (!resuming) {
@@ -1544,6 +1652,27 @@ int main(int argc, char** argv)
             MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                        nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
         }
+
+        // ── Helper: sync label_to_shard after rebuild (executor side) ───────────
+        // Contributes this executor's arrived labels via Allgatherv so all ranks
+        // update label_to_shard correctly.  Must match the coordinator-side lambda.
+        auto sync_label_to_shard_after_rebuild_exec = [&]() {
+            const auto& arrived = subIndex.getLastRebuildMovedLabels();
+            const int my_n = static_cast<int>(arrived.size());
+            std::vector<int> all_ns(world_size);
+            MPI_Allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+            std::vector<int> displs(world_size, 0);
+            for (int r = 1; r < world_size; r++) displs[r] = displs[r-1] + all_ns[r-1];
+            const int total_moved = displs[world_size-1] + all_ns[world_size-1];
+            std::vector<int> all_moved(total_moved);
+            int dummy = 0;
+            MPI_Allgatherv(arrived.empty() ? &dummy : arrived.data(), my_n, MPI_INT,
+                           all_moved.data(), all_ns.data(), displs.data(),
+                           MPI_INT, MPI_COMM_WORLD);
+            for (int r = 0; r < world_size; r++)
+                for (int i = displs[r]; i < displs[r] + all_ns[r]; i++)
+                    label_to_shard[all_moved[i]] = r;
+        };
 
         // ══════════════════════════════════════════════════════════════════════
         //                    EXECUTOR STREAMING LOOP
@@ -1644,6 +1773,12 @@ int main(int argc, char** argv)
                                    MPI_INT, MPI_COMM_WORLD);
                     for (int i = 0; i < total; i++)
                         label_to_center[all_labels[i]] = all_centers[i];
+                    // Mirror into label_to_shard (routing_partitions is valid here).
+                    for (int i = 0; i < total; i++) {
+                        const int cid = all_centers[i];
+                        if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
+                            label_to_shard[all_labels[i]] = routing_partitions[cid] + 1;
+                    }
                 }
 
                 {
@@ -1698,6 +1833,8 @@ int main(int argc, char** argv)
                         MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0, MPI_COMM_WORLD);
                     }
+                    // Sync label_to_shard: report arrived labels to all ranks.
+                    sync_label_to_shard_after_rebuild_exec();
                 }
 
                 {
@@ -1724,15 +1861,19 @@ int main(int argc, char** argv)
                     const int label = range_start + i;
                     const int cid   = del_center_ids[i];
                     if (cid == -1) continue;
-                    // Every executor attempts every label.  The one that actually
-                    // holds the vector will succeed; the others get "Label not
-                    // found" from hnswlib and markDeleteLocalBatch silently skips
-                    // them.  This is correct even after a delta rebuild where
-                    // reBuildDelta may have reclassified a vector to a different
-                    // nearest center than label_to_center records, making
-                    // routing_partitions[cid]-based filtering unreliable.
-                    my_delete_labels.push_back(label);
                     label_to_center.erase(label);
+                    auto it = label_to_shard.find(label);
+                    if (it != label_to_shard.end()) {
+                        // label_to_shard is accurate even after delta rebuilds:
+                        // only the owning executor calls markDelete.
+                        if (it->second == rank)
+                            my_delete_labels.push_back(label);
+                        label_to_shard.erase(it);
+                    } else {
+                        // Fallback: label_to_shard entry missing (shouldn't happen
+                        // in steady state; could occur with a pre-fix checkpoint).
+                        my_delete_labels.push_back(label);
+                    }
                 }
                 subIndex.markDeleteLocalBatch(my_delete_labels);
 
@@ -1788,6 +1929,8 @@ int main(int argc, char** argv)
                         MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0, MPI_COMM_WORLD);
                     }
+                    // Sync label_to_shard: report arrived labels to all ranks.
+                    sync_label_to_shard_after_rebuild_exec();
                 }
 
                 {
@@ -1857,6 +2000,10 @@ int main(int argc, char** argv)
                     }
                 }
 
+                // Precompute once: number of routing centers per partition (mirrors coordinator).
+                std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
+                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
+
                 // Run once per combo — must match coordinator's combo loop exactly.
                 for (int ci = 0; ci < n_combos; ci++) {
                     const auto& [sweep_mode_ex, sweep_param_ex] = sweep_combos[ci];
@@ -1883,7 +2030,7 @@ int main(int argc, char** argv)
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
                                 num_partitions, sweep_mode_ex, sweep_param_ex,
-                                routing_center_counts);
+                                routing_center_counts, routing_part_size);
                             thread_parts += static_cast<long long>(targets.size());
                             for (int tgt : targets) {
                                 local_qids[tgt].push_back(static_cast<uint32_t>(q));
