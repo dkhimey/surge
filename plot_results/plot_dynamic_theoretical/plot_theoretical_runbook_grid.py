@@ -415,6 +415,8 @@ def _stacked_columns(groups):
 
 
 def build_figure(mode, datasets, runbooks, loaded):
+    if mode == "merged":
+        return build_figure_merged(datasets, runbooks, loaded)
     nrows, ncols = len(datasets), len(runbooks)
     fig = plt.figure(figsize=(4 * ncols, 4 * nrows - 2))
     outer = fig.add_gridspec(nrows, ncols, hspace=0.15, wspace=0.2)
@@ -468,6 +470,116 @@ def build_figure(mode, datasets, runbooks, loaded):
     handles, labels, ncol = _stacked_columns(groups)
     fig.legend(handles, labels, loc="lower center", ncol=ncol, frameon=False,
                bbox_to_anchor=(0.5, 0.91), columnspacing=1.8, handletextpad=0.5)
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Merged figure
+#
+# A single recall-target figure that absorbs everything the separate nprobe
+# figure used to carry, so the two can be collapsed into one. Each cell stacks
+# THREE strips instead of two:
+#
+#     recall@10            (top)    SURGE fresh/stale routing + their oracles
+#     partition activation (middle) -- recall-target-only metric; shows that the
+#                                      staleness penalty appears here (extra
+#                                      probing) even when recall is held near the
+#                                      target on easy datasets
+#     partition imbalance  (bottom) -- layout-only Gini, mode-independent, moved
+#                                      over from the nprobe figure (no need to
+#                                      show it twice)
+#
+# GP-ANN is overlaid at a fixed nprobe (ds.nprobe_param, the same "reasonable"
+# budget used in the nprobe figure) on the recall and imbalance strips. It has no
+# recall-target mode, so this is a cross-mode baseline: GP-ANN runs a fixed budget
+# while SURGE adapts to the target. Its activation would be a constant
+# nprobe/Np, so it is omitted from the activation strip.
+# --------------------------------------------------------------------------- #
+def plot_cell_merged(ax_top, ax_act, ax_imb, ds, rb, d):
+    surge = d["surge"]
+    p = RECALL_TARGET_PARAM
+    sel = lambda m, t: surge[(surge["t"] == t) & (surge["mode"] == m)
+                             & (surge["param"] == p)].sort_values("step")
+
+    # SURGE recall-target routing: recall (top) + activation (middle)
+    for t, key in ((0, "with_maint"), (100, "no_maint")):
+        s = sel("RecallTarget", t)
+        _line(ax_top, s["step"], s["recall"], key)
+        _line(ax_act, s["step"], s["activation"], key)
+    for t, key in ((0, "oracle_maint"), (100, "oracle_no")):
+        s = sel("Oracle", t)
+        if len(s):
+            _line(ax_top, s["step"], s["recall"], key)
+            _line(ax_act, s["step"], s["activation"], key)
+
+    # imbalance strip (bottom): fresh (t0) / stale (t100) layouts -- layout-only,
+    # identical regardless of routing mode.
+    for (steps, vals), key in ((d["imb_t0"], "with_maint"), (d["imb_t100"], "no_maint")):
+        if steps is not None:
+            _line(ax_imb, steps, vals, key)
+
+    # GP-ANN at a fixed nprobe: recall (top) + imbalance (bottom).
+    g = d["gpann"]
+    if g is not None:
+        gg = g[g["operation"] == "SEARCH"] if "operation" in g.columns else g
+        gg = gg[gg["nprobe"] == ds.nprobe_param].sort_values("step")
+        _line(ax_top, gg["step"], gg["theoretical_recall"], "gpann")
+        _line(ax_imb, gg["step"], gg["gini"], "gpann")
+
+    ax_act.set_ylim(0, 0.705)
+    ax_imb.set_ylim(0, 0.7)
+
+
+def build_figure_merged(datasets, runbooks, loaded):
+    nrows, ncols = len(datasets), len(runbooks)
+    fig = plt.figure(figsize=(4 * ncols, 5 * nrows))
+    outer = fig.add_gridspec(nrows, ncols, hspace=0.18, wspace=0.2)
+
+    for r, ds in enumerate(datasets):
+        for c, rb in enumerate(runbooks):
+            d = loaded[(ds.title, rb.title)]
+            cell = outer[r, c].subgridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.0)
+            ax_top = fig.add_subplot(cell[0])
+            ax_act = fig.add_subplot(cell[1], sharex=ax_top)
+            ax_imb = fig.add_subplot(cell[2], sharex=ax_top)
+            plt.setp(ax_top.get_xticklabels(), visible=False)
+            plt.setp(ax_act.get_xticklabels(), visible=False)
+
+            plot_cell_merged(ax_top, ax_act, ax_imb, ds, rb, d)
+            # Use the (wider) nprobe recall range so GP-ANN's fixed-budget line
+            # and the lower stale-routing dips remain fully visible.
+            ylim = ds.recall_ylim.get("nprobe")
+            if ylim:
+                ax_top.set_ylim(*ylim)
+
+            for (s, e, kind) in _phases(rb):
+                col = "green" if kind == "ins" else "red"
+                for ax in (ax_top, ax_act, ax_imb):
+                    ax.axvspan(s, e, color=col, alpha=0.05)
+
+            if r == 0:
+                ax_top.set_title(rb.title)
+            if c == 0:
+                ax_top.set_ylabel("Theoretical\nRecall@10", fontsize=10)
+                ax_act.set_ylabel("Partition\nActivation", fontsize=10)
+                ax_imb.set_ylabel("Partition\nImbalance", fontsize=10)
+                _row_label(ax_top, f"{ds.title} (Target = {RECALL_TARGET_PARAM})")
+            if r == nrows - 1:
+                ax_imb.set_xlabel("Runbook Step")
+
+    def entry(key):
+        return (Line2D([0], [0], **{k: v for k, v in STYLE[key].items() if k != "label"}),
+                STYLE[key]["label"])
+
+    routing = [entry("with_maint"), entry("no_maint")]
+    oracles = [entry("oracle_maint"), entry("oracle_no")]
+    phases = [(Patch(facecolor="green", alpha=0.25), "Insert phase"),
+              (Patch(facecolor="red", alpha=0.25), "Delete phase")]
+    groups = [routing, oracles, [entry("gpann")], phases]
+
+    handles, labels, ncol = _stacked_columns(groups)
+    fig.legend(handles, labels, loc="lower center", ncol=ncol, frameon=False,
+               bbox_to_anchor=(0.5, 0.93), columnspacing=1.8, handletextpad=0.5)
     return fig
 
 
@@ -553,7 +665,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--output", default="runbook",
                     help="output path; for --mode both, used as a prefix")
-    ap.add_argument("--mode", choices=["recalltarget", "nprobe", "both"], default="both")
+    ap.add_argument("--mode", choices=["recalltarget", "nprobe", "merged", "both"], default="both")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--gap-csv", default=None,
                     help="also write the per-cell recall-gap table to this CSV")
@@ -563,7 +675,11 @@ def main():
     args = ap.parse_args()
 
     set_style()
-    modes = ["recalltarget", "nprobe"] if args.mode == "both" else [args.mode]
+    modes = ["recalltarget", "nprobe", "merged"] if args.mode == "both" else [args.mode]
+    # The merged figure reuses the recall-target recall data, so its same-step
+    # recall gaps duplicate the recall-target ones; report gaps only for the
+    # two primary modes.
+    gap_modes = [m for m in modes if m in ("recalltarget", "nprobe")]
     gap_kinds = (["routing", "oracle-stale", "oracle-fresh"]
                  if args.gap_kind == "all" else [args.gap_kind])
 
@@ -583,13 +699,13 @@ def main():
             loaded = {(ds.title, rb.title): load_runbook(ds, rb)
                       for ds in DATASETS for rb in RUNBOOKS}
             render(loaded, ".png")
-            report_recall_gaps(loaded, modes, DATASETS, RUNBOOKS,
+            report_recall_gaps(loaded, gap_modes, DATASETS, RUNBOOKS,
                                 kinds=gap_kinds, out_csv=args.gap_csv)
     else:
         loaded = {(ds.title, rb.title): load_runbook(ds, rb)
                   for ds in DATASETS for rb in RUNBOOKS}
         render(loaded, ".pdf")
-        report_recall_gaps(loaded, modes, DATASETS, RUNBOOKS,
+        report_recall_gaps(loaded, gap_modes, DATASETS, RUNBOOKS,
                            kinds=gap_kinds, out_csv=args.gap_csv)
 
 
