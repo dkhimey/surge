@@ -449,17 +449,31 @@ static std::string find_latest_checkpoint(const std::string& ckpt_base)
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    if (argc != 7) {
+    if (argc < 7) {
         std::cerr
             << "Usage: " << argv[0]
             << " <dataset> <num_partitions>"
             << " <full_threshold>"
-            << " <k> <gt_prefix> <output_file>\n"
+            << " <k> <gt_prefix> <output_file>"
+            << " [--init-state-dir <dir> --init-partitions <file> [--init-state-step <N>]]\n"
             << "\n"
             << "  full_threshold : min centers to migrate to trigger a rebuild;\n"
             << "                   set >= " << NCENTERS << " to disable\n"
             << "  gt_prefix      : directory with per-step GT files (step<N>.gt100),"
                " or \"\" for static GT only\n"
+            << "\n"
+            << "  Starting-state options (skip the from-scratch KMeans build and start\n"
+            << "  from the output of msturing-cluster-analysis.cpp step <N>):\n"
+            << "    --init-state-dir  <dir>   directory holding step_NNNNNN_hnsw.bin,\n"
+            << "                              step_NNNNNN_centers.csv, _center_counts.csv,\n"
+            << "                              and _labels.csv from cluster analysis\n"
+            << "    --init-partitions <file>  precomputed center→shard partition file\n"
+            << "                              (one shard id per line; e.g. produced by\n"
+            << "                              runbook_partitions_parallel.cpp)\n"
+            << "    --init-state-step <N>     cluster-analysis step to load (default 1)\n"
+            << "  Both --init-state-dir and --init-partitions are required to enable this\n"
+            << "  mode.  It only applies on a fresh start; an existing checkpoint always\n"
+            << "  takes precedence and resumes as usual.\n"
             << "\n"
             << "  Rebuild policy: delta always (shadow-delete departing elements,\n"
             << "  insert arriving ones with replace_deleted=true, keep graph topology).\n"
@@ -476,6 +490,29 @@ int main(int argc, char** argv)
     const int         k              = std::stoi(argv[4]);
     const std::string gt_prefix      = argv[5];
     const std::string output_file    = argv[6];
+
+    // ── Optional starting-state flags ────────────────────────────────────────
+    // When both --init-state-dir and --init-partitions are supplied, Phase 1
+    // loads the routing state produced by msturing-cluster-analysis.cpp step
+    // <init_state_step> instead of running KMeans from scratch.
+    std::string init_state_dir;
+    std::string init_partitions_file;
+    int         init_state_step = 1;
+    for (int ai = 7; ai < argc; ++ai) {
+        const std::string a = argv[ai];
+        if      (a == "--init-state-dir"  && ai + 1 < argc) init_state_dir       = argv[++ai];
+        else if (a == "--init-partitions" && ai + 1 < argc) init_partitions_file = argv[++ai];
+        else if (a == "--init-state-step" && ai + 1 < argc) init_state_step      = std::stoi(argv[++ai]);
+        else {
+            std::cerr << "ERROR: unrecognised or incomplete argument: " << a << "\n";
+            return 1;
+        }
+    }
+    const bool use_init_state = !init_state_dir.empty() && !init_partitions_file.empty();
+    if (!init_state_dir.empty() ^ !init_partitions_file.empty()) {
+        std::cerr << "ERROR: --init-state-dir and --init-partitions must be used together\n";
+        return 1;
+    }
     // Checkpoint base directory: strip the output file extension, append
     // Checkpoint base directory: stable across runs so that a restarted run
     // automatically resumes from the previous run's checkpoint even when the
@@ -591,7 +628,54 @@ int main(int argc, char** argv)
 
         Coordinator metaIndex(dim, &comm, &logger);
 
-        if (!resuming) {
+        if (!resuming && use_init_state) {
+            // ── Phase 1: load starting state from cluster analysis ────────────
+            // Load meta-HNSW, centroids, counts, label→center, and partitions
+            // produced by msturing-cluster-analysis.cpp step <init_state_step>,
+            // then distribute the initial batch to executors using that exact
+            // assignment (so the physical shard layout matches the loaded state).
+            std::cout << "[Sweep] Loading starting state from cluster analysis: "
+                      << init_state_dir << " (step " << init_state_step << "),"
+                      << " partitions=" << init_partitions_file << "\n";
+            metaIndex.loadFromClusterAnalysis(init_state_dir, init_state_step,
+                                              init_partitions_file, num_partitions,
+                                              EF_SEARCH, init_start);
+
+            // Build per-vector preassigned shard list from the loaded
+            // label→center map and partition assignment.  distribute_vectors
+            // indexes preassigned_partitions by absolute global id, so the
+            // vector must span [0, init_start + init_n).
+            const auto& l2c   = metaIndex.getLabelToCenter();
+            const auto& parts = metaIndex.getPartitions();
+            std::vector<int> preassigned(static_cast<size_t>(init_start) + init_n, 0);
+            int missing = 0;
+            for (int i = 0; i < init_n; i++) {
+                const int label = init_start + i;
+                auto it = l2c.find(label);
+                if (it == l2c.end()) { missing++; continue; }
+                const int cid = it->second;
+                if (cid < 0 || cid >= static_cast<int>(parts.size())) { missing++; continue; }
+                preassigned[label] = parts[cid];
+            }
+            if (missing > 0) {
+                std::cerr << "ERROR: " << missing << " of " << init_n
+                          << " initial vectors have no valid label→center entry in the "
+                          << "loaded state; cannot distribute. Check that "
+                          << "step_" << init_state_step << "_labels.csv covers ["
+                          << init_start << ", " << (init_start + init_n) << ").\n";
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+
+            std::cout << "[Sweep] Distributing initial " << init_n
+                      << " vectors (offset " << init_start
+                      << ") using loaded assignment\n";
+            metaIndex.distribute_vectors(base_file, init_n, false,
+                                         NUM_BUILDING_THREADS, &preassigned, init_start);
+            comm.broadcast_termination(world_size);
+            MPI_Barrier(MPI_COMM_WORLD);
+            std::cout << "[Sweep] Initial build complete (from loaded state)\n";
+            comm.broadcast_ef_search(EF_SEARCH, world_size);
+        } else if (!resuming) {
             // ── Phase 1: fresh build ──────────────────────────────────────────
             const size_t ss = std::min(static_cast<size_t>(init_n), SAMPLE_SIZE);
             std::vector<float> sample = getSample(base_file, init_n, dim, ss, init_start);

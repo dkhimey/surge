@@ -1130,6 +1130,21 @@ int main(int argc, char* argv[]) {
                                                  HNSW_M, HNSW_EF_CONSTRUCTION, ef_search);
                     initialised = true;
 
+                    // Export the step-1 label→centroid assignment (one centroid
+                    // id per line, batch order; global id = step.start + line)
+                    // so downstream tools (e.g. shared_batch_experiment_sweep.cpp)
+                    // can load this starting state.  Matches the debug dump
+                    // produced for subsequent insert steps.
+                    {
+                        auto lpath = fs::path(out_dir) /
+                            (step_prefix(step_id) + "_labels.csv");
+                        std::ofstream lf(lpath);
+                        for (int i = 0; i < n_vecs; ++i)
+                            lf << point_to_centroid[static_cast<uint32_t>(step.start + i)] << '\n';
+                        std::cout << "  [debug] Saved " << n_vecs
+                                  << " labels → " << lpath.string() << "\n";
+                    }
+
                 } else {
                     // ── Normal first-insert path (or --initial-centers alone) ──
                     // Build HNSW on initial centres (before re-estimation from data)
@@ -1139,6 +1154,22 @@ int main(int argc, char* argv[]) {
                     // Assign ALL vectors in this batch to nearest centre via HNSW
                     // (matches Python: no batching on first insert)
                     auto labels = hnsw_query1(*assign_hnsw, vecs.data(), n_vecs);
+
+                    // Export the step-1 label→centroid assignment (one centroid
+                    // id per line, batch order; global id = step.start + line)
+                    // so downstream tools (e.g. shared_batch_experiment_sweep.cpp)
+                    // can load this starting state.  Matches the debug dump
+                    // produced for subsequent insert steps.  These labels reflect
+                    // the assignment HNSW built from the initial centres, i.e. the
+                    // exact point_to_centroid stored below.
+                    {
+                        auto lpath = fs::path(out_dir) /
+                            (step_prefix(step_id) + "_labels.csv");
+                        std::ofstream lf(lpath);
+                        for (int i = 0; i < n_vecs; ++i) lf << labels[i] << '\n';
+                        std::cout << "  [debug] Saved " << n_vecs
+                                  << " labels → " << lpath.string() << "\n";
+                    }
 
                     for (int i = 0; i < n_vecs; ++i) {
                         uint32_t gid = static_cast<uint32_t>(step.start + i);

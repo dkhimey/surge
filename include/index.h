@@ -40,6 +40,27 @@ public:
     void load(const std::string& dir_path, int ef_search);
     void save(const std::string& output_dir);
 
+    // Load the coordinator's routing state from the output of
+    // msturing-cluster-analysis.cpp step <step> plus a precomputed partition
+    // assignment file (center → shard).  Used to start an experiment from a
+    // cluster-analysis-produced starting state instead of building from scratch.
+    //
+    // Reads, for prefix = <state_dir>/step_<step zero-padded to 6>:
+    //   <prefix>_hnsw.bin           → meta_HNSW_     (HNSW over centroids; label == centroid id)
+    //   <prefix>_centers.csv        → centers_       (k rows × dim, comma-sep, scientific notation)
+    //   <prefix>_center_counts.csv  → center_counts_ (one plain integer per line)
+    //   <prefix>_labels.csv         → label_to_center_ (one centroid id per line;
+    //                                                    global label = init_start + line index)
+    //   <partitions_file>           → partitions     (one shard id per line; an optional
+    //                                                  trailing moved-nodes count is ignored)
+    void loadFromClusterAnalysis(
+        const std::string& state_dir,
+        int                step,
+        const std::string& partitions_file,
+        int                num_partitions,
+        int                ef_search,
+        int                init_start);
+
     // ── Accessors for shared_batch_experiment ──────────────────────────────
     // Expose routing state so the experiment can replicate it on all ranks.
     hnswlib::HierarchicalNSW<float>* getMetaHNSW() { return meta_HNSW_; }

@@ -10,6 +10,9 @@
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <omp.h>
 
 typedef falconn::DenseVector<float> Point;
@@ -1077,6 +1080,106 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
         in4.read(reinterpret_cast<char*>(&value), sizeof(value));
         label_to_center_.emplace(key, value);
     }
+}
+
+void Coordinator::loadFromClusterAnalysis(
+    const std::string& state_dir,
+    int                step,
+    const std::string& partitions_file,
+    int                num_partitions,
+    int                ef_search,
+    int                init_start)
+{
+    // Build the "step_NNNNNN" prefix exactly as msturing-cluster-analysis.cpp does.
+    std::ostringstream pss;
+    pss << "step_" << std::setw(6) << std::setfill('0') << step;
+    const std::string base         = state_dir + "/" + pss.str();
+    const std::string hnsw_path    = base + "_hnsw.bin";
+    const std::string centers_path = base + "_centers.csv";
+    const std::string counts_path  = base + "_center_counts.csv";
+    const std::string labels_path  = base + "_labels.csv";
+
+    auto fail = [](const std::string& msg) {
+        std::cerr << "[Coordinator] loadFromClusterAnalysis ERROR: " << msg << "\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    };
+
+    // 1. meta-HNSW over the centroids (hnswlib label == centroid id, 0..k-1).
+    std::cout << "[Coordinator] Loading meta-HNSW from: " << hnsw_path << "\n";
+    meta_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path);
+    if (meta_HNSW_ == nullptr) fail("could not load meta-HNSW " + hnsw_path);
+    meta_HNSW_->setEf(ef_search);
+
+    // 2. centroid positions: k rows × dim floats, comma-separated, scientific
+    //    notation (np.savetxt-style — matches save_centers_csv).
+    std::cout << "[Coordinator] Loading centers from: " << centers_path << "\n";
+    centers_.clear();
+    {
+        std::ifstream f(centers_path);
+        if (!f) fail("cannot open " + centers_path);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::stringstream ss(line);
+            std::string cell;
+            while (std::getline(ss, cell, ',')) {
+                if (!cell.empty()) centers_.push_back(std::stof(cell));
+            }
+        }
+    }
+    if (centers_.size() % dim_ != 0)
+        fail("centers.csv value count " + std::to_string(centers_.size()) +
+             " is not a multiple of dim " + std::to_string(dim_));
+    ncenters_ = centers_.size() / dim_;
+
+    // 3. centroid counts: one plain decimal integer per line (matches
+    //    save_counts_csv — NOT scientific notation).
+    std::cout << "[Coordinator] Loading center counts from: " << counts_path << "\n";
+    center_counts_.assign(ncenters_, 0);
+    {
+        std::ifstream f(counts_path);
+        if (!f) fail("cannot open " + counts_path);
+        long v = 0;
+        size_t i = 0;
+        while (i < ncenters_ && (f >> v)) center_counts_[i++] = static_cast<int>(v);
+        if (i != ncenters_)
+            fail("center_counts.csv has " + std::to_string(i) +
+                 " entries, expected " + std::to_string(ncenters_));
+    }
+
+    // 4. partitions (center → shard): one shard id per line.
+    //    runbook_partitions_parallel.cpp appends a trailing moved-nodes count;
+    //    read all integers and keep only the first ncenters_.
+    std::cout << "[Coordinator] Loading partitions from: " << partitions_file << "\n";
+    partitions.clear();
+    {
+        std::ifstream f(partitions_file);
+        if (!f) fail("cannot open " + partitions_file);
+        int p;
+        while (f >> p) partitions.push_back(p);
+    }
+    if (partitions.size() > ncenters_) partitions.resize(ncenters_); // drop trailing moved-nodes count
+    if (partitions.size() != ncenters_)
+        fail("partitions file has " + std::to_string(partitions.size()) +
+             " entries, expected " + std::to_string(ncenters_));
+    num_partitions_ = static_cast<size_t>(num_partitions);
+
+    // 5. label → centroid map for the initial batch.  step_<N>_labels.csv holds
+    //    one centroid id per line in batch order; the global label is
+    //    init_start + line index (the same convention msturing writes with).
+    std::cout << "[Coordinator] Loading label→center map from: " << labels_path << "\n";
+    label_to_center_.clear();
+    {
+        std::ifstream f(labels_path);
+        if (!f) fail("cannot open " + labels_path);
+        int cid;
+        int i = 0;
+        while (f >> cid) { label_to_center_[init_start + i] = cid; ++i; }
+    }
+
+    std::cout << "[Coordinator] Starting state loaded: ncenters=" << ncenters_
+              << " num_partitions=" << num_partitions_
+              << " labels=" << label_to_center_.size() << "\n";
 }
 
 void Coordinator::save(const std::string& output_dir) {
