@@ -157,6 +157,12 @@ static constexpr int    M_META               = 16;
 static constexpr int    M_SUB                = 16;
 static constexpr int    NUM_BUILDING_THREADS = 32;
 static constexpr int    EF_SEARCH            = 200;
+// Meta-HNSW (routing) search ef.  Kept separate from EF_SEARCH (the executor
+// sub-index search ef) so routing effort can be tuned without touching local
+// search quality.  Set to 100 to match compute_theoretical_recall_updated.py's
+// router.set_ef(max(100, k_rt)), so the theoretical-recall column produced here
+// is computed with the same routing accuracy as the offline theoretical pipeline.
+static constexpr int    EF_ROUTING           = 100;
 static constexpr size_t SAMPLE_SIZE          = 100000;
 // If the maximum tombstone ratio across all executor shards meets or exceeds
 // this threshold during a delta-rebuild event, a full rebuild is used instead.
@@ -1311,6 +1317,13 @@ int main(int argc, char** argv)
                     MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
                 }
 
+                // Pin the routing meta-HNSW search ef for this step.  Done at
+                // search time on every rank because rebuilds and bcastRoutingState
+                // reset routing_hnsw's ef to EF_SEARCH; this guarantees both the
+                // GT->partition lookup and routeQuery use EF_ROUTING (matching the
+                // Python theoretical pipeline's router ef).
+                routing_hnsw->setEf(EF_ROUTING);
+
                 // ── Theoretical-recall setup ─────────────────────────────
                 // For each query in this rank's slice, resolve its top-K GT
                 // neighbours to partition IDs via a fresh meta-HNSW lookup
@@ -2073,6 +2086,11 @@ int main(int argc, char** argv)
                     routing_center_counts.resize(n);
                     MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
                 }
+
+                // Pin the routing meta-HNSW search ef for this step (mirrors
+                // coordinator).  Reset on every rebuild/bcastRoutingState, so it
+                // must be set here each search step on every rank.
+                routing_hnsw->setEf(EF_ROUTING);
 
                 // ── Theoretical-recall setup (mirrors coordinator) ───────
                 // Per-neighbour partition list (length kk, -1 for unresolved);
