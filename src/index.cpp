@@ -933,6 +933,56 @@ void Coordinator::doRebuildSimple(int world_size) {
     cached_rebuild_type_ = 0;
 }
 
+// ── doForceFullRebuild ────────────────────────────────────────────────────────
+// Prepare and execute a full rebuild without consulting checkNeedRebuild()'s
+// thresholds.  Mirrors the caching that checkNeedRebuild() performs for a full
+// rebuild, then reuses doRebuildSimple() so the on-wire protocol is identical to
+// a threshold-driven full rebuild (executors receive a FULL_REBUILD_REQUEST).
+void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_meta) {
+    // Discard any stale cached rebuild from a previous checkNeedRebuild() call
+    // that did not result in a rebuild this step.
+    if (cached_new_meta_HNSW_) {
+        delete cached_new_meta_HNSW_;
+        cached_new_meta_HNSW_ = nullptr;
+    }
+    cached_new_partitions_.clear();
+    cached_hnsw_buffer_.clear();
+
+    // Recompute the partitioning (also fills the repart timing accumulators).
+    hnswlib::HierarchicalNSW<float>* new_meta = nullptr;
+    std::vector<int>                 new_parts;
+    rePartition(new_parts, new_meta, ef_construction, M_meta,
+                &cached_repart_hnsw_s_,
+                &cached_repart_bottom_s_,
+                &cached_repart_kaffpa_s_,
+                &cached_repart_relabel_s_);
+
+    // Count centers / elements that change shard (for reporting).
+    {
+        int centers = 0, elems = 0;
+        for (size_t c = 0; c < new_parts.size(); c++) {
+            if (new_parts[c] != partitions[c]) {
+                centers++;
+                elems += center_counts_[c];
+            }
+        }
+        cached_centers_moved_  = centers;
+        cached_elements_moved_ = elems;
+    }
+
+    // Cache materials for doRebuildSimple() and serialise the new meta-HNSW.
+    cached_new_meta_HNSW_  = new_meta;
+    cached_new_partitions_ = std::move(new_parts);
+    cached_new_meta_HNSW_->saveIndex("tmp_hnsw.bin");
+    {
+        std::ifstream f("tmp_hnsw.bin", std::ios::binary);
+        cached_hnsw_buffer_.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    cached_rebuild_type_ = 1; // FULL
+
+    doRebuildSimple(world_size);
+}
+
 // ── doRebuildDelta ────────────────────────────────────────────────────────────
 // Like doRebuildSimple() but sends INPLACE_REBUILD_REQUEST so each executor
 // performs a mark-delete + insert pass instead of a full graph reconstruction.

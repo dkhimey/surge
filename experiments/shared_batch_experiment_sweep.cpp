@@ -13,7 +13,10 @@
 //  Rebuild policy: delta always — shadow-delete departing elements and insert
 //  arriving ones using replace_deleted=true (keeps existing graph topology).
 //  Falls back to a full reconstruction if any shard's tombstone ratio exceeds
-//  TOMBSTONE_RATIO_THRESHOLD (currently 0.5 = 50% unused slots).
+//  TOMBSTONE_RATIO_THRESHOLD (currently 0.5 = 50% unused slots).  This check
+//  fires independently of the center-movement rebuild threshold: a shard
+//  exceeding the ratio forces a full rebuild even when checkNeedRebuild() would
+//  otherwise report that no rebuild is needed.
 //
 // ─── Sweep parameter grids ───────────────────────────────────────────────────
 //  BranchingFactor : {20, 25, 30, 40, 50, 60, 80}
@@ -477,9 +480,11 @@ int main(int argc, char** argv)
             << "\n"
             << "  Rebuild policy: delta always (shadow-delete departing elements,\n"
             << "  insert arriving ones with replace_deleted=true, keep graph topology).\n"
-            << "  Falls back to full graph reconstruction if any shard's tombstone\n"
-            << "  ratio exceeds " << TOMBSTONE_RATIO_THRESHOLD
-            << " (" << static_cast<int>(TOMBSTONE_RATIO_THRESHOLD * 100) << "% unused slots).\n";
+            << "  A full graph reconstruction is forced whenever any shard's tombstone\n"
+            << "  ratio reaches " << TOMBSTONE_RATIO_THRESHOLD
+            << " (" << static_cast<int>(TOMBSTONE_RATIO_THRESHOLD * 100) << "% unused slots) -- this\n"
+            << "  check fires every step and triggers a rebuild on its own even when the\n"
+            << "  center-movement threshold is not met.\n";
         return 1;
     }
 
@@ -1011,31 +1016,57 @@ int main(int argc, char** argv)
                     metaIndex.updateCentersForInsertBatch(batch, cids);
                 }
 
-                // Rebuild check.
+                // Rebuild check.  checkNeedRebuild() reports whether the
+                // center-movement threshold is met; the tombstone-ratio check
+                // below can independently force a full rebuild even when it is not.
                 int rb_type = metaIndex.checkNeedRebuild(
                     full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
-                RebuildStats rb_stats;
-                if (rb_type > 0) {
-                    // Tombstone ratio check: collect the max tombstone ratio
-                    // across all executor shards (coordinator contributes 0.0).
-                    // If it meets or exceeds the threshold, force a full rebuild
-                    // even when use_delta_rebuild is set.
-                    // This MPI_Reduce must be symmetric with executor side below.
-                    bool actual_delta = use_delta_rebuild;
-                    if (use_delta_rebuild) {
-                        double coord_ratio = 0.0, max_ratio = 0.0;
-                        MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
-                                   MPI_MAX, 0, MPI_COMM_WORLD);
-                        if (max_ratio >= TOMBSTONE_RATIO_THRESHOLD) {
-                            actual_delta = false;
-                            std::cout << "[Sweep] Step " << step.step_num
-                                      << "  tombstone ratio " << max_ratio
-                                      << " >= " << TOMBSTONE_RATIO_THRESHOLD
-                                      << " -- forcing full rebuild\n";
-                        }
-                    }
 
+                // Tombstone ratio check — now runs every step so it can trigger a
+                // rebuild on its own.  Collect the max tombstone ratio across all
+                // executor shards (coordinator contributes 0.0).  Must stay
+                // symmetric with the executor side below.
+                double max_ratio = 0.0;
+                {
+                    double coord_ratio = 0.0;
+                    MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
+                               MPI_MAX, 0, MPI_COMM_WORLD);
+                }
+                const bool tombstone_forces = (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
+
+                // Rebuild if the center-movement threshold is met OR a shard's
+                // tombstone ratio crossed the limit.  A tombstone-forced rebuild
+                // is always full; otherwise delta when enabled.
+                int do_rebuild = (rb_type > 0 || tombstone_forces) ? 1 : 0;
+                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+                RebuildStats rb_stats;
+                if (do_rebuild) {
+                    const bool actual_delta = use_delta_rebuild && !tombstone_forces;
+                    if (tombstone_forces)
+                        std::cout << "[Sweep] Step " << step.step_num
+                                  << "  tombstone ratio " << max_ratio
+                                  << " >= " << TOMBSTONE_RATIO_THRESHOLD
+                                  << " -- forcing full rebuild"
+                                  << (rb_type > 0 ? "\n"
+                                                  : " (center-movement threshold not met)\n");
+
+                    // Dispatch.  When checkNeedRebuild() reported a rebuild it has
+                    // cached the repartition, so use the normal delta/full path.
+                    // When the rebuild is forced purely by the tombstone ratio
+                    // (rb_type == 0) there is no cached repartition, so compute and
+                    // dispatch a full rebuild explicitly (same on-wire protocol as
+                    // doRebuildSimple, so executors see a FULL_REBUILD_REQUEST).
+                    const double t_rb0 = MPI_Wtime();
+                    if (rb_type > 0) {
+                        if (actual_delta) metaIndex.doRebuildDelta(world_size);
+                        else              metaIndex.doRebuildSimple(world_size);
+                    } else {
+                        metaIndex.doForceFullRebuild(world_size, EF_CONSTRUCTION, M_META);
+                    }
+                    rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
+
+                    // Repartition stats are valid after dispatch for both paths.
                     rb_stats.rebuild_type     = actual_delta ? "delta" : "full";
                     rb_stats.centers_moved    = metaIndex.getCachedCentersMoved();
                     rb_stats.elements_moved   = metaIndex.getCachedElementsMoved();
@@ -1043,14 +1074,6 @@ int main(int argc, char** argv)
                     rb_stats.repart_bottom_s  = metaIndex.getCachedRepartBottomS();
                     rb_stats.repart_kaffpa_s  = metaIndex.getCachedRepartKaffpaS();
                     rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
-
-                    // Dispatch to the chosen rebuild variant.
-                    const double t_rb0 = MPI_Wtime();
-                    if (actual_delta)
-                        metaIndex.doRebuildDelta(world_size);
-                    else
-                        metaIndex.doRebuildSimple(world_size);
-                    rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
                     sync_routing_after_rebuild();
 
@@ -1063,13 +1086,10 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
-                    // Delta rebuild only: collect total remaining deleted slots
-                    // (sum across all shards). Executors contribute their own
-                    // count; coordinator contributes 0.
-                    // Gated on actual_delta (not use_delta_rebuild): when the
-                    // tombstone check overrides to full, this reduce is skipped
-                    // and the executor side gates on hdr.type == INPLACE_REBUILD_REQUEST,
-                    // which is consistent because doRebuildSimple sends a different header.
+                    // Delta rebuild only: collect total remaining deleted slots.
+                    // The executor side gates the matching reduce on hdr.type ==
+                    // INPLACE_REBUILD_REQUEST, sent only for delta rebuilds, so a
+                    // full rebuild (forced or threshold-driven) skips it on both sides.
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
@@ -1102,7 +1122,7 @@ int main(int argc, char** argv)
                 write_row(step.step_num, "insert", "", -1.0f,
                           step.start, step.end, max_t, throughput, -1.0, -1.0, -1.0,
                           kNoRebuild, sizes);
-                if (rb_type > 0) {
+                if (do_rebuild) {
                     const double total_rb_s = rb_stats.repart_hnsw_s + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
@@ -1157,27 +1177,43 @@ int main(int argc, char** argv)
 
                 int rb_type = metaIndex.checkNeedRebuild(
                     full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+                // Tombstone ratio check — runs every step so it can trigger a
+                // rebuild on its own (symmetric with the executor side below).
+                double max_ratio = 0.0;
+                {
+                    double coord_ratio = 0.0;
+                    MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
+                               MPI_MAX, 0, MPI_COMM_WORLD);
+                }
+                const bool tombstone_forces = (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
+
+                int do_rebuild = (rb_type > 0 || tombstone_forces) ? 1 : 0;
+                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
                 RebuildStats rb_stats;
-                if (rb_type > 0) {
-                    // Tombstone ratio check: collect the max tombstone ratio
-                    // across all executor shards (coordinator contributes 0.0).
-                    // If it meets or exceeds the threshold, force a full rebuild
-                    // even when use_delta_rebuild is set.
-                    // This MPI_Reduce must be symmetric with executor side below.
-                    bool actual_delta = use_delta_rebuild;
-                    if (use_delta_rebuild) {
-                        double coord_ratio = 0.0, max_ratio = 0.0;
-                        MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
-                                   MPI_MAX, 0, MPI_COMM_WORLD);
-                        if (max_ratio >= TOMBSTONE_RATIO_THRESHOLD) {
-                            actual_delta = false;
-                            std::cout << "[Sweep] Step " << step.step_num
-                                      << "  tombstone ratio " << max_ratio
-                                      << " >= " << TOMBSTONE_RATIO_THRESHOLD
-                                      << " -- forcing full rebuild\n";
-                        }
+                if (do_rebuild) {
+                    const bool actual_delta = use_delta_rebuild && !tombstone_forces;
+                    if (tombstone_forces)
+                        std::cout << "[Sweep] Step " << step.step_num
+                                  << "  tombstone ratio " << max_ratio
+                                  << " >= " << TOMBSTONE_RATIO_THRESHOLD
+                                  << " -- forcing full rebuild"
+                                  << (rb_type > 0 ? "\n"
+                                                  : " (center-movement threshold not met)\n");
+
+                    // Dispatch.  Threshold-driven rebuilds reuse the repartition
+                    // cached by checkNeedRebuild(); a purely tombstone-forced
+                    // rebuild (rb_type == 0) has no cache, so compute and dispatch
+                    // a full rebuild explicitly.
+                    const double t_rb0 = MPI_Wtime();
+                    if (rb_type > 0) {
+                        if (actual_delta) metaIndex.doRebuildDelta(world_size);
+                        else              metaIndex.doRebuildSimple(world_size);
+                    } else {
+                        metaIndex.doForceFullRebuild(world_size, EF_CONSTRUCTION, M_META);
                     }
+                    rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
                     rb_stats.rebuild_type     = actual_delta ? "delta" : "full";
                     rb_stats.centers_moved    = metaIndex.getCachedCentersMoved();
@@ -1186,14 +1222,6 @@ int main(int argc, char** argv)
                     rb_stats.repart_bottom_s  = metaIndex.getCachedRepartBottomS();
                     rb_stats.repart_kaffpa_s  = metaIndex.getCachedRepartKaffpaS();
                     rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
-
-                    // Dispatch to the chosen rebuild variant.
-                    const double t_rb0 = MPI_Wtime();
-                    if (actual_delta)
-                        metaIndex.doRebuildDelta(world_size);
-                    else
-                        metaIndex.doRebuildSimple(world_size);
-                    rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
                     sync_routing_after_rebuild();
 
@@ -1206,13 +1234,9 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
-                    // Delta rebuild only: collect total remaining deleted slots
-                    // (sum across all shards). Executors contribute their own
-                    // count; coordinator contributes 0.
-                    // Gated on actual_delta (not use_delta_rebuild): when the
-                    // tombstone check overrides to full, this reduce is skipped
-                    // and the executor side gates on hdr.type == INPLACE_REBUILD_REQUEST,
-                    // which is consistent because doRebuildSimple sends a different header.
+                    // Delta rebuild only: collect total remaining deleted slots.
+                    // The executor side gates the matching reduce on hdr.type ==
+                    // INPLACE_REBUILD_REQUEST, so a full rebuild skips it on both sides.
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
@@ -1245,7 +1269,7 @@ int main(int argc, char** argv)
                 write_row(step.step_num, "delete", "", -1.0f,
                           step.start, step.end, max_t, throughput, -1.0, -1.0, -1.0,
                           kNoRebuild, sizes);
-                if (rb_type > 0) {
+                if (do_rebuild) {
                     const double total_rb_s = rb_stats.repart_hnsw_s + rb_stats.repart_bottom_s
                                            + rb_stats.repart_kaffpa_s + rb_stats.repart_relabel_s
                                            + rb_stats.dorebuild_wall_s;
@@ -1871,20 +1895,19 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                int rb_type = 0;
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
-                if (rb_type > 0) {
-                    // Participate in the tombstone ratio check.  The coordinator
-                    // calls MPI_Reduce(MAX) only when use_delta_rebuild is set;
-                    // executors mirror that by checking the same global flag.
-                    // This must happen before recv_header so it is ordered before
-                    // doRebuildDelta/doRebuildSimple on the coordinator.
-                    if (use_delta_rebuild) {
-                        double my_ratio = subIndex.getTombstoneRatio();
-                        double dummy_max = 0.0;
-                        MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
-                                   MPI_MAX, 0, MPI_COMM_WORLD);
-                    }
+                // Tombstone ratio check — contribute this shard's ratio to the
+                // MAX reduce every step (symmetric with the coordinator) so it can
+                // trigger a forced full rebuild on its own.  Must be ordered before
+                // the do_rebuild broadcast.
+                {
+                    double my_ratio = subIndex.getTombstoneRatio();
+                    double dummy_max = 0.0;
+                    MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
+                               MPI_MAX, 0, MPI_COMM_WORLD);
+                }
+                int do_rebuild = 0;
+                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                if (do_rebuild) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {
@@ -1967,20 +1990,19 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                int rb_type = 0;
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
-                if (rb_type > 0) {
-                    // Participate in the tombstone ratio check.  The coordinator
-                    // calls MPI_Reduce(MAX) only when use_delta_rebuild is set;
-                    // executors mirror that by checking the same global flag.
-                    // This must happen before recv_header so it is ordered before
-                    // doRebuildDelta/doRebuildSimple on the coordinator.
-                    if (use_delta_rebuild) {
-                        double my_ratio = subIndex.getTombstoneRatio();
-                        double dummy_max = 0.0;
-                        MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
-                                   MPI_MAX, 0, MPI_COMM_WORLD);
-                    }
+                // Tombstone ratio check — contribute this shard's ratio to the
+                // MAX reduce every step (symmetric with the coordinator) so it can
+                // trigger a forced full rebuild on its own.  Must be ordered before
+                // the do_rebuild broadcast.
+                {
+                    double my_ratio = subIndex.getTombstoneRatio();
+                    double dummy_max = 0.0;
+                    MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
+                               MPI_MAX, 0, MPI_COMM_WORLD);
+                }
+                int do_rebuild = 0;
+                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                if (do_rebuild) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {

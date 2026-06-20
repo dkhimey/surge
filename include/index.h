@@ -97,6 +97,15 @@ public:
     // contract as doRebuildSimple().
     void doRebuildDelta(int world_size);
 
+    // Force a full rebuild now, independently of checkNeedRebuild() and the
+    // center-movement thresholds.  Used when an external condition (e.g. a
+    // shard's tombstone/free-slot ratio) demands a rebuild even though the
+    // center-movement threshold was not met.  Recomputes the partitioning,
+    // caches it as a FULL rebuild, and dispatches via the same protocol as
+    // doRebuildSimple() (executors receive a FULL_REBUILD_REQUEST).  Populates
+    // the cached_* statistics so the caller can report them afterwards.
+    void doForceFullRebuild(int world_size, int ef_construction, int M_meta);
+
     // Returns statistics from the most recent checkNeedRebuild() call that
     // returned non-zero.  All return 0 when no rebuild was needed or before
     // checkNeedRebuild() is first called.
