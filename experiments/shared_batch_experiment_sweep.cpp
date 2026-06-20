@@ -536,6 +536,13 @@ int main(int argc, char** argv)
     // Falls back to full if the tombstone ratio check fires (see TOMBSTONE_RATIO_THRESHOLD).
     const bool        use_delta_rebuild = true;
 
+    // Maintenance is disabled entirely when the rebuild threshold is at least the
+    // number of centers.  In that mode NO rebuild of any kind happens — neither
+    // the center-movement threshold nor the tombstone-ratio check may trigger one
+    // — so the rebuild machinery (including the tombstone-ratio reduce) is skipped.
+    // Computed identically on every rank since full_threshold is parsed by all.
+    const bool        maintenance_enabled = (full_threshold < NCENTERS);
+
     // Build the sweep list — identical on all ranks so collective counts match.
     const auto sweep_combos = build_sweep_combos();
     const int  n_combos     = static_cast<int>(sweep_combos.size());
@@ -1022,18 +1029,19 @@ int main(int argc, char** argv)
                     metaIndex.updateCentersForInsertBatch(batch, cids);
                 }
 
-                // Rebuild check.  checkNeedRebuild() reports whether the
-                // center-movement threshold is met; the tombstone-ratio check
-                // below can independently force a full rebuild even when it is not.
-                int rb_type = metaIndex.checkNeedRebuild(
-                    full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
-
-                // Tombstone ratio check — now runs every step so it can trigger a
-                // rebuild on its own.  Collect the max tombstone ratio across all
-                // executor shards (coordinator contributes 0.0).  Must stay
-                // symmetric with the executor side below.
+                // Rebuild check.  When maintenance is disabled (full_threshold >=
+                // NCENTERS) no rebuild of any kind may occur, so the whole check —
+                // including the tombstone-ratio reduce — is skipped.  Otherwise
+                // checkNeedRebuild() reports whether the center-movement threshold
+                // is met, and the tombstone-ratio check below can independently
+                // force a full rebuild even when it is not.
+                int    rb_type   = 0;
                 double max_ratio = 0.0;
-                {
+                if (maintenance_enabled) {
+                    rb_type = metaIndex.checkNeedRebuild(
+                        full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
+                    // Collect the max tombstone ratio across all executor shards
+                    // (coordinator contributes 0.0).  Symmetric with executor side.
                     double coord_ratio = 0.0;
                     MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
                                MPI_MAX, 0, MPI_COMM_WORLD);
@@ -1181,13 +1189,14 @@ int main(int argc, char** argv)
                         metaIndex.updateCentersForDeleteBatch(valid_vecs, valid_cids);
                 }
 
-                int rb_type = metaIndex.checkNeedRebuild(
-                    full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
-
-                // Tombstone ratio check — runs every step so it can trigger a
-                // rebuild on its own (symmetric with the executor side below).
+                // When maintenance is disabled (full_threshold >= NCENTERS) no
+                // rebuild of any kind may occur, so skip the whole check including
+                // the tombstone-ratio reduce.  Symmetric with the executor side.
+                int    rb_type   = 0;
                 double max_ratio = 0.0;
-                {
+                if (maintenance_enabled) {
+                    rb_type = metaIndex.checkNeedRebuild(
+                        full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     double coord_ratio = 0.0;
                     MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
                                MPI_MAX, 0, MPI_COMM_WORLD);
@@ -1909,10 +1918,11 @@ int main(int argc, char** argv)
                 }
 
                 // Tombstone ratio check — contribute this shard's ratio to the
-                // MAX reduce every step (symmetric with the coordinator) so it can
-                // trigger a forced full rebuild on its own.  Must be ordered before
-                // the do_rebuild broadcast.
-                {
+                // MAX reduce that may trigger a forced full rebuild.  Skipped
+                // entirely when maintenance is disabled (full_threshold >=
+                // NCENTERS), symmetric with the coordinator.  Must be ordered
+                // before the do_rebuild broadcast.
+                if (maintenance_enabled) {
                     double my_ratio = subIndex.getTombstoneRatio();
                     double dummy_max = 0.0;
                     MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
@@ -2004,10 +2014,11 @@ int main(int argc, char** argv)
                 }
 
                 // Tombstone ratio check — contribute this shard's ratio to the
-                // MAX reduce every step (symmetric with the coordinator) so it can
-                // trigger a forced full rebuild on its own.  Must be ordered before
-                // the do_rebuild broadcast.
-                {
+                // MAX reduce that may trigger a forced full rebuild.  Skipped
+                // entirely when maintenance is disabled (full_threshold >=
+                // NCENTERS), symmetric with the coordinator.  Must be ordered
+                // before the do_rebuild broadcast.
+                if (maintenance_enabled) {
                     double my_ratio = subIndex.getTombstoneRatio();
                     double dummy_max = 0.0;
                     MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
