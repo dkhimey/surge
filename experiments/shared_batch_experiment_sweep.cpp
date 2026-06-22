@@ -13,7 +13,7 @@
 //  Rebuild policy: delta always — shadow-delete departing elements and insert
 //  arriving ones using replace_deleted=true (keeps existing graph topology).
 //  Falls back to a full reconstruction if any shard's tombstone ratio exceeds
-//  TOMBSTONE_RATIO_THRESHOLD (currently 0.5 = 50% unused slots).  This check
+//  TOMBSTONE_RATIO_THRESHOLD (currently 0.75 = 75% unused slots).  This check
 //  fires independently of the center-movement rebuild threshold: a shard
 //  exceeding the ratio forces a full rebuild even when checkNeedRebuild() would
 //  otherwise report that no rebuild is needed.
@@ -166,7 +166,7 @@ static constexpr int    EF_ROUTING           = 100;
 static constexpr size_t SAMPLE_SIZE          = 100000;
 // If the maximum tombstone ratio across all executor shards meets or exceeds
 // this threshold during a delta-rebuild event, a full rebuild is used instead.
-static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.5;
+static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.75;
 // Write a checkpoint every this many runbook steps.  The new checkpoint is
 // fully written and fsync'd (via close()) before the previous one is removed,
 // so disk space is never exhausted by holding two copies simultaneously in the
@@ -174,9 +174,9 @@ static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.5;
 static constexpr size_t CHECKPOINT_INTERVAL       = 50;
 
 // ─── Sweep parameter grids (visible to all ranks so loop counts agree) ───────
-static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {20, 40, 60, 80};
-static const std::vector<int>   NPROBE_PARAMS           = {3, 5, 6, 7, 8, 9};
-static const std::vector<float> TARGET_PARAMS           = {.90f, .95f, .97f, .99f};
+static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {};
+static const std::vector<int>   NPROBE_PARAMS           = {3, 5, 6};
+static const std::vector<float> TARGET_PARAMS           = {.90f, .95f, .99f};
 
 // Build the ordered (mode, param) list once.  Both coordinator and executor
 // iterate this same list so their MPI collective calls stay in lockstep.
