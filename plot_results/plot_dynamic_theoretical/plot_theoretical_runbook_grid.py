@@ -71,8 +71,8 @@ def set_style():
 STYLE = {
     "with_maint":  dict(color="C0",        ls="-",  label="SURGE, fresh routing"),
     "no_maint":    dict(color="firebrick", ls="-",  label="SURGE, stale routing"),
-    "oracle_maint": dict(color="C0",        ls="--", alpha=0.6, label="Oracle, fresh"),
-    "oracle_no":   dict(color="firebrick", ls="--", alpha=0.6, label="Oracle, stale"),
+    "oracle_maint": dict(color="C0",        ls="--", alpha=0.6, label="Recall Target Oracle, fresh"),
+    "oracle_no":   dict(color="firebrick", ls="--", alpha=0.6, label="Recall Target Oracle, stale"),
     "gpann":       dict(color="C8",        ls="-",  label="GP-ANN"),
 }
 LEGEND_KEYS = {
@@ -340,7 +340,7 @@ def _line(ax, x, y, key):
 
 
 def _row_label(ax, text):
-    ax.text(-0.35, 0.3, text, transform=ax.transAxes, rotation=90,
+    ax.text(-0.3, -.1, text, transform=ax.transAxes, rotation=90,
             va="center", ha="center", fontweight="bold", fontsize=10)
 
 
@@ -490,10 +490,11 @@ def build_figure(mode, datasets, runbooks, loaded):
 #                                      show it twice)
 #
 # GP-ANN is overlaid at a fixed nprobe (ds.nprobe_param, the same "reasonable"
-# budget used in the nprobe figure) on the recall and imbalance strips. It has no
-# recall-target mode, so this is a cross-mode baseline: GP-ANN runs a fixed budget
-# while SURGE adapts to the target. Its activation would be a constant
-# nprobe/Np, so it is omitted from the activation strip.
+# budget used in the nprobe figure) on all three strips. It has no recall-target
+# mode, so this is a cross-mode baseline: GP-ANN runs a fixed budget while SURGE
+# adapts to the target. On the activation strip it is a flat line at its fixed
+# nprobe / N_partitions, included to contrast SURGE's adaptive activation with
+# GP-ANN's constant budget.
 # --------------------------------------------------------------------------- #
 def plot_cell_merged(ax_top, ax_act, ax_imb, ds, rb, d):
     surge = d["surge"]
@@ -518,12 +519,16 @@ def plot_cell_merged(ax_top, ax_act, ax_imb, ds, rb, d):
         if steps is not None:
             _line(ax_imb, steps, vals, key)
 
-    # GP-ANN at a fixed nprobe: recall (top) + imbalance (bottom).
+    # GP-ANN at a fixed nprobe: recall (top), activation (middle), imbalance
+    # (bottom). Its activation is the fixed budget nprobe / N_partitions, so the
+    # line is flat -- included as a reference for how many partitions SURGE's
+    # adaptive routing activates relative to GP-ANN's fixed budget.
     g = d["gpann"]
     if g is not None:
         gg = g[g["operation"] == "SEARCH"] if "operation" in g.columns else g
         gg = gg[gg["nprobe"] == ds.nprobe_param].sort_values("step")
         _line(ax_top, gg["step"], gg["theoretical_recall"], "gpann")
+        _line(ax_act, gg["step"], gg["nprobe"] / len(SHARD_COLS), "gpann")
         _line(ax_imb, gg["step"], gg["gini"], "gpann")
 
     ax_act.set_ylim(0, 0.705)
@@ -532,13 +537,13 @@ def plot_cell_merged(ax_top, ax_act, ax_imb, ds, rb, d):
 
 def build_figure_merged(datasets, runbooks, loaded):
     nrows, ncols = len(datasets), len(runbooks)
-    fig = plt.figure(figsize=(4 * ncols, 5 * nrows))
-    outer = fig.add_gridspec(nrows, ncols, hspace=0.18, wspace=0.2)
+    fig = plt.figure(figsize=(4.5 * ncols, 4.5 * nrows))
+    outer = fig.add_gridspec(nrows, ncols, hspace=0.1, wspace=0.2)
 
     for r, ds in enumerate(datasets):
         for c, rb in enumerate(runbooks):
             d = loaded[(ds.title, rb.title)]
-            cell = outer[r, c].subgridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.0)
+            cell = outer[r, c].subgridspec(3, 1, height_ratios=[2.8, 1.4, 1.4], hspace=0.0)
             ax_top = fig.add_subplot(cell[0])
             ax_act = fig.add_subplot(cell[1], sharex=ax_top)
             ax_imb = fig.add_subplot(cell[2], sharex=ax_top)
@@ -579,7 +584,7 @@ def build_figure_merged(datasets, runbooks, loaded):
 
     handles, labels, ncol = _stacked_columns(groups)
     fig.legend(handles, labels, loc="lower center", ncol=ncol, frameon=False,
-               bbox_to_anchor=(0.5, 0.93), columnspacing=1.8, handletextpad=0.5)
+               bbox_to_anchor=(0.5, 0.9), columnspacing=1.8, handletextpad=0.5)
     return fig
 
 
