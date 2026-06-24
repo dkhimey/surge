@@ -56,7 +56,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
-    {"sift-500M-clustered",
+    {"bigann-500M-clustered",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500M-bigann64clustered.u8bin"},
             {"runbook", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"},
