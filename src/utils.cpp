@@ -134,7 +134,27 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-1M.ibin"}
         }
 
-    }
+    },
+
+    {"sift-1B",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.u8bin"},
+            {"runbook", "TODO"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann/query.public.10K.u8bin"},
+            {"ground_truth_dir", "TODO"},
+            {"gt_file", "/dataset/big-ann-benchmarks/data/bigann/GT.public.1B.ibin"}
+        }
+    },
+
+    {"msturing-1B",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.fbin"},
+            {"runbook", "TODO"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
+            {"ground_truth_dir", "TODO"},
+            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt100-private10K-queries.bin"}
+        }
+    },
 };
 
 FileFormat getFileFormat(const std::string& filename) {
