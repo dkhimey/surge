@@ -466,7 +466,7 @@ int main(int argc, char** argv)
             << " <full_threshold>"
             << " <k> <gt_prefix> <output_file>"
             << " [--init-state-dir <dir> --init-partitions <file> [--init-state-step <N>]]"
-            << " [--search-scale <f> | --search-fraction <p>]\n"
+            << " [--search-scale <f> | --search-fraction <p1[,p2,...]>]\n"
             << "\n"
             << "  full_threshold : min centers to migrate to trigger a rebuild;\n"
             << "                   set >= " << NCENTERS << " to disable\n"
@@ -477,9 +477,14 @@ int main(int argc, char** argv)
             << "  touching insert/delete steps; pass at most one):\n"
             << "    --search-scale    <f>     multiply every search step's 10K query batch\n"
             << "                              by f (f>0; <1 shrinks, >1 grows the batch)\n"
-            << "    --search-fraction <p>     auto-pick f so searched vectors are fraction p\n"
-            << "                              of all (insert+delete+search) vectors over the\n"
-            << "                              whole runbook (p in (0,1); e.g. 0.10, 0.50)\n"
+            << "    --search-fraction <list>  ONE OR MORE comma-separated target fractions,\n"
+            << "                              e.g. 0.10,0.25,0.50 .  Each becomes a search\n"
+            << "                              variant: every search step is run once per\n"
+            << "                              fraction (× the mode/param sweep) and the\n"
+            << "                              fraction is recorded in the search_fraction\n"
+            << "                              CSV column.  Each p in (0,1); f is chosen so\n"
+            << "                              searched vectors are fraction p of all\n"
+            << "                              (insert+delete+search) vectors over the runbook.\n"
             << "  The query batch is tiled (query q uses original query q % nq_orig), so\n"
             << "  recall and theoretical recall are still computed once over the original\n"
             << "  query set + GT, while the timed window measures the scaled query count.\n"
@@ -531,21 +536,26 @@ int main(int argc, char** argv)
     // Both forms only change the SEARCH workload; the query batch is tiled
     // (logical query q uses original query q % nq_orig) so recall/GT stay
     // correct and base query memory is not duplicated.
-    double      search_scale_arg    = 1.0;   // --search-scale
-    double      search_fraction_arg = -1.0;  // --search-fraction (<0 = unset)
+    double      search_scale_arg     = 1.0;   // --search-scale (single)
+    // --search-fraction accepts ONE OR MORE comma-separated fractions, e.g.
+    // "0.10,0.25,0.50".  Each fraction becomes its own search variant: every
+    // search step is run once per variant (× the existing mode/param sweep),
+    // and the fraction is recorded in the new "search_fraction" CSV column.
+    std::string search_fractions_arg;          // raw comma-separated list ("" = unset)
     for (int ai = 7; ai < argc; ++ai) {
         const std::string a = argv[ai];
-        if      (a == "--init-state-dir"  && ai + 1 < argc) init_state_dir       = argv[++ai];
-        else if (a == "--init-partitions" && ai + 1 < argc) init_partitions_file = argv[++ai];
-        else if (a == "--init-state-step" && ai + 1 < argc) init_state_step      = std::stoi(argv[++ai]);
-        else if (a == "--search-scale"    && ai + 1 < argc) search_scale_arg     = std::stod(argv[++ai]);
-        else if (a == "--search-fraction" && ai + 1 < argc) search_fraction_arg  = std::stod(argv[++ai]);
+        if      (a == "--init-state-dir"   && ai + 1 < argc) init_state_dir       = argv[++ai];
+        else if (a == "--init-partitions"  && ai + 1 < argc) init_partitions_file = argv[++ai];
+        else if (a == "--init-state-step"  && ai + 1 < argc) init_state_step      = std::stoi(argv[++ai]);
+        else if (a == "--search-scale"     && ai + 1 < argc) search_scale_arg     = std::stod(argv[++ai]);
+        else if ((a == "--search-fraction" ||
+                  a == "--search-fractions") && ai + 1 < argc) search_fractions_arg = argv[++ai];
         else {
             std::cerr << "ERROR: unrecognised or incomplete argument: " << a << "\n";
             return 1;
         }
     }
-    if (search_fraction_arg > 0.0 && search_scale_arg != 1.0) {
+    if (!search_fractions_arg.empty() && search_scale_arg != 1.0) {
         std::cerr << "ERROR: pass only one of --search-scale / --search-fraction\n";
         return 1;
     }
@@ -614,19 +624,22 @@ int main(int argc, char** argv)
         MPI_Finalize(); return 1;
     }
 
-    // ── Resolve the global search-scale factor ───────────────────────────────
-    // Derived purely from the runbook + the query-file header, both of which
-    // are identical on every rank, so search_scale is computed identically
-    // everywhere (no broadcast needed; keeps all ranks' query counts — and
-    // therefore the per-search MPI collective sizes — in lockstep).
+    // ── Resolve search variants (scale + fraction label) ─────────────────────
+    // Each variant is one (scale, fraction) pair.  Every search step is run once
+    // per variant (× the existing mode/param sweep), and the fraction is recorded
+    // in the "search_fraction" CSV column.  Variants are derived purely from the
+    // runbook + query-file header (identical on every rank), so the variant list
+    // — and therefore the per-search MPI collective counts — stay in lockstep
+    // across ranks without any broadcast.
     //
-    //   --search-fraction p : updates  = total insert+delete vectors (fixed)
-    //                         base_vol = n_search_steps * nq_orig
-    //                         we want   search/(search+updates) = p, i.e.
-    //                         target   = p/(1-p) * updates,
-    //                         scale    = target / base_vol.
-    //   --search-scale f    : scale    = f directly.
-    double search_scale = 1.0;
+    //   --search-fraction p1,p2,… : updates  = total insert+delete vectors (fixed)
+    //                               base_vol = n_search_steps * nq_orig
+    //                               target_i = p_i/(1-p_i) * updates,
+    //                               scale_i  = target_i / base_vol.
+    //   --search-scale f          : single variant, scale = f, fraction = -1.
+    //   (neither)                 : single variant, scale = 1, fraction = -1.
+    struct SearchVariant { double scale; double fraction; }; // fraction < 0 = not fraction-based
+    std::vector<SearchVariant> search_variants;
     {
         auto [nq_orig_v, q_dim_v] = get_dataset_info(query_file);
         (void) q_dim_v;
@@ -637,29 +650,57 @@ int main(int argc, char** argv)
             else if (st.operation == "insert" || st.operation == "delete")
                 update_vecs += static_cast<long long>(st.end - st.start);
         }
-        if (search_fraction_arg > 0.0) {
-            const double p = search_fraction_arg;
-            if (p >= 1.0) {
-                if (rank == 0) std::cerr << "ERROR: --search-fraction must be in (0,1)\n";
+        const double base_vol = static_cast<double>(n_search_steps)
+                              * static_cast<double>(nq_orig);
+        auto scale_for_fraction = [&](double p) -> double {
+            const double target_vol = p / (1.0 - p) * static_cast<double>(update_vecs);
+            return (base_vol > 0.0) ? target_vol / base_vol : 1.0;
+        };
+
+        if (!search_fractions_arg.empty()) {
+            // Parse comma-separated fractions (manual split; avoids <sstream>).
+            size_t pos = 0;
+            const std::string& s_in = search_fractions_arg;
+            while (pos < s_in.size()) {
+                const size_t comma = s_in.find(',', pos);
+                std::string tok = (comma == std::string::npos)
+                    ? s_in.substr(pos) : s_in.substr(pos, comma - pos);
+                pos = (comma == std::string::npos) ? s_in.size() : comma + 1;
+                const size_t a = tok.find_first_not_of(" \t");
+                if (a == std::string::npos) continue;          // empty token
+                const size_t b = tok.find_last_not_of(" \t");
+                const double p = std::stod(tok.substr(a, b - a + 1));
+                if (p <= 0.0 || p >= 1.0) {
+                    if (rank == 0)
+                        std::cerr << "ERROR: each --search-fraction value must be in (0,1); got "
+                                  << p << "\n";
+                    MPI_Finalize(); return 1;
+                }
+                double s = scale_for_fraction(p);
+                if (s < 0.0) s = 0.0;
+                search_variants.push_back({s, p});
+            }
+            if (search_variants.empty()) {
+                if (rank == 0) std::cerr << "ERROR: --search-fraction list parsed to no values\n";
                 MPI_Finalize(); return 1;
             }
-            const double base_vol   = static_cast<double>(n_search_steps)
-                                    * static_cast<double>(nq_orig);
-            const double target_vol = p / (1.0 - p) * static_cast<double>(update_vecs);
-            search_scale = (base_vol > 0.0) ? target_vol / base_vol : 1.0;
         } else {
-            search_scale = search_scale_arg;
+            double s = search_scale_arg;
+            if (s < 0.0) s = 0.0;
+            search_variants.push_back({s, -1.0});
         }
-        if (search_scale < 0.0) search_scale = 0.0;
-        if (rank == 0)
-            std::cout << "[Sweep] search_scale=" << search_scale
-                      << "  (update_vecs=" << update_vecs
+
+        if (rank == 0) {
+            std::cout << "[Sweep] search variants (update_vecs=" << update_vecs
                       << ", search_steps=" << n_search_steps
-                      << ", nq_orig=" << nq_orig
-                      << (search_fraction_arg > 0.0
-                            ? "; target search fraction=" + std::to_string(search_fraction_arg)
-                            : "")
-                      << ")\n";
+                      << ", nq_orig=" << nq_orig << "):\n";
+            for (const auto& v : search_variants)
+                std::cout << "          scale=" << v.scale
+                          << (v.fraction >= 0.0
+                                ? "  (fraction=" + std::to_string(v.fraction) + ")"
+                                : "  (explicit scale)")
+                          << "\n";
+        }
     }
 
     // ── Log + communicator ────────────────────────────────────────────────────
@@ -866,6 +907,9 @@ int main(int argc, char** argv)
         }
         if (!resuming) {
             csv << "step,operation,mode,param"
+                // search variant's target fraction (-1 for non-search rows and for
+                // search rows produced by --search-scale or no scaling)
+                << ",search_fraction"
                 << ",range_start,range_end,time_s,throughput,recall@" << k
                 << ",theoretical_recall@" << k
                 << ",avg_parts_searched"
@@ -905,6 +949,10 @@ int main(int argc, char** argv)
         static const RebuildStats kNoRebuild{};
 
         // ── Helper: write one CSV row ─────────────────────────────────────────
+        // search_fraction defaults to -1 so non-search callers (insert/delete/
+        // rebuild/initial) need no change; the search caller passes the variant's
+        // fraction.  It is a trailing defaulted parameter (must be last) but is
+        // emitted right after param to match the header column order.
         auto write_row = [&](int step_num, const std::string& op,
                              const std::string& mode_str, float param_val,
                              int rs, int re,
@@ -912,10 +960,12 @@ int main(int argc, char** argv)
                              double theoretical_recall,
                              double avg_parts,
                              const RebuildStats& rb,
-                             const std::vector<unsigned long long>& sizes)
+                             const std::vector<unsigned long long>& sizes,
+                             double search_fraction = -1.0)
         {
             csv << step_num << "," << op
                 << "," << mode_str << "," << param_val
+                << "," << search_fraction
                 << "," << rs << "," << re
                 << "," << time_s << "," << throughput
                 << "," << recall
@@ -1377,20 +1427,12 @@ int main(int argc, char** argv)
 
                 // Load queries (not timed).
                 std::vector<float> queries = readVecs(query_file, dim);
-                // nq_orig = distinct queries actually present in the file.
-                // nq      = scaled query count that the TIMED window will run;
-                //           the batch is tiled (query q uses original q % nq_orig).
-                // chunk/my_qs/my_qe partition the SCALED index space so the timed
-                // routing+search work is distributed across all ranks.  Recall and
-                // theoretical recall are computed only on the first tile (q < nq_orig),
-                // i.e. exactly once over the original query set + GT.
+                // nq_orig = distinct queries present in the file.  Each search
+                // variant below scales this to nq = round(nq_orig * variant.scale)
+                // for its TIMED window; the batch is tiled (query q reuses original
+                // q % nq_orig).  Recall/theoretical recall are computed once per
+                // variant over the first tile (q < nq_orig) — the original set + GT.
                 const size_t nq_orig = queries.size() / dim;
-                const size_t nq      = (nq_orig == 0) ? 0
-                    : std::max<size_t>(1,
-                          static_cast<size_t>(static_cast<double>(nq_orig) * search_scale + 0.5));
-                const size_t chunk = (nq + world_size - 1) / world_size;
-                const size_t my_qs = static_cast<size_t>(rank) * chunk;
-                const size_t my_qe = std::min(my_qs + chunk, nq);
 
                 // Load GT once for the whole sweep over this search step.
                 std::vector<std::vector<int>> gt;
@@ -1420,6 +1462,45 @@ int main(int argc, char** argv)
                 // GT->partition lookup and routeQuery use EF_ROUTING (matching the
                 // Python theoretical pipeline's router ef).
                 routing_hnsw->setEf(EF_ROUTING);
+
+                // ── Combo + result buffers (shared across all search variants) ──
+                // ComboResult now carries the variant's search_fraction so each row
+                // is labelled.  combo_results accumulates n_combos * |variants| rows.
+                struct ComboResult {
+                    std::string mode_str;
+                    float       param;
+                    double      search_fraction; // variant fraction (-1 if not fraction-based)
+                    double      time_s;
+                    double      qps;
+                    double      recall;
+                    double      avg_parts;
+                    // Theoretical recall via the exact label_to_shard ownership map
+                    // (online method, matching gp-ann); -1 if no GT for this step.
+                    double      theoretical_recall;
+                };
+                std::vector<ComboResult> combo_results;
+                combo_results.reserve(static_cast<size_t>(n_combos) * search_variants.size());
+
+                // Precompute once: routing centers per partition (scale-independent).
+                // Matches np.bincount(partitions); passed into routeQuery so
+                // RecallTarget mode doesn't recompute it per query.
+                std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
+                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
+
+                // ── Search-variant loop ───────────────────────────────────────────
+                // Each variant is one (scale, fraction).  Every variant runs the
+                // identical MPI-collective sequence (same combos in the same order),
+                // so all ranks stay in lockstep; the executor mirrors this loop.
+                for (const auto& variant : search_variants) {
+                    const double search_scale     = variant.scale;
+                    const double variant_fraction = variant.fraction;
+                    // Per-variant scaled query count + slice over the SCALED space.
+                    const size_t nq = (nq_orig == 0) ? 0
+                        : std::max<size_t>(1,
+                              static_cast<size_t>(static_cast<double>(nq_orig) * search_scale + 0.5));
+                    const size_t chunk = (nq + world_size - 1) / world_size;
+                    const size_t my_qs = static_cast<size_t>(rank) * chunk;
+                    const size_t my_qe = std::min(my_qs + chunk, nq);
 
                 // ── Theoretical-recall setup ─────────────────────────────
                 // For each query in this rank's slice, resolve its top-K GT
@@ -1467,32 +1548,6 @@ int main(int argc, char** argv)
                         }
                     }
                 }
-
-                // ── Combo loop (results buffered; collect_sizes() called once after) ──
-                // Declared before the loop because ComboResult must live that long.
-                struct ComboResult {
-                    std::string mode_str;
-                    float       param;
-                    double      time_s;
-                    double      qps;
-                    double      recall;
-                    double      avg_parts;
-                    // Theoretical recall: fraction of the top-K GT neighbours
-                    // whose owning partition the router would also probe for
-                    // this mode/param.  GT→partition mapping uses the exact
-                    // label_to_shard ownership map (online method, matching
-                    // gp-ann) — no meta-HNSW re-route.
-                    // -1 if no GT was loaded for this step.
-                    double      theoretical_recall;
-                };
-                std::vector<ComboResult> combo_results;
-                combo_results.reserve(n_combos);
-
-                // Precompute once: number of routing centers per partition.
-                // Passed into routeQuery so RecallTarget mode doesn't recompute
-                // this per-query.  Matches np.bincount(partitions) in the Python.
-                std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
-                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
 
                 for (int ci = 0; ci < n_combos; ci++) {
                     const auto& [sweep_mode, sweep_param] = sweep_combos[ci];
@@ -1679,9 +1734,11 @@ int main(int argc, char** argv)
                               << "  avg_parts=" << avg_parts << "\n";
 
                     combo_results.push_back({sweep_mode_str, sweep_param,
+                                             variant_fraction,
                                              max_t, qps, recall, avg_parts,
                                              theoretical_recall});
                 }
+                } // end search-variant loop
 
                 // No rebuild after search.
                 int rb_type = 0;
@@ -1698,7 +1755,7 @@ int main(int argc, char** argv)
                               cr.time_s, cr.qps, cr.recall,
                               cr.theoretical_recall,
                               cr.avg_parts,
-                              kNoRebuild, sizes);
+                              kNoRebuild, sizes, cr.search_fraction);
                 }
 
             } else {
@@ -2190,18 +2247,11 @@ int main(int argc, char** argv)
             // ── SEARCH (executor side of sweep loop) ──────────────────────────
             } else if (op_code == 2) {
                 std::vector<float> queries = readVecs(query_file, dim);
-                // Mirror coordinator: scaled query count nq drives chunking and the
-                // timed work; recall is gated to the first tile (q < nq_orig).
-                // search_scale + nq_orig are identical on every rank, so chunk/my_qs/
-                // my_qe match the coordinator and the per-search collectives stay in
-                // lockstep.
+                // Mirror coordinator: nq_orig is the distinct query count; each
+                // variant scales it to nq for the timed work.  search_variants,
+                // nq_orig, and the combo list are identical on every rank, so the
+                // per-search collective counts stay in lockstep with the coordinator.
                 const size_t nq_orig = queries.size() / dim;
-                const size_t nq      = (nq_orig == 0) ? 0
-                    : std::max<size_t>(1,
-                          static_cast<size_t>(static_cast<double>(nq_orig) * search_scale + 0.5));
-                const size_t chunk = (nq + world_size - 1) / world_size;
-                const size_t my_qs = static_cast<size_t>(rank) * chunk;
-                const size_t my_qe = std::min(my_qs + chunk, nq);
 
                 // Load GT for recall computation (matches coordinator's load).
                 std::vector<std::vector<int>> gt;
@@ -2229,6 +2279,23 @@ int main(int argc, char** argv)
                 // must be set here each search step on every rank.
                 routing_hnsw->setEf(EF_ROUTING);
 
+                // Precompute once: routing centers per partition (scale-independent;
+                // mirrors coordinator).
+                std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
+                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
+
+                // ── Search-variant loop (mirrors coordinator exactly) ─────────────
+                // Same (scale, fraction) list, same order, so the MPI-collective
+                // sequence matches the coordinator and all ranks stay in lockstep.
+                for (const auto& variant : search_variants) {
+                    const double search_scale = variant.scale;
+                    const size_t nq = (nq_orig == 0) ? 0
+                        : std::max<size_t>(1,
+                              static_cast<size_t>(static_cast<double>(nq_orig) * search_scale + 0.5));
+                    const size_t chunk = (nq + world_size - 1) / world_size;
+                    const size_t my_qs = static_cast<size_t>(rank) * chunk;
+                    const size_t my_qe = std::min(my_qs + chunk, nq);
+
                 // ── Theoretical-recall setup (mirrors coordinator) ───────
                 // Exact GT→partition mapping via the replicated label_to_shard
                 // map (online method, matching gp-ann).  Per-neighbour partition
@@ -2255,10 +2322,6 @@ int main(int argc, char** argv)
                         }
                     }
                 }
-
-                // Precompute once: number of routing centers per partition (mirrors coordinator).
-                std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
-                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
 
                 // Run once per combo — must match coordinator's combo loop exactly.
                 for (int ci = 0; ci < n_combos; ci++) {
@@ -2439,6 +2502,7 @@ int main(int argc, char** argv)
                                MPI_SUM, 0, MPI_COMM_WORLD);
 
                 } // end executor combo loop
+                } // end executor search-variant loop
 
                 // No rebuild after search.
                 int rb_type = 0;

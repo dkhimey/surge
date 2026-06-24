@@ -10,9 +10,10 @@
 # (--init-state-dir sim-<dataset> --init-partitions sim-<dataset>/step_000001_partitions.csv)
 # instead of building the index from scratch.
 #
-# Searches are scaled to 50% of the (insert+delete+search) vector workload via
-# --search-fraction 0.50 (see SEARCH_FRACTION below); insert/delete steps are
-# unchanged and recall is still computed over the original query set.
+# Searches are run at several target fractions of the (insert+delete+search)
+# vector workload in one pass via --search-fraction (see SEARCH_FRACTION below);
+# insert/delete steps are unchanged and recall is computed over the original
+# query set.
 #
 # Runs are executed sequentially.  Each run is identified solely by
 # (dataset, threshold); all output paths are derived from that identity so
@@ -43,12 +44,14 @@ NUM_RANKS=$(( NUM_PARTITIONS + 1 ))   # 11: 1 coordinator + 10 executors
 K=10
 RANKFILE="${1:-rankfile.txt}"
 
-# Search-query scaling: make searches 50% of the (insert+delete+search) vector
-# workload.  The binary tiles each search step's query batch by the factor
-# needed to hit this fraction (insert/delete steps are left unchanged); QPS is
-# measured over the scaled query count while recall is computed once over the
-# original query set.  Set to empty to disable scaling.
-SEARCH_FRACTION=0.50
+# Search-query scaling: run each search step at MULTIPLE target fractions of the
+# (insert+delete+search) vector workload in a single pass.  The binary tiles each
+# search step's query batch by the factor needed to hit each fraction (insert/
+# delete steps are left unchanged); QPS is measured over the scaled query count
+# while recall is computed once over the original query set.  Every fraction is
+# measured on the IDENTICAL index state, so the rows can be compared directly via
+# the search_fraction CSV column.  Comma-separated list; empty disables scaling.
+SEARCH_FRACTION=0.05,0.50
 
 # MPI transport: restrict to the flat LAN interface so Open MPI doesn't
 # accidentally route inter-node traffic over the wrong interface on CloudLab.
