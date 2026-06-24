@@ -6,13 +6,25 @@
 #   t=6000  → maintenance enabled  (τ = 0.6, 60% of 10 000 centers)
 #   t=10000 → maintenance disabled (≥ NCENTERS, never triggers)
 #
-# 6 runs total, executed sequentially.  Each run is identified solely by
+# Each sweep starts from the cluster-analysis step-1 state for its dataset
+# (--init-state-dir sim-<dataset> --init-partitions sim-<dataset>/step_000001_partitions.csv)
+# instead of building the index from scratch.
+#
+# Searches are scaled to 50% of the (insert+delete+search) vector workload via
+# --search-fraction 0.50 (see SEARCH_FRACTION below); insert/delete steps are
+# unchanged and recall is still computed over the original query set.
+#
+# Runs are executed sequentially.  Each run is identified solely by
 # (dataset, threshold); all output paths are derived from that identity so
 # that a restarted run automatically resumes and appends to the same files:
 #
 #   results/<dataset>_t<threshold>/results.csv   ← append on resume
 #   results/<dataset>_t<threshold>/run.log       ← append on resume
 #   checkpoints/<dataset>_t<threshold>/          ← managed by the binary
+#
+# Note: the starting state is used only on a fresh start; if a checkpoint
+# exists for a (dataset, threshold) the binary resumes from it and ignores
+# the --init-state-* flags.
 #
 # Prerequisites:
 #   1. Build:  make experiments
@@ -31,6 +43,13 @@ NUM_RANKS=$(( NUM_PARTITIONS + 1 ))   # 11: 1 coordinator + 10 executors
 K=10
 RANKFILE="${1:-rankfile.txt}"
 
+# Search-query scaling: make searches 50% of the (insert+delete+search) vector
+# workload.  The binary tiles each search step's query batch by the factor
+# needed to hit this fraction (insert/delete steps are left unchanged); QPS is
+# measured over the scaled query count while recall is computed once over the
+# original query set.  Set to empty to disable scaling.
+SEARCH_FRACTION=0.50
+
 # MPI transport: restrict to the flat LAN interface so Open MPI doesn't
 # accidentally route inter-node traffic over the wrong interface on CloudLab.
 MCA_OPTS="-mca btl_tcp_if_include br-flat-lan-1"
@@ -41,15 +60,22 @@ TASKSET="taskset -c 0-31"
 # Maintenance thresholds to sweep
 THRESHOLDS=(6000 10000)
 
+# Starting state: each sweep begins from the cluster-analysis step-1 output
+# instead of building from scratch.  For dataset <key> the state lives in
+# sim-<key>/ (meta-HNSW, centroids, counts, label→center) with the precomputed
+# center→shard partitions at sim-<key>/step_000001_partitions.csv.
+INIT_STATE_STEP=1
+
 # ── Dataset registry ──────────────────────────────────────────────────────────
 # Format: "dataset_key|gt_prefix|runbook_yaml"
 declare -a DATASETS=(
-    "msturing-100M-clustered|/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100000000/msturing-100M-clustered_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/msturing-100M-clustered_runbookfinal.yaml"
+#    "msturing-100M-clustered|/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100000000/msturing-100M-clustered_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/msturing-100M-clustered_runbookfinal.yaml"
 #    "msturing-100M-random|/dataset/big-ann-benchmarks/data/MSTuring-100M-random/100000000/runbook-msturing-100M-random.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-random/runbook-msturing-100M-random.yaml"
     "msturing-100M-shift|/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100000000/msturing-100M-shift_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/msturing-100M-shift_runbookfinal.yaml"
     "bigann-100M-clustered|/dataset/big-ann-benchmarks/data/bigann-clustered/100000000/runbook-bigann-100M.yaml|/dataset/big-ann-benchmarks/data/bigann-clustered/runbook-bigann-100M.yaml"
 #    "bigann-100M-random|/dataset/big-ann-benchmarks/data/bigann-random/100000000/runbook-bigann-100M-random.yaml|/dataset/big-ann-benchmarks/data/bigann-random/runbook-bigann-100M-random.yaml"
-    "bigann-100M-shift|/dataset/big-ann-benchmarks/data/bigann-shift/100000000/bigann-100M-shift_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/bigann-shift/bigann-100M-shift_runbookfinal.yaml"
+#   "bigann-100M-shift|/dataset/big-ann-benchmarks/data/bigann-shift/100000000/bigann-100M-shift_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/bigann-shift/bigann-100M-shift_runbookfinal.yaml"
+    "bigann-500M-clustered|/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500000000/runbook_bigann-500M-clustered.yaml|/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"
 )
 
 # ── Helper: last step number in a runbook YAML ────────────────────────────────
@@ -101,6 +127,12 @@ for entry in "${DATASETS[@]}"; do
     GT_PREFIX="${_rest%%|*}"
     RUNBOOK="${_rest##*|}"
 
+    # Step-1 starting state produced by msturing-cluster-analysis.cpp for this
+    # dataset (e.g. sim-msturing-100M-clustered) plus its precomputed partitions.
+    INIT_STATE_DIR="sim-${DATASET}"
+    INIT_PARTITIONS="${INIT_STATE_DIR}/step_000001_partitions.csv"
+    STEP_PREFIX="$(printf 'step_%06d' "$INIT_STATE_STEP")"
+
     for THRESHOLD in "${THRESHOLDS[@]}"; do
         TAG="${DATASET}_t${THRESHOLD}"
         RUN_DIR="results/${TAG}"
@@ -119,9 +151,27 @@ for entry in "${DATASETS[@]}"; do
             continue
         fi
 
+        # Verify the step-1 starting-state files exist before launching.  These
+        # are ignored on resume (a checkpoint takes precedence), but a fresh run
+        # needs them, so fail fast with a clear message if they are missing.
+        if [[ ! -f "${INIT_STATE_DIR}/${STEP_PREFIX}_hnsw.bin" || ! -f "$INIT_PARTITIONS" ]]; then
+            echo "════════════════════════════════════════════════════════════"
+            echo "  dataset   : $DATASET"
+            echo "  threshold : $THRESHOLD"
+            echo "  → ERROR: starting-state files missing; skipping"
+            echo "           expected ${INIT_STATE_DIR}/${STEP_PREFIX}_hnsw.bin"
+            echo "           and      $INIT_PARTITIONS"
+            echo "════════════════════════════════════════════════════════════"
+            echo
+            FAILED+=("$TAG (missing starting state)")
+            continue
+        fi
+
         echo "════════════════════════════════════════════════════════════"
         echo "  dataset   : $DATASET"
         echo "  threshold : $THRESHOLD"
+        echo "  init state: $INIT_STATE_DIR (step $INIT_STATE_STEP)"
+        echo "  partitions: $INIT_PARTITIONS"
         echo "  output    : $OUTPUT"
         echo "  log       : $LOG"
         echo "  started   : $(date)"
@@ -134,8 +184,10 @@ for entry in "${DATASETS[@]}"; do
             echo "dataset   : $DATASET"
             echo "threshold : $THRESHOLD"
             echo "gt_prefix : $GT_PREFIX"
+            echo "init state: $INIT_STATE_DIR (step $INIT_STATE_STEP)"
+            echo "partitions: $INIT_PARTITIONS"
             echo "output    : $OUTPUT"
-            echo "command   : mpirun $MCA_OPTS -np $NUM_RANKS --rankfile $RANKFILE $TASKSET $BINARY $DATASET $NUM_PARTITIONS $THRESHOLD $K $GT_PREFIX $OUTPUT"
+            echo "command   : mpirun $MCA_OPTS -np $NUM_RANKS --rankfile $RANKFILE $TASKSET $BINARY $DATASET $NUM_PARTITIONS $THRESHOLD $K $GT_PREFIX $OUTPUT --init-state-dir $INIT_STATE_DIR --init-partitions $INIT_PARTITIONS --init-state-step $INIT_STATE_STEP${SEARCH_FRACTION:+ --search-fraction $SEARCH_FRACTION}"
             echo "---"
         } >> "$LOG"
 
@@ -144,6 +196,10 @@ for entry in "${DATASETS[@]}"; do
                $TASKSET "$BINARY" \
                "$DATASET" "$NUM_PARTITIONS" "$THRESHOLD" "$K" \
                "$GT_PREFIX" "$OUTPUT" \
+               --init-state-dir "$INIT_STATE_DIR" \
+               --init-partitions "$INIT_PARTITIONS" \
+               --init-state-step "$INIT_STATE_STEP" \
+               ${SEARCH_FRACTION:+--search-fraction "$SEARCH_FRACTION"} \
                2>&1 | tee -a "$LOG"; then
             echo "  → finished at $(date)"
         else
