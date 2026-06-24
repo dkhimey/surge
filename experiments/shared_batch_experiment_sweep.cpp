@@ -176,7 +176,7 @@ static constexpr size_t CHECKPOINT_INTERVAL       = 50;
 
 // ─── Sweep parameter grids (visible to all ranks so loop counts agree) ───────
 static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {};
-static const std::vector<int>   NPROBE_PARAMS           = {3, 5, 6};
+static const std::vector<int>   NPROBE_PARAMS           = {3, 5};
 static const std::vector<float> TARGET_PARAMS           = {.90f, .95f, .99f};
 
 // Build the ordered (mode, param) list once.  Both coordinator and executor
