@@ -167,7 +167,7 @@ static constexpr int    EF_ROUTING           = 100;
 static constexpr size_t SAMPLE_SIZE          = 100000;
 // If the maximum tombstone ratio across all executor shards meets or exceeds
 // this threshold during a delta-rebuild event, a full rebuild is used instead.
-static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.75;
+static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.50;
 // Write a checkpoint every this many runbook steps.  The new checkpoint is
 // fully written and fsync'd (via close()) before the previous one is removed,
 // so disk space is never exhausted by holding two copies simultaneously in the
