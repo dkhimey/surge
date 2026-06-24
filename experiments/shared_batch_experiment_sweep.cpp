@@ -32,10 +32,11 @@
 //  theoretical_recall@<k> is computed during the sweep (search rows only;
 //  -1 elsewhere).  For each query it equals
 //    | gt_partitions(q) ∩ visited_partitions(q, mode, param) | / | gt_partitions(q) |
-//  where gt_partitions(q) is the set of partitions holding q's top-K GT
-//  neighbours, looked up via a fresh routing_hnsw->searchKnn(gt_vec, 1) pass
-//  — matching compute_theoretical_recall_updated.py exactly.  Computed
-//  outside the timed search window so throughput is unaffected.
+//  where gt_partitions(q) is the multiset of partitions physically holding
+//  q's top-K GT neighbours, resolved via the exact label_to_shard ownership
+//  map (the online method, matching gp-ann's label_to_shard lookup) rather
+//  than a meta-HNSW re-route.  Computed outside the timed search window so
+//  throughput is unaffected.
 //  Rebuild rows (operation="rebuild") additionally populate:
 //    centers_moved, elements_moved,
 //    repart_hnsw_s, repart_bottom_s, repart_kaffpa_s, repart_relabel_s,
@@ -464,12 +465,24 @@ int main(int argc, char** argv)
             << " <dataset> <num_partitions>"
             << " <full_threshold>"
             << " <k> <gt_prefix> <output_file>"
-            << " [--init-state-dir <dir> --init-partitions <file> [--init-state-step <N>]]\n"
+            << " [--init-state-dir <dir> --init-partitions <file> [--init-state-step <N>]]"
+            << " [--search-scale <f> | --search-fraction <p>]\n"
             << "\n"
             << "  full_threshold : min centers to migrate to trigger a rebuild;\n"
             << "                   set >= " << NCENTERS << " to disable\n"
             << "  gt_prefix      : directory with per-step GT files (step<N>.gt100),"
                " or \"\" for static GT only\n"
+            << "\n"
+            << "  Search-scaling options (change the search:update workload mix without\n"
+            << "  touching insert/delete steps; pass at most one):\n"
+            << "    --search-scale    <f>     multiply every search step's 10K query batch\n"
+            << "                              by f (f>0; <1 shrinks, >1 grows the batch)\n"
+            << "    --search-fraction <p>     auto-pick f so searched vectors are fraction p\n"
+            << "                              of all (insert+delete+search) vectors over the\n"
+            << "                              whole runbook (p in (0,1); e.g. 0.10, 0.50)\n"
+            << "  The query batch is tiled (query q uses original query q % nq_orig), so\n"
+            << "  recall and theoretical recall are still computed once over the original\n"
+            << "  query set + GT, while the timed window measures the scaled query count.\n"
             << "\n"
             << "  Starting-state options (skip the from-scratch KMeans build and start\n"
             << "  from the output of msturing-cluster-analysis.cpp step <N>):\n"
@@ -509,15 +522,32 @@ int main(int argc, char** argv)
     std::string init_state_dir;
     std::string init_partitions_file;
     int         init_state_step = 1;
+    // ── Search-scaling flags (mutually exclusive; default = no scaling) ──────
+    //   --search-scale <f>     multiply every search step's query batch by f.
+    //   --search-fraction <p>  choose f automatically so that searched vectors
+    //                          make up fraction p of all (insert+delete+search)
+    //                          vectors over the whole runbook, holding the
+    //                          insert/delete steps fixed.  p must be in (0,1).
+    // Both forms only change the SEARCH workload; the query batch is tiled
+    // (logical query q uses original query q % nq_orig) so recall/GT stay
+    // correct and base query memory is not duplicated.
+    double      search_scale_arg    = 1.0;   // --search-scale
+    double      search_fraction_arg = -1.0;  // --search-fraction (<0 = unset)
     for (int ai = 7; ai < argc; ++ai) {
         const std::string a = argv[ai];
         if      (a == "--init-state-dir"  && ai + 1 < argc) init_state_dir       = argv[++ai];
         else if (a == "--init-partitions" && ai + 1 < argc) init_partitions_file = argv[++ai];
         else if (a == "--init-state-step" && ai + 1 < argc) init_state_step      = std::stoi(argv[++ai]);
+        else if (a == "--search-scale"    && ai + 1 < argc) search_scale_arg     = std::stod(argv[++ai]);
+        else if (a == "--search-fraction" && ai + 1 < argc) search_fraction_arg  = std::stod(argv[++ai]);
         else {
             std::cerr << "ERROR: unrecognised or incomplete argument: " << a << "\n";
             return 1;
         }
+    }
+    if (search_fraction_arg > 0.0 && search_scale_arg != 1.0) {
+        std::cerr << "ERROR: pass only one of --search-scale / --search-fraction\n";
+        return 1;
     }
     const bool use_init_state = !init_state_dir.empty() && !init_partitions_file.empty();
     if (!init_state_dir.empty() ^ !init_partitions_file.empty()) {
@@ -582,6 +612,54 @@ int main(int argc, char** argv)
     if (steps.empty() || steps[0].operation != "insert") {
         if (rank == 0) std::cerr << "ERROR: runbook must begin with an insert step\n";
         MPI_Finalize(); return 1;
+    }
+
+    // ── Resolve the global search-scale factor ───────────────────────────────
+    // Derived purely from the runbook + the query-file header, both of which
+    // are identical on every rank, so search_scale is computed identically
+    // everywhere (no broadcast needed; keeps all ranks' query counts — and
+    // therefore the per-search MPI collective sizes — in lockstep).
+    //
+    //   --search-fraction p : updates  = total insert+delete vectors (fixed)
+    //                         base_vol = n_search_steps * nq_orig
+    //                         we want   search/(search+updates) = p, i.e.
+    //                         target   = p/(1-p) * updates,
+    //                         scale    = target / base_vol.
+    //   --search-scale f    : scale    = f directly.
+    double search_scale = 1.0;
+    {
+        auto [nq_orig_v, q_dim_v] = get_dataset_info(query_file);
+        (void) q_dim_v;
+        const long long nq_orig = static_cast<long long>(nq_orig_v);
+        long long n_search_steps = 0, update_vecs = 0;
+        for (const auto& st : steps) {
+            if (st.operation == "search") ++n_search_steps;
+            else if (st.operation == "insert" || st.operation == "delete")
+                update_vecs += static_cast<long long>(st.end - st.start);
+        }
+        if (search_fraction_arg > 0.0) {
+            const double p = search_fraction_arg;
+            if (p >= 1.0) {
+                if (rank == 0) std::cerr << "ERROR: --search-fraction must be in (0,1)\n";
+                MPI_Finalize(); return 1;
+            }
+            const double base_vol   = static_cast<double>(n_search_steps)
+                                    * static_cast<double>(nq_orig);
+            const double target_vol = p / (1.0 - p) * static_cast<double>(update_vecs);
+            search_scale = (base_vol > 0.0) ? target_vol / base_vol : 1.0;
+        } else {
+            search_scale = search_scale_arg;
+        }
+        if (search_scale < 0.0) search_scale = 0.0;
+        if (rank == 0)
+            std::cout << "[Sweep] search_scale=" << search_scale
+                      << "  (update_vecs=" << update_vecs
+                      << ", search_steps=" << n_search_steps
+                      << ", nq_orig=" << nq_orig
+                      << (search_fraction_arg > 0.0
+                            ? "; target search fraction=" + std::to_string(search_fraction_arg)
+                            : "")
+                      << ")\n";
     }
 
     // ── Log + communicator ────────────────────────────────────────────────────
@@ -1299,7 +1377,17 @@ int main(int argc, char** argv)
 
                 // Load queries (not timed).
                 std::vector<float> queries = readVecs(query_file, dim);
-                const size_t nq    = queries.size() / dim;
+                // nq_orig = distinct queries actually present in the file.
+                // nq      = scaled query count that the TIMED window will run;
+                //           the batch is tiled (query q uses original q % nq_orig).
+                // chunk/my_qs/my_qe partition the SCALED index space so the timed
+                // routing+search work is distributed across all ranks.  Recall and
+                // theoretical recall are computed only on the first tile (q < nq_orig),
+                // i.e. exactly once over the original query set + GT.
+                const size_t nq_orig = queries.size() / dim;
+                const size_t nq      = (nq_orig == 0) ? 0
+                    : std::max<size_t>(1,
+                          static_cast<size_t>(static_cast<double>(nq_orig) * search_scale + 0.5));
                 const size_t chunk = (nq + world_size - 1) / world_size;
                 const size_t my_qs = static_cast<size_t>(rank) * chunk;
                 const size_t my_qe = std::min(my_qs + chunk, nq);
@@ -1335,42 +1423,47 @@ int main(int argc, char** argv)
 
                 // ── Theoretical-recall setup ─────────────────────────────
                 // For each query in this rank's slice, resolve its top-K GT
-                // neighbours to partition IDs via a fresh meta-HNSW lookup
-                // (mirrors compute_theoretical_recall_updated.py).  Each rank
-                // computes its own slice — no broadcast needed because
-                // routing_hnsw and routing_partitions are already replicated.
-                // Runs outside the per-combo timing window, so search
-                // throughput is unaffected.
+                // neighbours to the partition that *physically owns* each
+                // neighbour via the exact label_to_shard map (the online
+                // method, matching gp-ann's distributed_insert_bench_sweep.cpp
+                // label_to_shard lookup).  This is the partition the vector was
+                // actually distributed to — kept accurate across delta rebuilds
+                // — rather than the partition a fresh meta-HNSW kNN(1) re-route
+                // would assign it to.  The paper defines theoretical recall over
+                // the partitions that *hold* a query's true neighbours, so the
+                // physical owner is the correct mapping; the re-route was only
+                // an approximation inherited from the offline Python pipeline,
+                // which has no per-vector ownership map.
+                //
+                // label_to_shard is replicated on every rank (derived from
+                // label_to_center / broadcast on resume), so each rank resolves
+                // its own slice with no extra communication.  Deleted/tombstoned
+                // GT ids are absent from the map and stay -1 (counted as misses,
+                // matching gp-ann).  Runs outside the per-combo timing window.
                 //
                 // gt_partitions[q-my_qs] is a per-neighbour vector (length kk,
                 // -1 for unresolved ids) — NOT a set.  This gives the
                 // neighbor-frequency theoretical recall used by the Python
                 // _recall(), which is a strict upper bound on actual recall.
+                // Stores raw partition ids (label_to_shard value − 1), since the
+                // visited set `targets` is keyed by partition_id + 1.
                 std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
                 if (have_gt) {
-                    BaseMmap base_view(base_file, file_format);
-                    #pragma omp parallel
-                    {
-                        std::vector<float> tmp_vec;
-                        #pragma omp for schedule(static)
-                        for (size_t q = my_qs; q < my_qe; q++) {
-                            if (q >= gt.size()) continue;
-                            const auto& gt_q = gt[q];
-                            const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
-                            auto&       glist = gt_partitions[q - my_qs];
-                            glist.assign(kk, -1);
-                            for (int i = 0; i < kk; i++) {
-                                const int gid = gt_q[i];
-                                if (gid < 0 || static_cast<uint32_t>(gid) >= base_view.n())
-                                    continue;
-                                base_view.readVector(static_cast<uint32_t>(gid), tmp_vec);
-                                auto pq = routing_hnsw->searchKnn(tmp_vec.data(), 1);
-                                if (pq.empty()) continue;
-                                const int cid = static_cast<int>(pq.top().second);
-                                if (cid < 0 || cid >= static_cast<int>(routing_partitions.size()))
-                                    continue;
-                                glist[i] = routing_partitions[cid];
-                            }
+                    #pragma omp parallel for schedule(static)
+                    for (size_t q = my_qs; q < my_qe; q++) {
+                        // First tile only: tile copies (q >= nq_orig) reuse the
+                        // same GT, so resolving them again would be redundant.
+                        if (q >= nq_orig || q >= gt.size()) continue;
+                        const auto& gt_q = gt[q];
+                        const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
+                        auto&       glist = gt_partitions[q - my_qs];
+                        glist.assign(kk, -1);
+                        for (int i = 0; i < kk; i++) {
+                            const int gid = gt_q[i];
+                            if (gid < 0) continue;
+                            auto it = label_to_shard.find(gid);
+                            if (it == label_to_shard.end()) continue;  // deleted → miss
+                            glist[i] = it->second - 1;                 // shard rank → raw partition id
                         }
                     }
                 }
@@ -1384,11 +1477,11 @@ int main(int argc, char** argv)
                     double      qps;
                     double      recall;
                     double      avg_parts;
-                    // Theoretical recall: fraction of partitions holding the
-                    // top-K GT neighbours that the router would also probe
-                    // for this mode/param.  GT→partition mapping uses a fresh
-                    // routing_hnsw->searchKnn(gt_vec, 1) lookup per GT id,
-                    // matching compute_theoretical_recall_updated.py exactly.
+                    // Theoretical recall: fraction of the top-K GT neighbours
+                    // whose owning partition the router would also probe for
+                    // this mode/param.  GT→partition mapping uses the exact
+                    // label_to_shard ownership map (online method, matching
+                    // gp-ann) — no meta-HNSW re-route.
                     // -1 if no GT was loaded for this step.
                     double      theoretical_recall;
                 };
@@ -1423,7 +1516,10 @@ int main(int argc, char** argv)
 
                         #pragma omp for nowait schedule(static)
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            float* Q = queries.data() + q * dim;
+                            // Tiled fetch: scaled query q reuses original query
+                            // (q % nq_orig).  ALL nq scaled queries are routed and
+                            // scattered so the timed window does the full work.
+                            float* Q = queries.data() + (q % nq_orig) * dim;
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
                                 num_partitions, sweep_mode, sweep_param,
@@ -1434,11 +1530,14 @@ int main(int argc, char** argv)
                                 local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
                             }
 
-                            // Theoretical recall (neighbor-frequency, upper-
-                            // bounds actual recall): for each top-K GT
-                            // neighbour, check whether its owning partition
-                            // is in the visited set; divide by k.  targets
+                            // Theoretical recall — computed once, over the first
+                            // tile only (q < nq_orig).  Tile copies carry an empty
+                            // glist, but the explicit gate makes the intent clear.
+                            // Neighbor-frequency form (upper-bounds actual recall):
+                            // for each top-K GT neighbour, check whether its owning
+                            // partition is in the visited set; divide by k.  targets
                             // stores partition_id + 1; subtract 1 to recover.
+                            if (q >= nq_orig) continue;
                             const auto& glist = gt_partitions[q - my_qs];
                             if (!glist.empty()) {
                                 int inter = 0;
@@ -1514,6 +1613,10 @@ int main(int argc, char** argv)
                         const size_t nres = rcv_rqids[src].size();
                         for (size_t j = 0; j < nres; j++) {
                             const uint32_t qid   = rcv_rqids[src][j];
+                            // Recall is measured on the original query set only;
+                            // tile copies (qid >= nq_orig) are searched for timing
+                            // but their results are not retained.
+                            if (qid >= static_cast<uint32_t>(nq_orig)) continue;
                             const size_t q_local = qid - my_qs;
                             if (q_local >= neighbors.size()) continue;
                             for (int nn = 0; nn < k; nn++) {
@@ -1535,7 +1638,11 @@ int main(int argc, char** argv)
                     uint64_t my_hits = 0;
                     if (have_gt) {
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            if (q >= gt.size()) break;
+                            // Recall over the original query set only (first tile);
+                            // tile copies have no retained neighbours.  Use continue,
+                            // not break, since first-tile queries can be interleaved
+                            // with tile copies within this rank's slice.
+                            if (q >= nq_orig || q >= gt.size()) continue;
                             const auto& gt_q  = gt[q];
                             const auto& res_q = neighbors[q - my_qs];
                             std::set<uint32_t> res_set;
@@ -1549,8 +1656,17 @@ int main(int argc, char** argv)
                     MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
                                MPI_SUM, 0, MPI_COMM_WORLD);
 
-                    const double recall = (have_gt && nq > 0)
-                        ? static_cast<double>(total_hits) / (static_cast<double>(nq) * k)
+                    // Recall denominator = number of ORIGINAL queries actually
+                    // evaluated = min(nq, nq_orig).  When upscaling (nq >= nq_orig)
+                    // this is the full original set; when downscaling (nq < nq_orig)
+                    // only the first nq queries are searched, so recall is over that
+                    // subset.  Hits were counted only on the first tile (q < nq_orig),
+                    // and the loop bound q < nq makes the evaluated count exactly
+                    // min(nq, nq_orig).  Throughput (qps) uses the SCALED count nq —
+                    // the timed window routed/scattered/searched/returned all nq.
+                    const size_t nq_recall = std::min(nq, nq_orig);
+                    const double recall = (have_gt && nq_recall > 0)
+                        ? static_cast<double>(total_hits) / (static_cast<double>(nq_recall) * k)
                         : -1.0;
                     const double qps = (max_t > 0.0) ? static_cast<double>(nq) / max_t : 0.0;
 
@@ -1576,7 +1692,9 @@ int main(int argc, char** argv)
                 for (auto& cr : combo_results) {
                     write_row(step.step_num, "search",
                               cr.mode_str, cr.param,
-                              0, static_cast<int>(nq),
+                              // range = original (distinct) query set; the scaled
+                              // query count is reflected in throughput (qps) instead.
+                              0, static_cast<int>(nq_orig),
                               cr.time_s, cr.qps, cr.recall,
                               cr.theoretical_recall,
                               cr.avg_parts,
@@ -2072,7 +2190,15 @@ int main(int argc, char** argv)
             // ── SEARCH (executor side of sweep loop) ──────────────────────────
             } else if (op_code == 2) {
                 std::vector<float> queries = readVecs(query_file, dim);
-                const size_t nq    = queries.size() / dim;
+                // Mirror coordinator: scaled query count nq drives chunking and the
+                // timed work; recall is gated to the first tile (q < nq_orig).
+                // search_scale + nq_orig are identical on every rank, so chunk/my_qs/
+                // my_qe match the coordinator and the per-search collectives stay in
+                // lockstep.
+                const size_t nq_orig = queries.size() / dim;
+                const size_t nq      = (nq_orig == 0) ? 0
+                    : std::max<size_t>(1,
+                          static_cast<size_t>(static_cast<double>(nq_orig) * search_scale + 0.5));
                 const size_t chunk = (nq + world_size - 1) / world_size;
                 const size_t my_qs = static_cast<size_t>(rank) * chunk;
                 const size_t my_qe = std::min(my_qs + chunk, nq);
@@ -2104,33 +2230,28 @@ int main(int argc, char** argv)
                 routing_hnsw->setEf(EF_ROUTING);
 
                 // ── Theoretical-recall setup (mirrors coordinator) ───────
-                // Per-neighbour partition list (length kk, -1 for unresolved);
-                // neighbor-frequency recall, divides by k.
+                // Exact GT→partition mapping via the replicated label_to_shard
+                // map (online method, matching gp-ann).  Per-neighbour partition
+                // list (length kk, -1 for unresolved/deleted); neighbor-frequency
+                // recall, divides by k.  Stores raw partition ids
+                // (label_to_shard value − 1); visited set is keyed by id + 1.
                 std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
                 if (have_gt) {
-                    BaseMmap base_view(base_file, file_format);
-                    #pragma omp parallel
-                    {
-                        std::vector<float> tmp_vec;
-                        #pragma omp for schedule(static)
-                        for (size_t q = my_qs; q < my_qe; q++) {
-                            if (q >= gt.size()) continue;
-                            const auto& gt_q = gt[q];
-                            const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
-                            auto&       glist = gt_partitions[q - my_qs];
-                            glist.assign(kk, -1);
-                            for (int i = 0; i < kk; i++) {
-                                const int gid = gt_q[i];
-                                if (gid < 0 || static_cast<uint32_t>(gid) >= base_view.n())
-                                    continue;
-                                base_view.readVector(static_cast<uint32_t>(gid), tmp_vec);
-                                auto pq = routing_hnsw->searchKnn(tmp_vec.data(), 1);
-                                if (pq.empty()) continue;
-                                const int cid = static_cast<int>(pq.top().second);
-                                if (cid < 0 || cid >= static_cast<int>(routing_partitions.size()))
-                                    continue;
-                                glist[i] = routing_partitions[cid];
-                            }
+                    #pragma omp parallel for schedule(static)
+                    for (size_t q = my_qs; q < my_qe; q++) {
+                        // First tile only: tile copies (q >= nq_orig) reuse the
+                        // same GT, so resolving them again would be redundant.
+                        if (q >= nq_orig || q >= gt.size()) continue;
+                        const auto& gt_q = gt[q];
+                        const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
+                        auto&       glist = gt_partitions[q - my_qs];
+                        glist.assign(kk, -1);
+                        for (int i = 0; i < kk; i++) {
+                            const int gid = gt_q[i];
+                            if (gid < 0) continue;
+                            auto it = label_to_shard.find(gid);
+                            if (it == label_to_shard.end()) continue;  // deleted → miss
+                            glist[i] = it->second - 1;                 // shard rank → raw partition id
                         }
                     }
                 }
@@ -2161,7 +2282,10 @@ int main(int argc, char** argv)
 
                         #pragma omp for nowait schedule(static)
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            float* Q = queries.data() + q * dim;
+                            // Tiled fetch (mirrors coordinator): scaled query q
+                            // reuses original query (q % nq_orig); all nq queries
+                            // are routed/scattered for the timed window.
+                            float* Q = queries.data() + (q % nq_orig) * dim;
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
                                 num_partitions, sweep_mode_ex, sweep_param_ex,
@@ -2172,6 +2296,8 @@ int main(int argc, char** argv)
                                 local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
                             }
 
+                            // Theoretical recall: first tile only (mirrors coordinator).
+                            if (q >= nq_orig) continue;
                             const auto& glist = gt_partitions[q - my_qs];
                             if (!glist.empty()) {
                                 int inter = 0;
@@ -2270,6 +2396,9 @@ int main(int argc, char** argv)
                         const size_t nres = rcv_rqids[src].size();
                         for (size_t j = 0; j < nres; j++) {
                             const uint32_t qid    = rcv_rqids[src][j];
+                            // First tile only (mirrors coordinator): tile copies are
+                            // searched for timing but their results are not retained.
+                            if (qid >= static_cast<uint32_t>(nq_orig)) continue;
                             const size_t q_local  = qid - my_qs;
                             if (q_local >= neighbors.size()) continue;
                             for (int nn = 0; nn < k; nn++) {
@@ -2291,7 +2420,11 @@ int main(int argc, char** argv)
                     uint64_t my_hits = 0;
                     if (have_gt) {
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            if (q >= gt.size()) break;
+                            // Recall over the original query set only (first tile);
+                            // tile copies have no retained neighbours.  Use continue,
+                            // not break, since first-tile queries can be interleaved
+                            // with tile copies within this rank's slice.
+                            if (q >= nq_orig || q >= gt.size()) continue;
                             const auto& gt_q  = gt[q];
                             const auto& res_q = neighbors[q - my_qs];
                             std::set<uint32_t> res_set;
