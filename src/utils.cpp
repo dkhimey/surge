@@ -58,10 +58,10 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
 
     {"sift-500M-clustered",
         {
-            {"base_file", "TODO"},
-            {"runbook", "TODO"},
-            {"query_file", "TODO"},
-            {"ground_truth_dir", "TODO"},
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500M-bigann64clustered.u8bin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/query.public.10K.u8bin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500000000/runbook_bigann-500M-clustered.yaml/"},
         }
     },
 
