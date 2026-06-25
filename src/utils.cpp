@@ -152,7 +152,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"runbook", "TODO"},
             {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
             {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt100-private10K-queries.bin"}
+            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt_computed.10.full_1B.ibin"}
         }
     },
 };
