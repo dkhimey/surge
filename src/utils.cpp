@@ -1,5 +1,13 @@
 #include "utils.h"
 
+#include <algorithm>
+#include <cstring>
+#include <cerrno>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 // DATASETS definition (declared extern in utils.h)
 std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
     {"bigann-100M-clustered",
@@ -215,96 +223,105 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
     std::sample(indices.begin(), indices.end(), std::back_inserter(sampled_indices),
                 sample_size, gen);
 
-    std::ifstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "Failed to open file for sampling: " << filename << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    std::vector<float> sample;
-    sample.reserve(sample_size * dim);
+    // Read the sampled vectors strictly in increasing file-offset order. std::sample
+    // already preserves the (sorted) order of its input, but sort explicitly so the
+    // access pattern is guaranteed monotonic regardless of the sampling implementation.
+    // Combined with mmap + MADV_SEQUENTIAL below, this turns the previous tens of
+    // thousands of random seek()+small-read() calls into one forward, read-ahead-
+    // friendly pass over the file.
+    std::sort(sampled_indices.begin(), sampled_indices.end());
 
     size_t header_offset = 0;
-
-    std::pair<int,int> data_info = get_dataset_info(filename);
-    int header_num_pts = data_info.first;
-    int header_dim = data_info.second;
-
     if (filetype == I8BIN || filetype == U8BIN || filetype == FBIN) {
         header_offset = 8;
     }
 
+    // Per-record stride in bytes. The *vecs formats prefix each vector with a 4-byte
+    // dimension; the *bin formats are a flat array of values after an 8-byte header.
+    size_t record_stride = 0;
+    switch (filetype) {
+        case FVECS: record_stride = sizeof(int) + dim * sizeof(float);   break;
+        case BVECS: record_stride = sizeof(int) + dim * sizeof(uint8_t); break;
+        case I8BIN: record_stride = dim * sizeof(int8_t);                break;
+        case U8BIN: record_stride = dim * sizeof(uint8_t);               break;
+        case FBIN:  record_stride = dim * sizeof(float);                 break;
+        default:
+            std::cerr << "Unsupported file format " << filename << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    int fd = open(filename.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "Failed to open file for sampling: " << filename << ": "
+                  << strerror(errno) << "\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        std::cerr << "fstat failed for " << filename << ": " << strerror(errno) << "\n";
+        close(fd);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    void* map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        std::cerr << "mmap failed for " << filename << ": " << strerror(errno) << "\n";
+        close(fd);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    // We touch pages in strictly increasing offset order; hint the kernel to read
+    // ahead aggressively and drop pages behind us.
+    madvise(map, st.st_size, MADV_SEQUENTIAL);
+    const char* base = static_cast<const char*>(map);
+
+    std::vector<float> sample;
+    sample.reserve(sample_size * dim);
+
     for (int idx : sampled_indices) {
+        size_t record_offset = header_offset + static_cast<size_t>(idx) * record_stride;
+        size_t value_offset = record_offset;
+
+        // For the *vecs formats, validate and skip the 4-byte per-vector dimension.
+        if (filetype == FVECS || filetype == BVECS) {
+            int d;
+            std::memcpy(&d, base + record_offset, sizeof(int));
+            if (d != static_cast<int>(dim)) {
+                std::cerr << (filetype == FVECS ? "Fvecs" : "Bvecs")
+                          << " dim mismatch at index " << idx << ": " << d << " != " << dim << "\n";
+                munmap(map, st.st_size);
+                close(fd);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            value_offset += sizeof(int);
+        }
+
+        const char* p = base + value_offset;
         switch (filetype) {
-            case FVECS: {
-                size_t offset = idx * (sizeof(int) + sizeof(float) * dim);
-                file.seekg(offset, std::ios::beg);
-
-                int d;
-                file.read(reinterpret_cast<char*>(&d), sizeof(int));
-                if (d != static_cast<int>(dim)) {
-                    std::cerr << "Fvecs dim mismatch at index " << idx << ": " << d << " != " << dim << "\n";
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
-
-                std::vector<float> vec(dim);
-                file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(float));
-                sample.insert(sample.end(), vec.begin(), vec.end());
+            case FVECS:
+            case FBIN: {
+                const float* vec = reinterpret_cast<const float*>(p);
+                sample.insert(sample.end(), vec, vec + dim);
                 break;
             }
-            case BVECS: {
-                size_t offset = idx * (sizeof(int) + sizeof(uint8_t) * dim);
-                file.seekg(offset, std::ios::beg);
-
-                int d;
-                file.read(reinterpret_cast<char*>(&d), sizeof(int));
-                if (d != static_cast<int>(dim)) {
-                    std::cerr << "Bvecs dim mismatch at index " << idx << ": " << d << " != " << dim << "\n";
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
-
-                std::vector<uint8_t> vec(dim);
-                file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(uint8_t));
-                for (uint8_t v : vec) sample.push_back(static_cast<float>(v));
+            case BVECS:
+            case U8BIN: {
+                const uint8_t* vec = reinterpret_cast<const uint8_t*>(p);
+                for (size_t d = 0; d < dim; d++) sample.push_back(static_cast<float>(vec[d]));
                 break;
             }
             case I8BIN: {
-                size_t offset = header_offset + static_cast<size_t>(idx) * dim * sizeof(int8_t);
-                file.seekg(offset, std::ios::beg);
-
-                std::vector<int8_t> vec(dim);
-                file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(int8_t));
-                for (int8_t v : vec) sample.push_back(static_cast<float>(v));
-                break;
-            }
-            case U8BIN: {
-                size_t offset = header_offset + static_cast<size_t>(idx) * dim * sizeof(uint8_t);
-                file.seekg(offset, std::ios::beg);
-
-                std::vector<uint8_t> vec(dim);
-                file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(uint8_t));
-                for (uint8_t v : vec) sample.push_back(static_cast<float>(v));
-                break;
-            }
-            case FBIN: {
-                size_t offset = header_offset + static_cast<size_t>(idx) * dim * sizeof(float);
-                file.seekg(offset, std::ios::beg);
-
-                std::vector<float> vec(dim);
-                file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(float));
-                if (!file) {
-                    std::cerr << "Failed to read float vector at index " << idx << "\n";
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
-
-                sample.insert(sample.end(), vec.begin(), vec.end());
+                const int8_t* vec = reinterpret_cast<const int8_t*>(p);
+                for (size_t d = 0; d < dim; d++) sample.push_back(static_cast<float>(vec[d]));
                 break;
             }
             default:
-                std::cerr << "Unsupported file format " << filename << "\n";
-                MPI_Abort(MPI_COMM_WORLD, 1);
+                break; // unreachable: validated above
         }
     }
+
+    munmap(map, st.st_size);
+    close(fd);
 
     return sample;
 }
