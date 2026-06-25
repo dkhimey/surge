@@ -66,14 +66,19 @@ bool loadCachedGTVectors(const std::string& filepath, std::vector<float>& vector
 int main(int argc, char **argv) {
     int node, world_size;
 
-    if (argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <dataset> <num_partitions> <sample_size>\n";
+    if (argc != 4 && argc != 5) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <dataset> <num_partitions> <sample_size> [existing_routing_dir]\n"
+                  << "  If existing_routing_dir is given, the routing layer is loaded from\n"
+                  << "  those files instead of being built from scratch.\n";
         return 1;
     }
 
     std::string dataset_name = argv[1];
     int num_partitions = std::stoi(argv[2]);
     int sample_size = std::stoi(argv[3]);
+    std::string existing_routing_dir = (argc == 5) ? argv[4] : "";
+    const int ef_search = 200;
 
     // add time stamp in year_month_day_log_id format
     auto now = std::time(nullptr);
@@ -95,24 +100,47 @@ int main(int argc, char **argv) {
 
     printf("Max threads: %d\n", omp_get_max_threads());
 
-    // build only meta-HNSW
-    std::vector<float> sample = getSample(DATASETS[dataset_name]["base_file"], 
-                                              nvectors, dim, sample_size);
-
-    std::cout << "Initialized Sample " << sample_size << " samples\n";
-
     Coordinator metaIndex(dim, &logger);
-    metaIndex.setSampleData(sample.data(), sample_size);
-
-    int ncenters = 10000;
-    int ef_construction = 200;
-    int M_meta = 16;
     int k = 10;
 
-    std::cout << "Building meta-HNSW index\n";
+    if (!existing_routing_dir.empty()) {
+        // Start the sweep from an existing routing layer instead of building one.
+        // Coordinator::load restores the meta-HNSW, centers, counts, label map and
+        // partition assignment written by a previous Coordinator::save.
+        std::cout << "Loading existing routing files from " << existing_routing_dir << "\n";
+        metaIndex.load(existing_routing_dir, ef_search);
 
-    metaIndex.build(ncenters, num_partitions, ef_construction, M_meta);
-    metaIndex.save(log_id);
+        // The loaded partition assignment is authoritative; override num_partitions
+        // so the metrics arrays below are sized to the actual shard count.
+        const std::vector<int>& loaded_partitions = metaIndex.getPartitions();
+        if (!loaded_partitions.empty()) {
+            int loaded_num_partitions =
+                *std::max_element(loaded_partitions.begin(), loaded_partitions.end()) + 1;
+            if (loaded_num_partitions != num_partitions) {
+                std::cout << "Overriding num_partitions " << num_partitions
+                          << " -> " << loaded_num_partitions
+                          << " from loaded routing state\n";
+                num_partitions = loaded_num_partitions;
+            }
+        }
+    } else {
+        // build only meta-HNSW
+        std::vector<float> sample = getSample(DATASETS[dataset_name]["base_file"],
+                                                  nvectors, dim, sample_size);
+
+        std::cout << "Initialized Sample " << sample_size << " samples\n";
+
+        metaIndex.setSampleData(sample.data(), sample_size);
+
+        int ncenters = 10000;
+        int ef_construction = 200;
+        int M_meta = 16;
+
+        std::cout << "Building meta-HNSW index\n";
+
+        metaIndex.build(ncenters, num_partitions, ef_construction, M_meta);
+        metaIndex.save(log_id);
+    }
 
     FileFormat format = getFileFormat(DATASETS[dataset_name]["base_file"]);
 
