@@ -1,4 +1,5 @@
 #include "index.h"
+#include "checkpoint_io.h"
 #include <falconn/lsh_nn_table.h>
 
 #include <iostream>
@@ -2773,12 +2774,45 @@ void Executor::delete_vector(size_t label, int tag) {
 
 std::string Executor::save(const std::string& prefix) {
     std::shared_lock lock(graph_mutex_);
-    char suffix[10];
-    snprintf(suffix, 10, "_%lu.bin", node_id_);
-    std::string hnsw_path = prefix + suffix;
+    char suffix[24];
+    snprintf(suffix, sizeof(suffix), "_%lu.bin", node_id_);
+    const std::string hnsw_path = prefix + suffix;
+    const std::string tmp_path  = hnsw_path + ".tmp";
     std::cout << "[Executor " << node_id_ << " ] Saving sub-HNSW to: " << hnsw_path << "\n";
-    sub_HNSW_->saveIndex(hnsw_path);
-    std::cout << "[Executor " << node_id_ << " ] Saved\n";
+
+    // Durable, atomic, verified save. Rationale:
+    //  1. Serialize to a *.tmp path so a crash can never leave a half-written
+    //     shard under its real name.
+    //  2. fsync the temp file: saveIndex()'s close() only flushes to the OS
+    //     page cache, so without this a later SIGKILL/crash loses the bytes.
+    //  3. Verify the file is a structurally complete HNSW index. saveIndex()
+    //     ignores ofstream write errors, so a short write (e.g. ENOSPC) would
+    //     otherwise pass silently and only blow up on resume.
+    //  4. Atomically rename tmp -> final, then fsync the directory so the
+    //     rename itself survives a crash.
+    // Any failure throws; the caller treats that as "this checkpoint failed"
+    // and keeps the previous good checkpoint.
+    sub_HNSW_->saveIndex(tmp_path);
+
+    if (!surge::fsync_file(tmp_path))
+        throw std::runtime_error("Executor::save: fsync failed for " + tmp_path);
+
+    std::string verr;
+    if (!surge::hnsw_file_is_valid(tmp_path, &verr)) {
+        std::error_code rmec;
+        std::filesystem::remove(tmp_path, rmec);
+        throw std::runtime_error("Executor::save: shard verification failed for " +
+                                 tmp_path + ": " + verr);
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, hnsw_path, ec);
+    if (ec)
+        throw std::runtime_error("Executor::save: rename " + tmp_path + " -> " +
+                                 hnsw_path + " failed: " + ec.message());
+    surge::fsync_parent_dir(hnsw_path);
+
+    std::cout << "[Executor " << node_id_ << " ] Saved (fsynced + verified)\n";
     return hnsw_path;
 }
 

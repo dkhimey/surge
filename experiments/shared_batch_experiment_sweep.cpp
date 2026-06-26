@@ -78,6 +78,15 @@
 #include <unordered_set>
 
 #include "index.h"
+#include "checkpoint_io.h"
+
+// Name of the per-checkpoint commit marker. A checkpoint directory is only
+// considered valid/resumable once this file exists. It is written *last*, by
+// rank 0, after every rank has fsynced and verified its own files, so a torn
+// or partially-written checkpoint is invisible to resume. Migration note: a
+// known-good checkpoint produced before this change can be blessed manually
+// with `touch <ckpt_dir>/COMMITTED`.
+static constexpr const char* CKPT_COMMIT_MARKER = "COMMITTED";
 
 // ─── mmap helper for sparse GT vector reads ─────────────────────────────────
 //
@@ -447,8 +456,19 @@ static std::string find_latest_checkpoint(const std::string& ckpt_base)
         if (name.size() <= 6 || name.substr(0, 6) != "ckpt_s") continue;
         try {
             long long n = std::stoll(name.substr(6));
-            // Validate: metadata.bin must exist and be readable.
-            const std::string meta = entry.path().string() + "/metadata.bin";
+            // Validate: the checkpoint must be COMMITTED. The marker is written
+            // only after every rank durably fsynced + verified its files, so a
+            // checkpoint that was interrupted mid-write (the cause of the
+            // "Index seems to be corrupted" aborts on resume) is skipped here
+            // and resume falls back to the previous committed checkpoint.
+            const std::string marker = entry.path().string() + "/" + CKPT_COMMIT_MARKER;
+            const std::string meta   = entry.path().string() + "/metadata.bin";
+            if (!std::filesystem::exists(marker)) {
+                std::cerr << "[Sweep] Skipping uncommitted checkpoint "
+                          << entry.path().string()
+                          << " (no " << CKPT_COMMIT_MARKER << " marker)\n";
+                continue;
+            }
             if (!std::filesystem::exists(meta)) continue;
             if (n > best_s) { best_s = n; best_dir = entry.path().string(); }
         } catch (...) {}
@@ -910,7 +930,10 @@ int main(int argc, char** argv)
                 // search variant's target fraction (-1 for non-search rows and for
                 // search rows produced by --search-scale or no scaling)
                 << ",search_fraction"
-                << ",range_start,range_end,time_s,throughput,recall@" << k
+                // num_queries: scaled query count actually run in the timed window
+                // (= nq); -1 for non-search rows.  range_end stays the original
+                // (distinct) query count nq_orig.
+                << ",range_start,range_end,num_queries,time_s,throughput,recall@" << k
                 << ",theoretical_recall@" << k
                 << ",avg_parts_searched"
                 << ",centers_moved,elements_moved"
@@ -949,10 +972,11 @@ int main(int argc, char** argv)
         static const RebuildStats kNoRebuild{};
 
         // ── Helper: write one CSV row ─────────────────────────────────────────
-        // search_fraction defaults to -1 so non-search callers (insert/delete/
-        // rebuild/initial) need no change; the search caller passes the variant's
-        // fraction.  It is a trailing defaulted parameter (must be last) but is
-        // emitted right after param to match the header column order.
+        // search_fraction and num_queries default to -1 so non-search callers
+        // (insert/delete/rebuild/initial) need no change; the search caller passes
+        // both.  They are trailing defaulted parameters (must be last) but are
+        // emitted in their header positions (search_fraction after param,
+        // num_queries after range_end).
         auto write_row = [&](int step_num, const std::string& op,
                              const std::string& mode_str, float param_val,
                              int rs, int re,
@@ -961,12 +985,14 @@ int main(int argc, char** argv)
                              double avg_parts,
                              const RebuildStats& rb,
                              const std::vector<unsigned long long>& sizes,
-                             double search_fraction = -1.0)
+                             double search_fraction = -1.0,
+                             long long num_queries = -1)
         {
             csv << step_num << "," << op
                 << "," << mode_str << "," << param_val
                 << "," << search_fraction
                 << "," << rs << "," << re
+                << "," << num_queries
                 << "," << time_s << "," << throughput
                 << "," << recall
                 << "," << theoretical_recall
@@ -1477,6 +1503,7 @@ int main(int argc, char** argv)
                     // Theoretical recall via the exact label_to_shard ownership map
                     // (online method, matching gp-ann); -1 if no GT for this step.
                     double      theoretical_recall;
+                    size_t      num_queries;   // scaled query count actually run (nq)
                 };
                 std::vector<ComboResult> combo_results;
                 combo_results.reserve(static_cast<size_t>(n_combos) * search_variants.size());
@@ -1736,7 +1763,7 @@ int main(int argc, char** argv)
                     combo_results.push_back({sweep_mode_str, sweep_param,
                                              variant_fraction,
                                              max_t, qps, recall, avg_parts,
-                                             theoretical_recall});
+                                             theoretical_recall, nq});
                 }
                 } // end search-variant loop
 
@@ -1749,13 +1776,14 @@ int main(int argc, char** argv)
                 for (auto& cr : combo_results) {
                     write_row(step.step_num, "search",
                               cr.mode_str, cr.param,
-                              // range = original (distinct) query set; the scaled
-                              // query count is reflected in throughput (qps) instead.
+                              // range = original (distinct) query set; num_queries
+                              // carries the scaled count actually run.
                               0, static_cast<int>(nq_orig),
                               cr.time_s, cr.qps, cr.recall,
                               cr.theoretical_recall,
                               cr.avg_parts,
-                              kNoRebuild, sizes, cr.search_fraction);
+                              kNoRebuild, sizes, cr.search_fraction,
+                              static_cast<long long>(cr.num_queries));
                 }
 
             } else {
@@ -1788,6 +1816,11 @@ int main(int argc, char** argv)
                           << "  checkpoint -> " << ckpt_dir << "\n";
 
                 // ── 1a. Write coordinator state ───────────────────────────────
+                // coord_write_ok stays 1 only if every coordinator-side write
+                // and fsync below succeeds; it feeds my_ckpt_write_ok so a
+                // partial coordinator write aborts the commit (old checkpoint
+                // kept).
+                int coord_write_ok = 1;
                 std::filesystem::create_directories(coord_dir);
 
                 // Save meta-HNSW, partitions, center positions, center counts.
@@ -1796,20 +1829,43 @@ int main(int argc, char** argv)
                 // never updated during streaming.  We overwrite it below.)
                 metaIndex.save(coord_dir);
 
+                // fsync every file metaIndex.save() produced. close() alone only
+                // reaches the OS page cache; without fsync a later crash/kill can
+                // lose these bytes even though the program saw a clean return.
+                {
+                    std::error_code ec;
+                    for (const auto& e :
+                         std::filesystem::directory_iterator(coord_dir, ec)) {
+                        if (ec) { coord_write_ok = 0; break; }
+                        if (e.is_regular_file() &&
+                            !surge::fsync_file(e.path().string()))
+                            coord_write_ok = 0;
+                    }
+                }
+
                 // Overwrite labels_to_centers.bin with the authoritative map
                 // that is kept live via Allgatherv on every INSERT/DELETE step.
                 {
-                    std::ofstream ltc(coord_dir + "/labels_to_centers.bin",
-                                      std::ios::binary | std::ios::trunc);
+                    const std::string p = coord_dir + "/labels_to_centers.bin";
+                    std::ofstream ltc(p, std::ios::binary | std::ios::trunc);
                     if (!ltc) {
-                        std::cerr << "[Sweep] ERROR: cannot write "
-                                  << coord_dir << "/labels_to_centers.bin\n";
+                        std::cerr << "[Sweep] ERROR: cannot write " << p << "\n";
+                        coord_write_ok = 0;
                     } else {
                         const std::size_t n = label_to_center.size();
                         ltc.write(reinterpret_cast<const char*>(&n), sizeof(n));
                         for (const auto& [key, val] : label_to_center) {
                             ltc.write(reinterpret_cast<const char*>(&key), sizeof(key));
                             ltc.write(reinterpret_cast<const char*>(&val), sizeof(val));
+                        }
+                        ltc.flush();
+                        ltc.close();
+                        // Detect short writes (e.g. ENOSPC) that std::ofstream
+                        // swallows, then force the bytes to disk.
+                        if (!ltc || !surge::fsync_file(p)) {
+                            std::cerr << "[Sweep] ERROR: write/fsync failed for "
+                                      << p << "\n";
+                            coord_write_ok = 0;
                         }
                     }
                 }
@@ -1819,11 +1875,11 @@ int main(int argc, char** argv)
                 // of center IDs, so resume does not depend on deriving ownership
                 // from a potentially stale label_to_center.
                 {
-                    std::ofstream lts(coord_dir + "/labels_to_shards.bin",
-                                      std::ios::binary | std::ios::trunc);
+                    const std::string p = coord_dir + "/labels_to_shards.bin";
+                    std::ofstream lts(p, std::ios::binary | std::ios::trunc);
                     if (!lts) {
-                        std::cerr << "[Sweep] ERROR: cannot write "
-                                  << coord_dir << "/labels_to_shards.bin\n";
+                        std::cerr << "[Sweep] ERROR: cannot write " << p << "\n";
+                        coord_write_ok = 0;
                     } else {
                         const std::size_t n = label_to_shard.size();
                         lts.write(reinterpret_cast<const char*>(&n), sizeof(n));
@@ -1831,45 +1887,87 @@ int main(int argc, char** argv)
                             lts.write(reinterpret_cast<const char*>(&key), sizeof(key));
                             lts.write(reinterpret_cast<const char*>(&val), sizeof(val));
                         }
+                        lts.flush();
+                        lts.close();
+                        if (!lts || !surge::fsync_file(p)) {
+                            std::cerr << "[Sweep] ERROR: write/fsync failed for "
+                                      << p << "\n";
+                            coord_write_ok = 0;
+                        }
                     }
                 }
 
                 // Write metadata: loop index of the next step to execute on
                 // resume, and the corresponding runbook step_num for sanity.
-                {
-                    std::ofstream meta(ckpt_dir + "/metadata.bin",
-                                       std::ios::binary | std::ios::trunc);
-                    const size_t next_s    = s + 1;
+                // Written atomically + fsynced via a temp-then-rename so a torn
+                // metadata.bin can never be observed on resume.
+                try {
+                    const size_t next_s     = s + 1;
                     const int    step_num_v = step.step_num;
-                    meta.write(reinterpret_cast<const char*>(&next_s),    sizeof(next_s));
-                    meta.write(reinterpret_cast<const char*>(&step_num_v), sizeof(step_num_v));
+                    std::string buf;
+                    buf.resize(sizeof(next_s) + sizeof(step_num_v));
+                    std::memcpy(&buf[0],               &next_s,     sizeof(next_s));
+                    std::memcpy(&buf[sizeof(next_s)],  &step_num_v, sizeof(step_num_v));
+                    surge::atomic_durable_write(ckpt_dir + "/metadata.bin", buf);
+                } catch (const std::exception& ex) {
+                    std::cerr << "[Sweep] ERROR: metadata.bin write failed: "
+                              << ex.what() << "\n";
+                    coord_write_ok = 0;
                 }
+
+                // Persist the coordinator + checkpoint directory entries so the
+                // files created above survive a crash (best-effort).
+                surge::fsync_dir(coord_dir);
+                surge::fsync_dir(ckpt_dir);
 
                 // ── 1b. Executors write their shards (happens concurrently) ──
                 // (Executor side mirrors this block; see executor streaming loop.)
 
-                // Verify coordinator writes succeeded (metadata.bin is last written).
-                {
-                    std::error_code ec;
-                    const auto sz = std::filesystem::file_size(
-                        ckpt_dir + "/metadata.bin", ec);
-                    my_ckpt_write_ok = (!ec && sz > 0) ? 1 : 0;
-                }
+                my_ckpt_write_ok = coord_write_ok;
                 if (!my_ckpt_write_ok)
                     std::cerr << "[Sweep] WARNING: coordinator checkpoint write failed "
                               << "at " << ckpt_dir << "\n";
 
                 // ── 2. Barrier + all-ranks write validation ───────────────────
                 // Each rank reports whether its own write succeeded (1/0).
-                // MPI_Allreduce(MIN) gives 1 only if ALL ranks wrote successfully.
-                // If any rank failed (e.g. disk full), deletion is skipped so the
-                // previous checkpoint is kept as a valid fallback.
+                // MPI_Allreduce(MIN) gives 1 only if ALL ranks (coordinator and
+                // every executor) durably wrote AND verified their files. If any
+                // rank failed (disk full, fsync error, shard verification), the
+                // checkpoint is NOT committed and the previous one is kept.
                 MPI_Barrier(MPI_COMM_WORLD);
                 int all_ckpt_writes_ok = 0;
                 MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
                               1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
-                // ── 3. Remove the previous checkpoint (rank 0 only) ──────────
+                // ── 3. Commit (rank 0 writes the marker LAST) ────────────────
+                // Only once every rank confirmed a durable, verified write do we
+                // publish the COMMITTED marker. find_latest_checkpoint() requires
+                // this marker, so a checkpoint is never resumable until all of
+                // its files are guaranteed on disk. The marker write is itself
+                // atomic + fsynced.
+                if (all_ckpt_writes_ok) {
+                    try {
+                        surge::atomic_durable_write(
+                            ckpt_dir + "/" + CKPT_COMMIT_MARKER,
+                            "next_s=" + std::to_string(s + 1) +
+                            " step=" + std::to_string(step.step_num) + "\n");
+                        std::cout << "[Sweep] Committed checkpoint " << ckpt_dir << "\n";
+                    } catch (const std::exception& ex) {
+                        std::cerr << "[Sweep] ERROR: failed to write commit marker for "
+                                  << ckpt_dir << ": " << ex.what()
+                                  << " — treating checkpoint as incomplete.\n";
+                        all_ckpt_writes_ok = 0;
+                    }
+                }
+
+                // ── 4. Barrier so the marker is durable before anyone deletes ─
+                // Executors must not remove their previous shards until the new
+                // checkpoint is committed, otherwise a crash here could leave
+                // neither checkpoint resumable.
+                MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                MPI_Barrier(MPI_COMM_WORLD);
+
+                // ── 5. Remove the previous checkpoint (rank 0 only) ──────────
                 if (all_ckpt_writes_ok) {
                     if (!last_ckpt_dir.empty() &&
                             std::filesystem::exists(last_ckpt_dir)) {
@@ -1882,12 +1980,15 @@ int main(int argc, char** argv)
                             std::cout << "[Sweep] Removed old checkpoint "
                                       << last_ckpt_dir << "\n";
                     }
+                    last_ckpt_dir = ckpt_dir;
                 } else {
                     std::cout << "[Sweep] WARNING: new checkpoint incomplete "
-                              << "(disk full on some node?); keeping old checkpoint "
-                              << last_ckpt_dir << " as fallback.\n";
+                              << "(disk full / fsync / verify failure on some node?); "
+                              << "keeping old checkpoint " << last_ckpt_dir
+                              << " as fallback and discarding " << ckpt_dir << ".\n";
+                    // Leave last_ckpt_dir pointing at the previous good checkpoint
+                    // so the next successful commit cleans up the right directory.
                 }
-                last_ckpt_dir = ckpt_dir;
             }
 
         } // end coordinator streaming loop
@@ -2538,35 +2639,53 @@ int main(int argc, char** argv)
 
                 // Save this executor's sub-HNSW shard.
                 // Executor::save(prefix) appends "_<rank>.bin" to prefix and
-                // returns the full path written.
-                const std::string shard_path = subIndex.save(ckpt_dir + "/shard");
-
-                // Verify the shard file was written successfully.
-                std::error_code shard_ec;
-                const auto shard_sz = std::filesystem::file_size(shard_path, shard_ec);
-                int my_ckpt_write_ok = (!shard_ec && shard_sz > 0) ? 1 : 0;
-                if (!my_ckpt_write_ok)
+                // returns the full path written. It now writes to a temp file,
+                // fsyncs, verifies the serialized index is structurally complete,
+                // then atomically renames into place — throwing on any failure.
+                int my_ckpt_write_ok = 1;
+                try {
+                    const std::string shard_path = subIndex.save(ckpt_dir + "/shard");
+                    // Defensive belt-and-suspenders: confirm the published file
+                    // is non-empty (save() already verified its integrity).
+                    std::error_code shard_ec;
+                    const auto shard_sz = std::filesystem::file_size(shard_path, shard_ec);
+                    if (shard_ec || shard_sz == 0) my_ckpt_write_ok = 0;
+                } catch (const std::exception& ex) {
+                    my_ckpt_write_ok = 0;
                     std::cerr << "[Sweep Executor " << rank
-                              << "] WARNING: shard write failed or empty: "
-                              << shard_path << " (disk full?)\n";
+                              << "] WARNING: shard save failed: " << ex.what()
+                              << " (disk full? fsync/verify error?)\n";
+                }
 
                 // ── Barrier + all-ranks write validation ──────────────────────
-                // Matches the coordinator's barrier exactly.
+                // Matches the coordinator's collective sequence exactly:
+                // Barrier -> Allreduce -> Bcast -> Barrier.
                 MPI_Barrier(MPI_COMM_WORLD);
                 int all_ckpt_writes_ok = 0;
                 MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
                               1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
+                // Rank 0 writes the COMMITTED marker between the Allreduce and the
+                // Bcast/Barrier below; it may also clear all_ckpt_writes_ok if the
+                // marker write fails. Receive its authoritative verdict, then wait
+                // at the barrier so the marker is durable before we delete shards.
+                MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                MPI_Barrier(MPI_COMM_WORLD);
+
                 // ── Delete old checkpoint (this rank's local copy) ────────────
-                // Only delete if ALL ranks confirmed successful writes.
-                // ~/surge may be local to each node rather than NFS-shared, so
-                // every rank removes the old checkpoint independently.
-                // On NFS this is idempotent (remove_all on a missing path is a no-op).
-                if (all_ckpt_writes_ok && !last_ckpt_dir.empty()) {
-                    std::error_code ec;
-                    std::filesystem::remove_all(last_ckpt_dir, ec);
+                // Only delete once the new checkpoint is COMMITTED (all ranks OK
+                // and rank 0's marker written). ~/surge may be local to each node
+                // rather than NFS-shared, so every rank removes its own old copy.
+                // remove_all on a missing path is a no-op (idempotent on NFS).
+                if (all_ckpt_writes_ok) {
+                    if (!last_ckpt_dir.empty()) {
+                        std::error_code ec;
+                        std::filesystem::remove_all(last_ckpt_dir, ec);
+                    }
+                    last_ckpt_dir = ckpt_dir;
                 }
-                last_ckpt_dir = ckpt_dir;
+                // else: keep last_ckpt_dir pointing at the previous good
+                // checkpoint; the failed new one is left to be overwritten.
             }
 
         } // end executor streaming loop
