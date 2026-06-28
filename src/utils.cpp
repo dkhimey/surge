@@ -56,6 +56,15 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
+    {"msturing-500M-shift",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/500M_msturingshift64.fbin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/runbook_msturing500Mshift.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/500000000/runbook_msturing500Mshift.yaml"},
+        }
+    },
+
     {"bigann-500M-clustered",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500M-bigann64clustered.u8bin"},
