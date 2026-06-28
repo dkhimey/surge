@@ -182,6 +182,13 @@ static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.50;
 // so disk space is never exhausted by holding two copies simultaneously in the
 // typical case (unless a single checkpoint exceeds half the available space).
 static constexpr size_t CHECKPOINT_INTERVAL       = 50;
+// Evaluate the rebuild check (center-movement threshold + tombstone-ratio MAX
+// reduce) only once every this many runbook steps, rather than on every
+// insert/delete step.  The cadence is keyed off the streaming-loop index s,
+// which advances in lockstep on every rank, so the gated MPI collectives stay
+// matched between the coordinator and the executors.  On steps where the check
+// is skipped no rebuild can be triggered (do_rebuild is broadcast as 0).
+static constexpr size_t REBUILD_CHECK_INTERVAL     = 6;
 
 // ─── Sweep parameter grids (visible to all ranks so loop counts agree) ───────
 static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {};
@@ -1079,6 +1086,11 @@ int main(int argc, char** argv)
         for (size_t s = resume_s; s < steps.size(); s++) {
             const RunbookStep& step = steps[s];
 
+            // Run the rebuild check only once every REBUILD_CHECK_INTERVAL steps.
+            // Computed from the loop index s (identical on every rank), so the
+            // gated tombstone-ratio MPI_Reduce stays in lockstep with the executors.
+            const bool rebuild_check_due = (s % REBUILD_CHECK_INTERVAL == 0);
+
             int bcast_buf[3] = { step.step_num, step.start, step.end };
             int op_code = (step.operation == "insert") ? 0
                         : (step.operation == "delete") ? 1
@@ -1191,7 +1203,7 @@ int main(int argc, char** argv)
                 // force a full rebuild even when it is not.
                 int    rb_type   = 0;
                 double max_ratio = 0.0;
-                if (maintenance_enabled) {
+                if (maintenance_enabled && rebuild_check_due) {
                     rb_type = metaIndex.checkNeedRebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     // Collect the max tombstone ratio across all executor shards
@@ -1348,7 +1360,7 @@ int main(int argc, char** argv)
                 // the tombstone-ratio reduce.  Symmetric with the executor side.
                 int    rb_type   = 0;
                 double max_ratio = 0.0;
-                if (maintenance_enabled) {
+                if (maintenance_enabled && rebuild_check_due) {
                     rb_type = metaIndex.checkNeedRebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     double coord_ratio = 0.0;
@@ -1982,12 +1994,18 @@ int main(int argc, char** argv)
                     }
                     last_ckpt_dir = ckpt_dir;
                 } else {
+                    // Discard the uncommitted (partial) checkpoint so failed
+                    // attempts don't accumulate and exhaust disk — freeing it
+                    // may also let the next checkpoint succeed. Safe here: every
+                    // rank has passed the barrier above, so nobody is still
+                    // writing into ckpt_dir. last_ckpt_dir still points at the
+                    // previous *committed* checkpoint, which we keep as fallback.
+                    std::error_code ec;
+                    std::filesystem::remove_all(ckpt_dir, ec);
                     std::cout << "[Sweep] WARNING: new checkpoint incomplete "
                               << "(disk full / fsync / verify failure on some node?); "
-                              << "keeping old checkpoint " << last_ckpt_dir
-                              << " as fallback and discarding " << ckpt_dir << ".\n";
-                    // Leave last_ckpt_dir pointing at the previous good checkpoint
-                    // so the next successful commit cleans up the right directory.
+                              << "removed partial " << ckpt_dir
+                              << " and kept " << last_ckpt_dir << " as fallback.\n";
                 }
             }
 
@@ -2087,6 +2105,11 @@ int main(int argc, char** argv)
         std::string last_ckpt_dir = resume_ckpt;
 
         for (size_t s = resume_s; s < steps.size(); s++) {
+            // Mirror the coordinator's rebuild-check cadence (see coordinator loop):
+            // gate the tombstone-ratio MPI_Reduce on the same once-every-
+            // REBUILD_CHECK_INTERVAL-steps predicate so the collectives stay matched.
+            const bool rebuild_check_due = (s % REBUILD_CHECK_INTERVAL == 0);
+
             int op_code, bcast_buf[3];
             MPI_Bcast(&op_code,  1, MPI_INT, 0, MPI_COMM_WORLD);
             MPI_Bcast(bcast_buf, 3, MPI_INT, 0, MPI_COMM_WORLD);
@@ -2198,7 +2221,7 @@ int main(int argc, char** argv)
                 // entirely when maintenance is disabled (full_threshold >=
                 // NCENTERS), symmetric with the coordinator.  Must be ordered
                 // before the do_rebuild broadcast.
-                if (maintenance_enabled) {
+                if (maintenance_enabled && rebuild_check_due) {
                     double my_ratio = subIndex.getTombstoneRatio();
                     double dummy_max = 0.0;
                     MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
@@ -2294,7 +2317,7 @@ int main(int argc, char** argv)
                 // entirely when maintenance is disabled (full_threshold >=
                 // NCENTERS), symmetric with the coordinator.  Must be ordered
                 // before the do_rebuild broadcast.
-                if (maintenance_enabled) {
+                if (maintenance_enabled && rebuild_check_due) {
                     double my_ratio = subIndex.getTombstoneRatio();
                     double dummy_max = 0.0;
                     MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
@@ -2683,9 +2706,14 @@ int main(int argc, char** argv)
                         std::filesystem::remove_all(last_ckpt_dir, ec);
                     }
                     last_ckpt_dir = ckpt_dir;
+                } else {
+                    // Uncommitted checkpoint: remove this rank's partial copy so
+                    // it doesn't pile up and consume disk. last_ckpt_dir still
+                    // points at the previous committed checkpoint (kept as
+                    // fallback). Safe: past the barrier, nobody is still writing.
+                    std::error_code ec;
+                    std::filesystem::remove_all(ckpt_dir, ec);
                 }
-                // else: keep last_ckpt_dir pointing at the previous good
-                // checkpoint; the failed new one is left to be overwritten.
             }
 
         } // end executor streaming loop
