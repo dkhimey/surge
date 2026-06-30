@@ -1777,13 +1777,13 @@ void Executor::build(
     std::cout << "[Executor " << node_id_ << " ] Building local sub-index\n";
     double start = MPI_Wtime();
     float* norm_element = new float[dim_];
-    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, data_count_, M_sub, ef_construction, 100, true);
-    sub_HNSW_->addPoint(data_, indices_[0], /*replace_deleted=*/true); // first element not thread safe
+    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, data_count_, M_sub, ef_construction, 100, /*allow_replace_deleted=*/allow_replace_deleted_);
+    sub_HNSW_->addPoint(data_, indices_[0], /*replace_deleted=*/allow_replace_deleted_); // first element not thread safe
     omp_set_num_threads(num_building_threads);
     std::cout << "[Executor " << node_id_ << "] - num threads building index: " << num_building_threads << "/"  << omp_get_max_threads() << "\n";
     #pragma omp parallel for num_threads(num_building_threads)
     for (int j = 1; j < data_count_; j++) {
-        sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/allow_replace_deleted_);
     }
 
     delete[] norm_element;
@@ -1922,7 +1922,7 @@ void Executor::partialReBuild(
     for (int i = 0; i < total_recv; i++) {
         float* vec = all_recv_vectors.data() + (i * dim_);
         int index = all_recv_labels[i];
-        sub_HNSW_->addPoint(vec, index, /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(vec, index, /*replace_deleted=*/allow_replace_deleted_);
     }
 
     sub_HNSW_->setEf(ef_construction);
@@ -1981,7 +1981,7 @@ void Executor::reBuild(
     std::vector<int> partitions(ncenters);
     MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    hnswlib::HierarchicalNSW<float>* next_sub_HNSW = new hnswlib::HierarchicalNSW<float>(space_, active_count, M_sub, ef_construction, 100, true);
+    hnswlib::HierarchicalNSW<float>* next_sub_HNSW = new hnswlib::HierarchicalNSW<float>(space_, active_count, M_sub, ef_construction, 100, /*allow_replace_deleted=*/allow_replace_deleted_);
 
     std::vector<std::vector<float>> partition_vectors(world_size);
     std::vector<std::vector<int>> partition_indices(world_size);
@@ -1999,7 +1999,7 @@ void Executor::reBuild(
         int p = partitions[label] + 1;
         if (p == node_id_) {
             first_inserted = true;
-            next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/true);
+            next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/allow_replace_deleted_);
             num_kept++;
         } else {
             partition_vectors[p].insert(partition_vectors[p].end(), vec, vec + dim_);
@@ -2017,7 +2017,7 @@ void Executor::reBuild(
         hnswlib::labeltype label = metaHNSW->searchKnn(vec, 1).top().second;
         int p = partitions[label] + 1;
         if (p == node_id_) {
-            next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/true);
+            next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/allow_replace_deleted_);
             num_kept++;
         }
         else {
@@ -2108,7 +2108,7 @@ void Executor::reBuild(
     for (int i = 0; i < total_recv; i++) {
         float* vec = all_recv_vectors.data() + (i * dim_);
         int index = all_recv_labels[i];
-        next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/true);
+        next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/allow_replace_deleted_);
     }
     double end_hnsw = MPI_Wtime();
 
@@ -2317,13 +2317,18 @@ void Executor::reBuildDelta(
     std::cout << "[Executor " << node_id_ << "] delta rebuild exchange: arrived="
               << total_recv << "\n";
 
-    // ── Step 4: resize if needed, then insert with replace_deleted ────────────
-    // After the mark-delete pass, sub_HNSW_->num_deleted_ counts every slot
-    // currently available for reuse (including any prior stream-deleted elements
-    // that were never replaced).  Incoming insertions with replace_deleted=true
-    // fill those slots first; only the excess needs new capacity.
+    // ── Step 4: resize if needed, then insert ─────────────────────────────────
+    // When allow_replace_deleted_ is true, after the mark-delete pass
+    // sub_HNSW_->num_deleted_ counts every slot currently available for reuse
+    // (including any prior stream-deleted elements that were never replaced);
+    // incoming insertions with replace_deleted=true fill those slots first, so
+    // only the excess (total_recv - total_freed) needs new capacity.
+    // When allow_replace_deleted_ is false, no slot is ever reused, so every one
+    // of the total_recv arriving vectors needs a fresh slot.
     {
-        const size_t total_freed = sub_HNSW_->num_deleted_.load();
+        const size_t total_freed = allow_replace_deleted_
+                                       ? sub_HNSW_->num_deleted_.load()
+                                       : 0;
         if (static_cast<size_t>(total_recv) > total_freed) {
             const size_t net_new = static_cast<size_t>(total_recv) - total_freed;
             std::unique_lock<std::shared_mutex> lk(graph_mutex_);
@@ -2341,7 +2346,7 @@ void Executor::reBuildDelta(
             sub_HNSW_->addPoint(
                 flat_recv_vecs.data() + static_cast<size_t>(i) * dim_,
                 static_cast<hnswlib::labeltype>(flat_recv_labels[i]),
-                /*replace_deleted=*/true);
+                /*replace_deleted=*/allow_replace_deleted_);
         }
     }
     double end_hnsw = MPI_Wtime();
@@ -2351,14 +2356,21 @@ void Executor::reBuildDelta(
     // num_deleted_: every markDelete adds to it, every successful slot-reuse by
     // addPoint removes from it.  So deleted_elements.size() == num_deleted_ and
     // both equal the number of tombstone slots still sitting in the graph.
+    // With allow_replace_deleted=false, hnswlib does not populate
+    // deleted_elements at all (no reuse), so the authoritative tombstone count is
+    // num_deleted_ — every departed slot remains as a tombstone.
     size_t remaining_deleted;
-    {
-        std::lock_guard<std::mutex> del_lock(sub_HNSW_->deleted_elements_lock);
-        remaining_deleted = sub_HNSW_->deleted_elements.size();
+    if (allow_replace_deleted_) {
+        {
+            std::lock_guard<std::mutex> del_lock(sub_HNSW_->deleted_elements_lock);
+            remaining_deleted = sub_HNSW_->deleted_elements.size();
+        }
+        // Sanity cross-check (both fields should agree when replace_deleted=true).
+        assert(remaining_deleted == sub_HNSW_->num_deleted_.load() &&
+               "deleted_elements.size() and num_deleted_ out of sync");
+    } else {
+        remaining_deleted = sub_HNSW_->num_deleted_.load();
     }
-    // Sanity cross-check (both fields should agree when replace_deleted=true).
-    assert(remaining_deleted == sub_HNSW_->num_deleted_.load() &&
-           "deleted_elements.size() and num_deleted_ out of sync");
 
     std::cout << "[Executor " << node_id_ << "] delta rebuild complete:"
               << "  departed=" << n_departing
@@ -2512,7 +2524,7 @@ void Executor::reBuildReplace(
         for (int i = 0; i < total_recv; i++) {
             float* vec = all_recv_vectors.data() + (i * dim_);
             int index = all_recv_labels[i];
-            sub_HNSW_->addPoint(vec, index, true);
+            sub_HNSW_->addPoint(vec, index, /*replace_deleted=*/allow_replace_deleted_);
         }
 
         sub_HNSW_->setEf(ef_construction);
@@ -2596,11 +2608,14 @@ void Executor::insertLocalBatch(const std::vector<float>& vecs,
 
     // Phase 1: capacity check and resize under exclusive lock.
     //
-    // With replace_deleted=true (used in Phase 2), each addPoint reuses a
+    // When allow_replace_deleted_ is true, each addPoint (Phase 2) reuses a
     // tombstone slot before claiming a fresh one.  The number of new internal
     // IDs actually needed is therefore:
     //
     //   net_new = incoming - min(num_deleted_, incoming)
+    //
+    // When allow_replace_deleted_ is false, no tombstone is ever reused, so
+    // every incoming vector needs a fresh slot (reusable = 0).
     //
     // getCurrentElementCount() is the high-water mark of ever-allocated
     // internal IDs (live + tombstones, but NOT counting reused slots twice),
@@ -2610,7 +2625,9 @@ void Executor::insertLocalBatch(const std::vector<float>& vecs,
         std::unique_lock<std::shared_mutex> lk(graph_mutex_);
         const size_t current  = sub_HNSW_->getCurrentElementCount();
         const size_t deleted  = sub_HNSW_->num_deleted_.load();
-        const size_t reusable = std::min(deleted, incoming);
+        const size_t reusable = allow_replace_deleted_
+                                    ? std::min(deleted, incoming)
+                                    : 0;
         const size_t net_new  = incoming - reusable;
         const size_t needed   = current + net_new;
         if (needed > sub_HNSW_->getMaxElements()) {
@@ -2622,14 +2639,16 @@ void Executor::insertLocalBatch(const std::vector<float>& vecs,
     }
 
     // Phase 2: parallel inserts under shared lock.
-    // replace_deleted=true reuses tombstone slots from prior stream-deletes
-    // before allocating new capacity.  hnswlib addPoint is internally
-    // thread-safe (per-element locks and deleted_elements_lock for slot
-    // selection), so concurrent calls on distinct labels are safe here.
+    // replace_deleted=allow_replace_deleted_: when true, reuses tombstone slots
+    // from prior stream-deletes before allocating new capacity; when false,
+    // every insert claims a fresh slot and tombstones are left untouched.
+    // hnswlib addPoint is internally thread-safe (per-element locks and
+    // deleted_elements_lock for slot selection), so concurrent calls on distinct
+    // labels are safe here.
     std::shared_lock<std::shared_mutex> lk(graph_mutex_);
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < incoming; i++)
-        sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/allow_replace_deleted_);
 }
 
 // ── markDeleteLocal ──────────────────────────────────────────────────────────
@@ -2710,7 +2729,7 @@ void Executor::insert_batch(size_t num_vecs, int tag) {
             sub_HNSW_->resizeIndex((current + num_vecs) * 2);
         }
         for (size_t i = 0; i < num_vecs; i++) {
-            sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/true);
+            sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/allow_replace_deleted_);
         }
     }
 
@@ -2726,7 +2745,7 @@ void Executor::insert(int tag) {
         std::shared_lock read_lock(graph_mutex_);
         // +1 because we're about to add one element
         if (sub_HNSW_->getCurrentElementCount() + 100 <= sub_HNSW_->getMaxElements()) {
-            sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/true);
+            sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/allow_replace_deleted_);
 
             comm_.send_ack(INSERT_SUCCESS, 0, tag);
             return;
@@ -2744,7 +2763,7 @@ void Executor::insert(int tag) {
     // After resize, safe to add. Acquire shared lock again
     {
         std::shared_lock read_lock(graph_mutex_);
-        sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/allow_replace_deleted_);
     }
     comm_.send_ack(INSERT_SUCCESS, 0, tag);
 }
@@ -2822,7 +2841,7 @@ void Executor::load(const std::string& prefix, int ef_search) {
     std::string hnsw_path = prefix + suffix;
 
     std::cout << "[Executor " << node_id_ << " ] Loading sub-HNSW from: " << hnsw_path << "\n";
-    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path, false, 0, true);
+    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path, false, 0, /*allow_replace_deleted=*/allow_replace_deleted_);
     sub_HNSW_->setEf(ef_search);
 }
 

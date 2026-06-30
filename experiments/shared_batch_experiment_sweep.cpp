@@ -11,7 +11,10 @@
 //      <dataset> <num_partitions> <full_threshold> <k> <gt_prefix> <output_file>
 //
 //  Rebuild policy: delta always — shadow-delete departing elements and insert
-//  arriving ones using replace_deleted=true (keeps existing graph topology).
+//  arriving ones into fresh slots (keeps existing graph topology).  Deleted
+//  vectors are NOT replaced in the local HNSW graphs: local indexes are built
+//  without hnswlib's replace-deleted machinery and every insert claims a fresh
+//  slot, so departed/deleted elements remain as tombstones until a full rebuild.
 //  Falls back to a full reconstruction if any shard's tombstone ratio exceeds
 //  TOMBSTONE_RATIO_THRESHOLD (currently 0.75 = 75% unused slots).  This check
 //  fires independently of the center-movement rebuild threshold: a shard
@@ -530,7 +533,9 @@ int main(int argc, char** argv)
             << "  takes precedence and resumes as usual.\n"
             << "\n"
             << "  Rebuild policy: delta always (shadow-delete departing elements,\n"
-            << "  insert arriving ones with replace_deleted=true, keep graph topology).\n"
+            << "  insert arriving ones into fresh slots, keep graph topology).\n"
+            << "  Deleted vectors are never replaced in the local HNSW graphs;\n"
+            << "  tombstones accumulate until a full rebuild.\n"
             << "  A full graph reconstruction is forced whenever any shard's tombstone\n"
             << "  ratio reaches " << TOMBSTONE_RATIO_THRESHOLD
             << " (" << static_cast<int>(TOMBSTONE_RATIO_THRESHOLD * 100) << "% unused slots) -- this\n"
@@ -599,7 +604,8 @@ int main(int argc, char** argv)
     // E.g.  checkpoints/msturing-100M-clustered_t6000/
     const std::string ckpt_base =
         "checkpoints/" + dataset_name + "_t" + std::to_string(full_threshold);
-    // Rebuild policy: always attempt delta (shadow-delete + replace_deleted insert).
+    // Rebuild policy: always attempt delta (shadow-delete departing elements +
+    // insert arriving ones into fresh slots; deleted slots are not reused).
     // Falls back to full if the tombstone ratio check fires (see TOMBSTONE_RATIO_THRESHOLD).
     const bool        use_delta_rebuild = true;
 
@@ -1833,13 +1839,26 @@ int main(int argc, char** argv)
                 // partial coordinator write aborts the commit (old checkpoint
                 // kept).
                 int coord_write_ok = 1;
-                std::filesystem::create_directories(coord_dir);
+                // Everything that touches the filesystem here is wrapped so that
+                // ANY failure (e.g. ENOSPC even on mkdir, or a throw from
+                // metaIndex.save) degrades to "checkpoint skipped" rather than an
+                // uncaught exception that terminates the rank and aborts the whole
+                // MPI job. The collectives below run unconditionally so all ranks
+                // stay in lockstep regardless of who failed.
+                try {
+                std::error_code mkec;
+                std::filesystem::create_directories(coord_dir, mkec);
+                if (mkec) {
+                    std::cerr << "[Sweep] ERROR: cannot create " << coord_dir
+                              << ": " << mkec.message() << "\n";
+                    coord_write_ok = 0;
+                }
 
                 // Save meta-HNSW, partitions, center positions, center counts.
                 // (Coordinator::save() also writes labels_to_centers.bin but
                 // that file is stale — it is only populated at build time and
                 // never updated during streaming.  We overwrite it below.)
-                metaIndex.save(coord_dir);
+                if (coord_write_ok) metaIndex.save(coord_dir);
 
                 // fsync every file metaIndex.save() produced. close() alone only
                 // reaches the OS page cache; without fsync a later crash/kill can
@@ -1931,6 +1950,14 @@ int main(int argc, char** argv)
                 // files created above survive a crash (best-effort).
                 surge::fsync_dir(coord_dir);
                 surge::fsync_dir(ckpt_dir);
+                } catch (const std::exception& ex) {
+                    // Disk full / filesystem error anywhere above: skip this
+                    // checkpoint instead of crashing the job.
+                    coord_write_ok = 0;
+                    std::cerr << "[Sweep] ERROR: coordinator checkpoint write threw: "
+                              << ex.what() << " — skipping checkpoint at "
+                              << ckpt_dir << "\n";
+                }
 
                 // ── 1b. Executors write their shards (happens concurrently) ──
                 // (Executor side mirrors this block; see executor streaming loop.)
@@ -2020,6 +2047,13 @@ int main(int argc, char** argv)
     } else {
 
         Executor subIndex(rank, dim, comm, &logger);
+        // This sweep never reuses deleted (tombstoned) slots in the local HNSW
+        // graphs: local indexes are built without hnswlib's replace-deleted
+        // machinery and every insert (initial build, stream inserts, and the
+        // delta-rebuild migration inserts) claims a fresh slot.  Departed
+        // elements remain as tombstones until a full rebuild.  Must be set before
+        // build()/load() so the sub-HNSW is constructed with the matching flag.
+        subIndex.setAllowReplaceDeleted(false);
 
         if (!resuming) {
             // Phase 1: receive initial vectors and build sub-HNSW.
@@ -2655,18 +2689,25 @@ int main(int argc, char** argv)
                 const std::string ckpt_dir =
                     ckpt_base + "/ckpt_s" + std::to_string(s);
 
-                // Ensure the checkpoint directory exists (create_directories is
-                // idempotent; the coordinator may have created it first via NFS,
-                // or we may arrive first — either way is fine).
-                std::filesystem::create_directories(ckpt_dir);
-
                 // Save this executor's sub-HNSW shard.
                 // Executor::save(prefix) appends "_<rank>.bin" to prefix and
                 // returns the full path written. It now writes to a temp file,
                 // fsyncs, verifies the serialized index is structurally complete,
                 // then atomically renames into place — throwing on any failure.
+                // Directory creation is inside the try (non-throwing overload +
+                // explicit check) so that ENOSPC even on mkdir degrades to a
+                // skipped checkpoint rather than terminating the rank and
+                // aborting the whole MPI job.
                 int my_ckpt_write_ok = 1;
                 try {
+                    // create_directories is idempotent; the coordinator may have
+                    // made it first via NFS, or we may arrive first — either is fine.
+                    std::error_code mkec;
+                    std::filesystem::create_directories(ckpt_dir, mkec);
+                    if (mkec)
+                        throw std::runtime_error("cannot create " + ckpt_dir +
+                                                 ": " + mkec.message());
+
                     const std::string shard_path = subIndex.save(ckpt_dir + "/shard");
                     // Defensive belt-and-suspenders: confirm the published file
                     // is non-empty (save() already verified its integrity).

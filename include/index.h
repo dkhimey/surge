@@ -308,6 +308,18 @@ public:
     std::string save(const std::string& prefix);
     void setEfSearch(int ef_search);
 
+    // Controls whether the local sub-HNSW reuses tombstone (deleted) slots.
+    // When true (default), local indexes are built with hnswlib's
+    // allow_replace_deleted=true and all inserts pass replace_deleted=true, so
+    // freed slots are preferentially reused (the original shared_batch_experiment
+    // behavior).  When false, local indexes are built without the replace-deleted
+    // machinery and every insert claims a fresh slot, so deleted vectors are never
+    // replaced in the graph (tombstones accumulate until a full rebuild).
+    // Must be set BEFORE build()/load() so the sub-HNSW is constructed with the
+    // matching allow_replace_deleted setting.
+    void setAllowReplaceDeleted(bool v) { allow_replace_deleted_ = v; }
+    bool getAllowReplaceDeleted() const { return allow_replace_deleted_; }
+
     void search(size_t k, int tag);
     void insert(int tag);
     void insert_batch(size_t num_vecs, int tag);
@@ -382,8 +394,10 @@ public:
     );
 
     // Delta rebuild: mark-delete elements that migrated away, receive and
-    // insert elements that migrated in.  Uses replace_deleted=true so
-    // incoming insertions preferentially reuse the freed slots.
+    // insert elements that migrated in.  Incoming insertions use
+    // replace_deleted=allow_replace_deleted_: when the flag is true they
+    // preferentially reuse the freed slots; when false they always claim fresh
+    // slots and the departed slots remain as tombstones.
     // Does NOT rebuild the graph from scratch; the existing graph topology
     // is retained for staying elements.
     void reBuildDelta(
@@ -430,8 +444,14 @@ private:
 
     // Count of deleted slots still unreplaced after the most recent reBuildDelta().
     // With allow_replace_deleted=true, this equals sub_HNSW_->deleted_elements.size()
-    // immediately after all insertions complete.
+    // immediately after all insertions complete.  With allow_replace_deleted=false
+    // no slots are ever reused, so this equals sub_HNSW_->num_deleted_ (every
+    // tombstone still present in the graph).
     size_t last_rebuild_remaining_deleted_ = 0;
+
+    // Whether the local sub-HNSW reuses tombstone slots (see setAllowReplaceDeleted).
+    // Default true preserves the original shared_batch_experiment behavior.
+    bool allow_replace_deleted_ = true;
 
     // Arrived labels from the most recent rebuild exchange, for sweep-side
     // label_to_shard synchronisation via Allgatherv after each rebuild.
