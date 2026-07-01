@@ -73,7 +73,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500000000/runbook_bigann-500M-clustered.yaml/"},
         }
     },
-
+    
     {"sift-500M",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_500000000.u8bin"},
@@ -117,10 +117,10 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
 
     {"msturing-500M-clustered",
         {
-            {"base_file", "TODO"},
-            {"runbook", "TODO"},
-            {"query_file", "TODO"},
-            {"ground_truth_dir", "TODO"},
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500M-msturingclustered64.fbin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/runbook_msturing500Mclustered.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500000000/runbook_msturing500Mclustered.yaml"},
         }
     },
 
