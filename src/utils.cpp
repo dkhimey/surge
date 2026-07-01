@@ -83,6 +83,15 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
+    {"bigann-500M-shift",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/5500M_bigann500shift64.u8bin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/runbook_bigann500Mshift.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/query.public.10K.u8bin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/500000000/runbook_bigann500Mshift.yaml/"},
+        }
+    },
+
     {"sift-500M",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_500000000.u8bin"},
@@ -120,16 +129,6 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/query10K.fbin"},
             {"ground_truth_dir", "TODO"},
             {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-100M.query10K.bin"}
-        }
-    },
-
-
-    {"msturing-500M-clustered",
-        {
-            {"base_file", "TODO"},
-            {"runbook", "TODO"},
-            {"query_file", "TODO"},
-            {"ground_truth_dir", "TODO"},
         }
     },
 
