@@ -51,7 +51,7 @@ RANKFILE="${1:-rankfile.txt}"
 # while recall is computed once over the original query set.  Every fraction is
 # measured on the IDENTICAL index state, so the rows can be compared directly via
 # the search_fraction CSV column.  Comma-separated list; empty disables scaling.
-SEARCH_FRACTION=0.05,0.50
+SEARCH_FRACTION=
 
 # MPI transport: restrict to the flat LAN interface so Open MPI doesn't
 # accidentally route inter-node traffic over the wrong interface on CloudLab.
@@ -74,11 +74,12 @@ INIT_STATE_STEP=1
 declare -a DATASETS=(
 #    "msturing-100M-clustered|/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100000000/msturing-100M-clustered_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/msturing-100M-clustered_runbookfinal.yaml"
 #    "msturing-100M-random|/dataset/big-ann-benchmarks/data/MSTuring-100M-random/100000000/runbook-msturing-100M-random.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-random/runbook-msturing-100M-random.yaml"
-    "msturing-100M-shift|/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100000000/msturing-100M-shift_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/msturing-100M-shift_runbookfinal.yaml"
-    "bigann-100M-clustered|/dataset/big-ann-benchmarks/data/bigann-clustered/100000000/runbook-bigann-100M.yaml|/dataset/big-ann-benchmarks/data/bigann-clustered/runbook-bigann-100M.yaml"
+#    "msturing-100M-shift|/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100000000/msturing-100M-shift_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/msturing-100M-shift_runbookfinal.yaml"
+    "msturing-500M-shift|/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/500000000/runbook_msturing500Mshift.yaml|/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/runbook_msturing500Mshift.yaml"
+#    "bigann-100M-clustered|/dataset/big-ann-benchmarks/data/bigann-clustered/100000000/runbook-bigann-100M.yaml|/dataset/big-ann-benchmarks/data/bigann-clustered/runbook-bigann-100M.yaml"
 #    "bigann-100M-random|/dataset/big-ann-benchmarks/data/bigann-random/100000000/runbook-bigann-100M-random.yaml|/dataset/big-ann-benchmarks/data/bigann-random/runbook-bigann-100M-random.yaml"
 #   "bigann-100M-shift|/dataset/big-ann-benchmarks/data/bigann-shift/100000000/bigann-100M-shift_runbookfinal.yaml|/dataset/big-ann-benchmarks/data/bigann-shift/bigann-100M-shift_runbookfinal.yaml"
-    "bigann-500M-clustered|/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500000000/runbook_bigann-500M-clustered.yaml|/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"
+#    "bigann-500M-clustered|/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500000000/runbook_bigann-500M-clustered.yaml|/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"
 )
 
 # ── Helper: last step number in a runbook YAML ────────────────────────────────
