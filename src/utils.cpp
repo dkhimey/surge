@@ -65,12 +65,30 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
         }
     },
 
+    {"msturing-500M-clustered",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500M-msturingclustered64.fbin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/runbook_msturing500Mclustered.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500000000/runbook_msturing500Mclustered.yaml"},
+        }
+    },
+
     {"bigann-500M-clustered",
         {
             {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500M-bigann64clustered.u8bin"},
             {"runbook", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"},
             {"query_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500000000/runbook_bigann-500M-clustered.yaml/"},
+        }
+    },
+
+    {"bigann-500M-shift",
+        {
+            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/500M_bigann500shift64.u8bin"},
+            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/runbook_bigann500Mshift.yaml"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/query.public.10K.u8bin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/500000000/runbook_bigann500Mshift.yaml/"},
         }
     },
 
@@ -111,16 +129,6 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/query10K.fbin"},
             {"ground_truth_dir", "TODO"},
             {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-100M.query10K.bin"}
-        }
-    },
-
-
-    {"msturing-500M-clustered",
-        {
-            {"base_file", "TODO"},
-            {"runbook", "TODO"},
-            {"query_file", "TODO"},
-            {"ground_truth_dir", "TODO"},
         }
     },
 
