@@ -1,0 +1,6 @@
+[submodule "external/KaHIP"]
+	path = external/KaHIP
+	url = https://github.com/KaHIP/KaHIP
+[submodule "external/yaml-cpp"]
+	path = external/yaml-cpp
+	url = https://github.com/jbeder/yaml-cpp
