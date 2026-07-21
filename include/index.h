@@ -41,7 +41,7 @@ public:
     void save(const std::string& output_dir);
 
     // Load the coordinator's routing state from the output of
-    // msturing-cluster-analysis.cpp step <step> plus a precomputed partition
+    // runbook_centers.cpp step <step> plus a precomputed partition
     // assignment file (center → shard).  Used to start an experiment from a
     // cluster-analysis-produced starting state instead of building from scratch.
     //

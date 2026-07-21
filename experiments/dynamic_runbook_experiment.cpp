@@ -1,19 +1,20 @@
-// shared_batch_experiment_sweep.cpp
+// dynamic_runbook_experiment.cpp
 //
-// Variant of shared_batch_experiment that sweeps all three routing modes and
-// their full parameter grids during search steps rather than accepting a single
-// mode/param on the command line.  Insert, delete, and rebuild steps run once
-// as normal; each search step runs once per (mode, param) combination and
-// records throughput + recall separately for each combination.
+// Main end-to-end distributed dynamic experiment.  Replays a streaming runbook
+// of interleaved insert / delete / search steps against the SURGE index, keeping
+// the routing layer and local graphs current via online maintenance, and reports
+// per-step recall and throughput.  Insert, delete, and rebuild steps run once as
+// normal; each search step is swept over all three routing modes and their full
+// parameter grids, recording throughput + recall separately for each (mode, param).
 //
 // ─── Usage ───────────────────────────────────────────────────────────────────
-//  mpirun -np <P+1> ./shared_batch_experiment_sweep \
+//  mpirun -np <P+1> ./dynamic_runbook_experiment \
 //      <dataset> <num_partitions> <full_threshold> <k> <gt_prefix> <output_file>
 //
 //  Rebuild policy: delta always — shadow-delete departing elements and insert
 //  arriving ones using replace_deleted=true (keeps existing graph topology).
 //  Falls back to a full reconstruction if any shard's tombstone ratio exceeds
-//  TOMBSTONE_RATIO_THRESHOLD (currently 0.75 = 75% unused slots).  This check
+//  TOMBSTONE_RATIO_THRESHOLD (currently 0.50 = 50% unused slots).  This check
 //  fires independently of the center-movement rebuild threshold: a shard
 //  exceeding the ratio forces a full rebuild even when checkNeedRebuild() would
 //  otherwise report that no rebuild is needed.
@@ -517,7 +518,7 @@ int main(int argc, char** argv)
             << "  query set + GT, while the timed window measures the scaled query count.\n"
             << "\n"
             << "  Starting-state options (skip the from-scratch KMeans build and start\n"
-            << "  from the output of msturing-cluster-analysis.cpp step <N>):\n"
+            << "  from the output of runbook_centers.cpp step <N>):\n"
             << "    --init-state-dir  <dir>   directory holding step_NNNNNN_hnsw.bin,\n"
             << "                              step_NNNNNN_centers.csv, _center_counts.csv,\n"
             << "                              and _labels.csv from cluster analysis\n"
@@ -549,7 +550,7 @@ int main(int argc, char** argv)
 
     // ── Optional starting-state flags ────────────────────────────────────────
     // When both --init-state-dir and --init-partitions are supplied, Phase 1
-    // loads the routing state produced by msturing-cluster-analysis.cpp step
+    // loads the routing state produced by runbook_centers.cpp step
     // <init_state_step> instead of running KMeans from scratch.
     std::string init_state_dir;
     std::string init_partitions_file;
@@ -795,7 +796,7 @@ int main(int argc, char** argv)
         if (!resuming && use_init_state) {
             // ── Phase 1: load starting state from cluster analysis ────────────
             // Load meta-HNSW, centroids, counts, label→center, and partitions
-            // produced by msturing-cluster-analysis.cpp step <init_state_step>,
+            // produced by runbook_centers.cpp step <init_state_step>,
             // then distribute the initial batch to executors using that exact
             // assignment (so the physical shard layout matches the loaded state).
             std::cout << "[Sweep] Loading starting state from cluster analysis: "

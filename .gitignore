@@ -1,5 +1,33 @@
-build
-bin
+# Build output
+build/
+bin/
 external/KaHIP/build/*
+external/yaml-cpp/build/*
+
+# Experiment artifacts
 theoretical_partitioning_quality*
 logs*
+results/
+checkpoints/
+rankfile.txt
+*.csv.bak
+plot_results/
+old_experiments/
+postgres/
+tools/
+docs/
+oracles/theoretical_dynamic_simulation/retroactive_nprobe_oracle.py
+oracles/theoretical_dynamic_simulation/compute_theoretical_recall_sweep.py
+
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.synctex.gz

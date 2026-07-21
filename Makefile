@@ -9,9 +9,6 @@ LDFLAGS := -fopenmp
 # === Include Paths ===
 INCLUDES := -Iexternal/hnswlib/hnswlib \
             -Iexternal/KaHIP/interface \
-            -Iexternal/FALCONN/external/eigen \
-            -Iexternal/FALCONN/external/simple-serializer \
-            -Iexternal/FALCONN/src/include \
             -Iexternal/nlohmann/ \
             -Iexternal/yaml-cpp/include
 
@@ -32,10 +29,14 @@ CORE_SRCS := $(SRC_DIR)/index.cpp $(SRC_DIR)/utils.cpp
 CORE_OBJS := $(CORE_SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
 # === Experiments ===
+# Top-level drivers plus any grouped into sub-directories (e.g. theoretical_dynamic_simulation).
+# Binaries are always emitted flat as bin/<basename>.
 EXP_DIR := experiments
-EXP_SRCS := $(wildcard $(EXP_DIR)/*.cpp)
-EXP_OBJS := $(EXP_SRCS:$(EXP_DIR)/%.cpp=$(OBJ_DIR)/exp_%.o)
-EXP_BINS := $(EXP_SRCS:$(EXP_DIR)/%.cpp=bin/%)
+EXP_SRCS := $(wildcard $(EXP_DIR)/*.cpp) $(wildcard $(EXP_DIR)/*/*.cpp)
+EXP_BINS := $(addprefix bin/,$(notdir $(EXP_SRCS:.cpp=)))
+
+# Resolve experiment sources by basename regardless of sub-directory.
+vpath %.cpp $(sort $(dir $(EXP_SRCS)))
 
 # === Old Experiments ===
 OLD_DIR := old_experiments
@@ -56,7 +57,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
 	$(MPICXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJ_DIR)/exp_%.o: $(EXP_DIR)/%.cpp
+$(OBJ_DIR)/exp_%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(MPICXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 

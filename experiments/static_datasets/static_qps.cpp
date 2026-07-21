@@ -1,18 +1,16 @@
 // shared_static_experiment.cpp
 //
-// Static-index throughput benchmark that replaces static_routing_qps_single.cpp.
+// Static-index throughput benchmark.
 //
-// Key improvements over static_routing_qps_single.cpp:
+// Design notes:
 //  - All MPI ranks hold a local copy of the routing state (meta-HNSW +
 //    partitions) and participate in query dispatch via AllToAllV, matching the
-//    setup of shared_batch_experiment_sweep.cpp and gp-ann's distributed bench.
-//    In the old experiment the coordinator dispatched queries serially over the
-//    MPI message-passing protocol (handle_query); the coordinator became the
-//    bottleneck and executor parallelism was under-utilised.
+//    setup of dynamic_runbook_experiment.cpp and gp-ann's distributed bench.
+//    This avoids a coordinator dispatch bottleneck and keeps executors busy.
 //  - Timing follows gp-ann's distributed_bench.cpp: every rank measures its
 //    own wall time, then MPI_Reduce(MAX) gives the true end-to-end time.
 //  - Sweeps all three routing modes and their full parameter grids, identical
-//    to the grids in shared_batch_experiment_sweep.cpp.
+//    to the grids in dynamic_runbook_experiment.cpp.
 //  - Loads a pre-built static index; no insert / delete / rebuild logic.
 //
 // ─── Usage ───────────────────────────────────────────────────────────────────
@@ -50,7 +48,7 @@
 static constexpr int EF_SEARCH = 200;
 static constexpr int NUM_RUNS  = 10;  // timed passes per (mode, param) combo
 
-// ─── Sweep grids (must match shared_batch_experiment_sweep.cpp) ───────────────
+// ─── Sweep grids (must match dynamic_runbook_experiment.cpp) ───────────────
 static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 15, 20, 25, 30, 40, 60, 80, 100};
 static const std::vector<int>   NPROBE_PARAMS           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 static const std::vector<float> TARGET_PARAMS           = {.6f, .7f, .75f, .8f, .85f,
@@ -79,7 +77,7 @@ static std::string mode_to_string(RoutingMode m)
 }
 
 // ─── routeQuery ──────────────────────────────────────────────────────────────
-// Identical to shared_batch_experiment_sweep.cpp — kept here so this file
+// Identical to dynamic_runbook_experiment.cpp — kept here so this file
 // compiles standalone without a shared header.
 static std::set<int> routeQuery(
     float*                           vec,
@@ -500,7 +498,7 @@ int main(int argc, char** argv)
 
     auto [nvectors, dim] = get_dataset_info(base_file);
 
-    // ── Index directory convention (matches static_routing_qps_single.cpp) ────
+    // ── Index directory convention (shared with the streaming experiments) ────
     const std::string meta_dir = dataset_name + "_" + std::to_string(num_partitions);
 
     std::string log_id = "shared_static_" + dataset_name + "_" + std::to_string(num_partitions);

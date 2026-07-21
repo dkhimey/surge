@@ -1,141 +1,42 @@
 // =============================================================================
-// msturing-cluster-analysis.cpp
+// runbook_centers.cpp
 //
-// C++ translation of:
-//   - msturing-cluster-analysis.py  (steps 1–3: KMeans + HNSW assignment)
-//   - hnsw_per_step.cpp             (step  4: build HNSW + extract base layer)
+// Per-step routing-state generator.  Replays a Big-ANN streaming runbook and,
+// for every update step, produces the coordinator's routing state used by the
+// theoretical-recall pipeline and by dynamic_runbook_experiment's
+// --init-state-dir starting state.
 //
-// Step 5 (KaHIP partitioning) is still handled by runbook_partitions_parallel.cpp.
+// KaHIP partitioning of the emitted base layer is handled separately by
+// runbook_partitions_parallel.cpp.
 //
-// Output per update step  (same filenames as the Python pipeline):
-//   step_NNNNNN_centers.csv        – k × dim float32 centroids
-//   step_NNNNNN_center_counts.csv  – k      int32  cluster sizes
-//   step_NNNNNN_hnsw.bin           – hnswlib serialised index (for recall eval)
-//   step_NNNNNN_base_layer.csv     – base-layer edge list (input to step 5)
+// Output per update step:
+//   step_NNNNNN_centers.csv        - k x dim float32 centroids
+//   step_NNNNNN_center_counts.csv  - k int32 cluster sizes (plain decimal)
+//   step_NNNNNN_hnsw.bin           - hnswlib routing index (for recall eval)
+//   step_NNNNNN_base_layer.csv     - base-layer edge list (input to partitioner)
 //
-// Build (example):
-//   g++ -std=c++17 -O3 -fopenmp \
-//       -I/path/to/hnswlib \
-//       msturing-cluster-analysis.cpp -o msturing-cluster-analysis
+// Build:   make experiments        (produces bin/runbook_centers)
 //
-// Run (example, matching Python defaults):
-//   ./msturing-cluster-analysis \
-//       --runbook    final_runbook.yaml \
+// Run (example):
+//   ./bin/runbook_centers \
+//       --runbook     final_runbook.yaml \
 //       --dataset-key msturing-30M-clustered \
 //       --vector-path 30M-clustered64.fbin \
-//       --centers    10000
+//       --centers     10000
 //
-// ── DIAGNOSTIC: isolate step-1 vs. step-2+ divergence ───────────────────────
+// KMeans and HNSW assignment are seeded (mt19937(42), hnswlib seed 100) so runs
+// are reproducible.
 //
-// Use --initial-centers together with --load-state-assignments to skip C++'s
-// first-batch HNSW assignment entirely and start step 2 from EXACTLY the same
-// state as Python.
-//
-// Why --initial-centers alone is not enough:
-//   Python step-1 flow:
-//     (A) KMeans → centers_A
-//     (B) HNSW(centers_A) → assign all vectors → labels_A
-//     (C) cluster_sums from labels_A → recompute → centers_B  [saved to CSV]
-//     (D) HNSW(centers_B) [used for step-2 assignment]
-//
-//   C++ with --initial-centers loading centers_B:
-//     (A') HNSW(centers_B) → re-assign all vectors → labels_B'  ← different!
-//     (B') cluster_sums from labels_B' → recompute → centers_C   ← different!
-//     (C') HNSW(centers_C) [used for step-2 assignment]          ← different!
-//
-//   Because centers_C ≠ centers_B, step 2 sees a different HNSW than Python's,
-//   so all subsequent assignments diverge.
-//
-// Proper isolation — BOTH flags together:
-//   --initial-centers   <step_000001_centers.csv>   (Python's post-assignment centers)
+// Optional flags:
+//   --initial-centers <centers.csv>
 //   --load-state-assignments <point_to_centroid.csv>
-//
-//   C++ will populate point_to_centroid and cluster_sums from the loaded labels,
-//   then build HNSW from the loaded centers without any re-assignment or
-//   recomputation.  After step 1 C++ state is identical to Python's.
-//
-// To export point_to_centroid.npy → CSV (run once in Python):
-//   python3 - << 'EOF'
-//   import numpy as np
-//   d = np.load('point_to_centroid.npy', allow_pickle=True).item()
-//   with open('point_to_centroid.csv', 'w') as f:
-//       for gid, cid in d.items():
-//           f.write(f'{gid},{cid}\n')
-//   EOF
-//
+//       Start from a fixed centroid set and point->centroid assignment instead
+//       of running the first-batch KMeans + HNSW assignment.  Use both together
+//       to resume from a previously generated step-1 state.
+//   --ignore-zero-counts      Build HNSW over all k nodes but drop edges
+//                             incident to empty (zero-count) centroids.
+//   --skip-zero-count-inserts Do not insert empty centroids into the HNSW at all.
 // =============================================================================
-//
-// ── BEHAVIORAL DIFFERENCES vs. the Python / hnsw_per_step pipeline ──────────
-//
-//  1. KMeans: number of restarts
-//     Python  : sklearn KMeans(random_state=42) with n_init='auto' (k-means++ →
-//               1 restart in sklearn ≥ 1.4 when init='k-means++') or n_init=10
-//               in older sklearn.  Each restart is seeded deterministically from
-//               random_state=42.
-//     C++     : single k-means++ run (n_init=1), seeded with mt19937(42).
-//     Impact  : final centres may differ; quality is similar for k-means++ init.
-//
-//  2. KMeans: random state source
-//     Python  : numpy BitGenerator (PCG64) via random_state=42.
-//     C++     : std::mt19937 seeded with 42.
-//     Impact  : different initial centre selection → different cluster layout,
-//               but the downstream recall metric is invariant to label permutation.
-//
-//  3. KMeans: sampling for initial fit
-//     Python  : np.random.choice(n, 100000, replace=False) using the *global*
-//               numpy random state (NOT seeded here → non-reproducible run-to-run).
-//     C++     : std::mt19937(42) → fully reproducible.
-//     Impact  : Python is non-deterministic across runs; C++ is deterministic.
-//
-//  4. KMeans: convergence criterion
-//     Python/sklearn : relative tolerance tol=1e-4 scaled by inertia/n_samples.
-//     C++            : absolute squared centroid shift ≤ KMEANS_TOL (1e-4).
-//     Impact  : C++ may need more iterations on large datasets.  Max iterations
-//               (300) matches sklearn default.
-//
-//  5. HNSW parameters for assignment index
-//     Both Python and C++ use M=16, ef_construction=200, ef_search=200,
-//     random_seed=100 (hnswlib default).  These are identical.
-//
-//  6. HNSW for step 4 (base-layer graph)
-//     Python pipeline : hnsw_per_step.cpp builds a *fresh* HNSW from the saved
-//                       centres CSV, using hnswlib defaults (M=16, ef_construction
-//                       =200, random_seed=100).
-//     This file       : reuses the assignment HNSW (same parameters, same centres)
-//                       so the graph is byte-for-byte identical.
-//
-//  7. Cluster-sum accumulation precision
-//     Python  : np.float64 (double).
-//     C++     : double.  Identical.
-//
-//  8. Counts file format  ← BUG FIX
-//     Python  : np.savetxt(path, counts.astype(np.int32), delimiter=",") uses the
-//               default fmt='%.18e', so it writes integers in scientific notation:
-//               e.g. count 38 → "3.800000000000000000e+01".
-//               std::stoi("3.800000000000000000e+01") stops at '.' and returns 3.
-//     C++     : writes plain decimal integers (e.g. "38").
-//               std::stoi("38") = 38.  ✓
-//     Impact  :
-//       • hnsw_per_step zero-count check  — unaffected (stoi still returns > 0
-//         for any non-zero count, so zero/non-zero distinction is preserved).
-//       • runbook_partitions_parallel node weights (--no-node-weights NOT passed)
-//         — Python silently uses wrong node weights (only the leading digit).
-//         The C++ output fixes this.  If you are running both scripts together
-//         set --no-node-weights when using the Python-generated counts, or use
-//         the C++ output for correct node-weighted partitioning.
-//
-//  9. Base-layer zero-count handling  (controlled by CLI flags below)
-//     Default (no flag)            : all k nodes included (matches hnsw_per_step
-//                                    default with no extra flags).
-//     --ignore-zero-counts         : HNSW built with all nodes; edges incident to
-//                                    zero-count nodes suppressed in output.  Matches
-//                                    hnsw_per_step --ignore-zero-count.
-//     --skip-zero-count-inserts    : zero-count nodes not inserted into HNSW at all;
-//                                    output uses external labels.  Matches
-//                                    hnsw_per_step --skip-zero-count-inserts.
-//
-// =============================================================================
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1132,7 +1033,7 @@ int main(int argc, char* argv[]) {
 
                     // Export the step-1 label→centroid assignment (one centroid
                     // id per line, batch order; global id = step.start + line)
-                    // so downstream tools (e.g. shared_batch_experiment_sweep.cpp)
+                    // so downstream tools (e.g. dynamic_runbook_experiment.cpp)
                     // can load this starting state.  Matches the debug dump
                     // produced for subsequent insert steps.
                     {
@@ -1157,7 +1058,7 @@ int main(int argc, char* argv[]) {
 
                     // Export the step-1 label→centroid assignment (one centroid
                     // id per line, batch order; global id = step.start + line)
-                    // so downstream tools (e.g. shared_batch_experiment_sweep.cpp)
+                    // so downstream tools (e.g. dynamic_runbook_experiment.cpp)
                     // can load this starting state.  Matches the debug dump
                     // produced for subsequent insert steps.  These labels reflect
                     // the assignment HNSW built from the initial centres, i.e. the
@@ -1324,13 +1225,3 @@ int main(int argc, char* argv[]) {
     std::cout << "\nDone. Output in: " << out_dir << "\n";
     return 0;
 }
-
-// g++ -std=c++17 -O3 -fopenmp \
-//     -I/path/to/hnswlib \
-//     msturing-cluster-analysis.cpp -o msturing-cluster-analysis
-//
-// ./msturing-cluster-analysis \
-//     --runbook     /dataset/vectorDB/final_runbook_256.yaml \
-//     --dataset-key msturing-30M-clustered \
-//     --vector-path /dataset/big-ann-benchmarks/data/MSTuring-30M-clustered/30M-clustered64.fbin \
-//     --centers     10000

@@ -1,6 +1,5 @@
 #include "index.h"
 #include "checkpoint_io.h"
-#include <falconn/lsh_nn_table.h>
 
 #include <iostream>
 #include <functional>
@@ -15,9 +14,6 @@
 #include <sstream>
 #include <iomanip>
 #include <omp.h>
-
-typedef falconn::DenseVector<float> Point;
-Point transformVector(float* vec, size_t dim, float alpha = 0.5);
 
 #define TAG_SEND_NUM 100000001
 #define TAG_SEND_VECS 100000002
@@ -1141,7 +1137,7 @@ void Coordinator::loadFromClusterAnalysis(
     int                ef_search,
     int                init_start)
 {
-    // Build the "step_NNNNNN" prefix exactly as msturing-cluster-analysis.cpp does.
+    // Build the "step_NNNNNN" prefix exactly as runbook_centers.cpp does.
     std::ostringstream pss;
     pss << "step_" << std::setw(6) << std::setfill('0') << step;
     const std::string base         = state_dir + "/" + pss.str();
@@ -1704,7 +1700,7 @@ int Coordinator::kmeans_(float* sample, size_t nPrime, size_t m_centers, float* 
         KMEANS_EPOCHS
     );
     // Reset counts to zero so subsequent inserts accumulate from a clean
-    // baseline, matching the reference pipeline (msturing-cluster-analysis.cpp).
+    // baseline, matching the reference pipeline (runbook_centers.cpp).
     std::fill(center_counts_.begin(), center_counts_.end(), 0);
     return iters;
 }
@@ -2824,19 +2820,4 @@ void Executor::load(const std::string& prefix, int ef_search) {
     std::cout << "[Executor " << node_id_ << " ] Loading sub-HNSW from: " << hnsw_path << "\n";
     sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path, false, 0, true);
     sub_HNSW_->setEf(ef_search);
-}
-
-
-// for running MIPS
-Point transformVector(float* vec, size_t dim, float alpha) {
-    Point transformed; transformed.resize(dim + 1);
-    float dot = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        dot += vec[i] * vec[i];
-        transformed[i] = vec[i];
-    }
-    float norm = sqrt(dot);
-    transformed[dim] = (alpha * norm);
-
-    return transformed;
 }
