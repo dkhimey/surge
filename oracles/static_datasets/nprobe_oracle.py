@@ -5,14 +5,9 @@ import hnswlib
 from pathlib import Path
 
 
-# ── I/O helpers ─────────────────────────────────────────────────────────────
 
 def read_fbin_ground_truth(filename):
-    """Read a ground-truth file in either fbin (IDs + distances) or ibin (IDs only) format.
-
-    Both formats share the same header and ID block; ibin simply has no trailing
-    distances section.  The trailing seek is harmless if the file ends early.
-    """
+    """Read a ground-truth file in fbin or ibin format; trailing seek handles both."""
     with open(filename, "rb") as f:
         num_queries = np.frombuffer(f.read(4), dtype=np.uint32)[0]
         K           = np.frombuffer(f.read(4), dtype=np.uint32)[0]
@@ -46,7 +41,6 @@ def read_partitions_bin(filename):
     """Read a partitions.bin file written by Coordinator::save().
 
     Format: uint64 size | int32[size]
-    (size_t header on 64-bit, then one int32 partition ID per center)
     """
     with open(filename, "rb") as f:
         size = int(np.frombuffer(f.read(8), dtype=np.uint64)[0])
@@ -62,7 +56,6 @@ def load_cached_gt_vectors(filename):
     """Read a cached GT vector file written by saveCachedGTVectors() in the C++ experiment.
 
     Format: uint32 num_vecs | uint32 dim | float32[num_vecs * dim]
-    Vectors are stored in sorted-GT-index order (matching the C++ needed_indices ordering).
     """
     with open(filename, "rb") as f:
         header   = np.frombuffer(f.read(8), dtype=np.uint32)
@@ -76,16 +69,9 @@ def load_cached_gt_vectors(filename):
     return vecs.reshape(num_vecs, dim)
 
 
-# ── Oracle ───────────────────────────────────────────────────────────────────
 
 def find_cached_gt_vectors(base_file: str, dataset_name: str = None) -> str | None:
-    """Look for a cached_gt_vectors_*.bin file in the same directory as the base file.
-
-    theoretical_partitioning_quality.cpp writes:
-        {base_file_parent}/cached_gt_vectors_{dataset_name}.bin
-    If dataset_name is provided, searches for the specific file.
-    Otherwise, globs for the pattern and picks the most recently modified match.
-    """
+    """Find cached_gt_vectors_*.bin file in base_file's directory; glob for most recent if no dataset_name."""
     base_dir = Path(base_file).parent
 
     if dataset_name:
@@ -124,14 +110,8 @@ def compute_nprobe_oracle(
     nprobe_values:  list = None,
     out_csv:        str  = "nprobe_oracle_results.csv",
 ):
-    """Compute the nprobe oracle: for each nprobe value, probe the nprobe partitions
-    that hold the maximum number of GT neighbours for each query.
-
-    For every query q the oracle ranks partitions by the descending fraction of
-    GT neighbours they contain and selects the top nprobe — this is the best any
-    nprobe-limited router could achieve given perfect knowledge of where the GT
-    vectors live.  The reported recall is the mean across queries of the fraction
-    of GT neighbours covered by those nprobe optimal partitions.
+    """
+    Compute nprobe oracle: ranks partitions by GT density; returns optimal recall per nprobe value.
 
     Parameters
     ----------
@@ -154,31 +134,24 @@ def compute_nprobe_oracle(
     if nprobe_values is None:
         nprobe_values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20]
 
-    # ── Load ground truth ─────────────────────────────────────────────────
     gt          = read_fbin_ground_truth(gt_file)       # (num_queries, K_gt)
     num_queries = gt.shape[0]
     gt_indices_flat = gt[:, :k_neighbors].ravel()       # (Q*k,)
 
     print(f"Loaded ground truth: {num_queries} queries, k={k_neighbors}")
 
-    # ── Load partition map ────────────────────────────────────────────────
     partitions     = read_partitions_bin(partition_file)
     num_partitions = int(partitions.max()) + 1
 
     print(f"Loaded partitions: {len(partitions)} centers, {num_partitions} partitions")
 
-    # ── Load router ───────────────────────────────────────────────────────
     router = hnswlib.Index(space="l2", dim=dim)
     router.load_index(router_path)
     router.set_ef(ef)
 
     print(f"Loaded router index with {router.get_current_count()} elements")
 
-    # ── Gather GT vectors (unique only) and route to partitions ───────────
-    # np.unique returns sorted unique indices and an inverse map such that
-    #   unique_indices[inverse] == gt_indices_flat
-    # This aligns with the C++ needed_indices (also sorted) so cache rows
-    # correspond 1-to-1 with unique_indices.
+    # Use unique GT indices to avoid redundant HNSW lookups; inverse expands to (Q*k,)
     unique_indices, inverse = np.unique(gt_indices_flat, return_inverse=True)
 
     cache_path = find_cached_gt_vectors(base_file, dataset_name=dataset_name)
@@ -199,25 +172,22 @@ def compute_nprobe_oracle(
         gt_vecs   = np.ascontiguousarray(base_mmap[unique_indices], dtype=np.float32)
         print(f"Gathered {len(unique_indices):,} unique GT vectors from base file")
 
-    # Route unique vectors; expand back to (Q*k,) via the inverse index.
+    # Route unique vectors; expand via inverse index mapping
     labels, _       = router.knn_query(gt_vecs, k=1)   # (num_unique, 1)
     unique_part_ids = partitions[labels[:, 0]]          # (num_unique,)
     gt_part_ids     = unique_part_ids[inverse]          # (Q*k,)
     gt_part_matrix  = gt_part_ids.reshape(num_queries, k_neighbors)
 
-    # ── Build per-query partition distributions ───────────────────────────
-    # query_dist[i, p] = fraction of query i's GT neighbours in partition p
+    # Per-query partition distributions: fraction of GT neighbours in each partition
     query_dist = np.zeros((num_queries, num_partitions), dtype=np.float64)
     for i in range(num_queries):
         counts        = np.bincount(gt_part_matrix[i], minlength=num_partitions)
         query_dist[i] = counts / k_neighbors
 
-    # Sort each row descending; cumsum gives the achievable recall curve
-    # when the top-n optimal partitions are probed.
+    # Optimal recall curves: sort descending; cumsum = max recall for top-n
     sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]     # (Q, P)
     cumsum      = np.cumsum(sorted_dist, axis=1)            # (Q, P)
 
-    # ── Oracle per nprobe value ───────────────────────────────────────────
     rows = []
 
     print(f"\n{'NProbe':>8} | {'Activation':>12} | {'Mean recall':>12} | "
@@ -226,8 +196,7 @@ def compute_nprobe_oracle(
 
     for nprobe in nprobe_values:
         n = min(nprobe, num_partitions)
-        # cumsum[:, n-1] is the recall achieved by probing the n optimal
-        # partitions for each query independently.
+        # Oracle recall: optimal n partitions for each query independently
         recall_per_query = cumsum[:, n - 1]
 
         mean_recall = float(recall_per_query.mean())
@@ -246,7 +215,6 @@ def compute_nprobe_oracle(
             "p95_recall":  p95_recall,
         })
 
-    # ── Write CSV ─────────────────────────────────────────────────────────
     lines = ["nprobe,activation,mean_recall,p5_recall,p95_recall"] + [
         f"{r['nprobe']},"
         f"{r['activation']:.6f},"
@@ -262,7 +230,6 @@ def compute_nprobe_oracle(
     return rows
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

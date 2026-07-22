@@ -1,29 +1,9 @@
 #pragma once
 //
-// checkpoint_io.h — durability + integrity helpers for checkpoint writes.
+// checkpoint_io.h — durability and integrity helpers for checkpoint writes.
 //
-// Background: the checkpoint code used to write shard / metadata files with a
-// plain std::ofstream and rely on close() for durability. close() only hands
-// the bytes to the OS page cache; it does NOT force them to stable storage.
-// If the job is later SIGKILL'd (scheduler time limit / OOM) or the node
-// crashes, the large shard files can still be sitting in the page cache and are
-// lost, while small files written earlier (e.g. results.csv) have already been
-// flushed. On the next run the resume picks a checkpoint whose shard files are
-// truncated, and hnswlib's loader aborts with
-//     "Index seems to be corrupted or unsupported".
-//
-// These helpers provide:
-//   * fsync_file / fsync_dir / fsync_parent_dir — force data + directory
-//     entries to disk.
-//   * atomic_durable_write — write-to-temp + fsync + rename + dir-fsync, so a
-//     published file is always either the complete old version or the complete
-//     new one, never a torn mix.
-//   * hnsw_file_is_valid — a cheap, allocation-free structural check that an
-//     hnswlib index file on disk is complete. It mirrors the integrity walk in
-//     HierarchicalNSW::loadIndex but does NOT allocate the graph, so it can be
-//     run on a freshly-written 500M-scale shard without doubling memory. This
-//     catches silent short writes (e.g. ENOSPC) that saveIndex ignores, before
-//     the checkpoint is committed.
+// Provides atomic writes with fsync, directory durability, and structural
+// validation for hnswlib index files to prevent corruption from partial writes.
 //
 #include <cstdint>
 #include <cstdio>
@@ -37,7 +17,7 @@
 
 namespace surge {
 
-// fsync a regular file by path. Returns true on success.
+// fsync a regular file by path, returns true on success
 inline bool fsync_file(const std::string& path) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
@@ -46,9 +26,7 @@ inline bool fsync_file(const std::string& path) {
     return r == 0;
 }
 
-// fsync a directory so that newly created/renamed entries are durable.
-// Best-effort: some filesystems reject directory fsync (returns false), which
-// callers may treat as non-fatal.
+// fsync a directory so entries are durable; best-effort (some filesystems reject it)
 inline bool fsync_dir(const std::string& dir) {
     int flags = O_RDONLY;
 #ifdef O_DIRECTORY
@@ -68,17 +46,15 @@ inline bool fsync_parent_dir(const std::string& path) {
     return fsync_dir(parent.string());
 }
 
-// Durably and atomically write `bytes` to `final_path`:
-//   write to final_path + ".tmp" -> flush -> fsync -> rename -> fsync(dir).
-// Throws std::runtime_error on any failure. Suitable for small files
-// (metadata, commit markers). Do NOT use for multi-GB buffers.
+// Atomically write to final_path via tmp file + fsync + rename
+// Throws std::runtime_error on failure; unsuitable for multi-GB buffers
 inline void atomic_durable_write(const std::string& final_path,
                                  const std::string& bytes) {
     const std::string tmp = final_path + ".tmp";
     {
         std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
         if (!o) throw std::runtime_error("cannot open for write: " + tmp);
-        if (!bytes.empty())
+    if (!bytes.empty())
             o.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         o.flush();
         if (!o) throw std::runtime_error("write failed (disk full?): " + tmp);
@@ -89,20 +65,12 @@ inline void atomic_durable_write(const std::string& final_path,
     std::filesystem::rename(tmp, final_path, ec);
     if (ec)
         throw std::runtime_error("rename failed: " + final_path + ": " + ec.message());
-    fsync_parent_dir(final_path);  // best-effort; rename durability
+    fsync_parent_dir(final_path);  // best-effort durability
 }
 
-// Structural integrity check for an hnswlib HierarchicalNSW<float> file.
-//
-// Mirrors the "check if index is ok" walk inside HierarchicalNSW::loadIndex
-// (external/hnswlib/hnswlib/hnswalg.h): read the fixed header, skip the level-0
-// data block, then walk one variable-length link list per element and confirm
-// the cursor lands exactly on EOF. Returns false (with an explanation in `err`,
-// if provided) when the file is truncated, short-written, or otherwise the size
-// the header implies does not match the bytes on disk — i.e. exactly the
-// condition that makes loadIndex throw "Index seems to be corrupted".
-//
-// Allocation-free: only seeks through the file, never materialises the graph.
+// Structural validation of hnswlib index files without loading graph
+// Mirrors HierarchicalNSW::loadIndex validation but allocation-free
+// Returns false if truncated, short-written, or size mismatches occur
 inline bool hnsw_file_is_valid(const std::string& path, std::string* err = nullptr) {
     auto fail = [&](const std::string& m) {
         if (err) *err = m;
@@ -122,7 +90,7 @@ inline bool hnsw_file_is_valid(const std::string& path, std::string* err = nullp
         return static_cast<bool>(in) && in.gcount() == static_cast<std::streamsize>(n);
     };
 
-    // Header fields, in the exact order/sizes saveIndex writes them.
+    // Read header fields in saveIndex order
     uint64_t offsetLevel0, max_elements, cur_element_count, size_data_per_element,
              label_offset, offsetData, maxM, maxM0, M, ef_construction;
     int32_t  maxlevel;
@@ -147,9 +115,7 @@ inline bool hnsw_file_is_valid(const std::string& path, std::string* err = nullp
 
     const std::streamoff header_end = in.tellg();
 
-    // Skip the contiguous level-0 data block. Guard against a header that
-    // claims more data than the file can hold (long double avoids overflow in
-    // the comparison even for huge element counts).
+    // Skip level-0 data block; guard against overflow with long double
     const long double data_block =
         static_cast<long double>(cur_element_count) *
         static_cast<long double>(size_data_per_element);
@@ -161,7 +127,7 @@ inline bool hnsw_file_is_valid(const std::string& path, std::string* err = nullp
                  static_cast<std::streamoff>(cur_element_count * size_data_per_element),
              std::ios::beg);
 
-    // Walk one linkListSize-prefixed list per element.
+    // Validate link lists for each element
     for (uint64_t i = 0; i < cur_element_count; ++i) {
         const std::streamoff cur = in.tellg();
         if (cur < 0 || cur >= filesize)

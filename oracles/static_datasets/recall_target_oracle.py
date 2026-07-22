@@ -5,14 +5,9 @@ import hnswlib
 from pathlib import Path
 
 
-# ── I/O helpers ─────────────────────────────────────────────────────────────
 
 def read_fbin_ground_truth(filename):
-    """Read a ground-truth file in either fbin (IDs + distances) or ibin (IDs only) format.
-
-    Both formats share the same header and ID block; ibin simply has no trailing
-    distances section.  The trailing seek is harmless if the file ends early.
-    """
+    """Read a ground-truth file in fbin or ibin format; trailing seek handles both."""
     with open(filename, "rb") as f:
         num_queries = np.frombuffer(f.read(4), dtype=np.uint32)[0]
         K           = np.frombuffer(f.read(4), dtype=np.uint32)[0]
@@ -46,7 +41,6 @@ def read_partitions_bin(filename):
     """Read a partitions.bin file written by Coordinator::save().
 
     Format: uint64 size | int32[size]
-    (size_t header on 64-bit, then one int32 partition ID per center)
     """
     with open(filename, "rb") as f:
         size = int(np.frombuffer(f.read(8), dtype=np.uint64)[0])
@@ -62,7 +56,6 @@ def load_cached_gt_vectors(filename):
     """Read a cached GT vector file written by saveCachedGTVectors() in the C++ experiment.
 
     Format: uint32 num_vecs | uint32 dim | float32[num_vecs * dim]
-    Vectors are stored in sorted-GT-index order (matching the C++ needed_indices ordering).
     """
     with open(filename, "rb") as f:
         header   = np.frombuffer(f.read(8), dtype=np.uint32)
@@ -76,20 +69,12 @@ def load_cached_gt_vectors(filename):
     return vecs.reshape(num_vecs, dim)
 
 
-# ── Oracle ───────────────────────────────────────────────────────────────────
 
 def find_cached_gt_vectors(base_file: str, dataset_name: str = None) -> str | None:
-    """Look for a cached_gt_vectors_*.bin file in the same directory as the base file.
-
-    theoretical_partitioning_quality.cpp writes:
-        {base_file_parent}/cached_gt_vectors_{dataset_name}.bin
-    If dataset_name is provided, searches for the specific file.
-    Otherwise, globs for the pattern and picks the most recently modified match.
-    """
+    """Find cached_gt_vectors_*.bin file in base_file's directory; glob for most recent if no dataset_name."""
     base_dir = Path(base_file).parent
     
     if dataset_name:
-        # Search for specific cached file with the given dataset name
         specific_file = base_dir / f"cached_gt_vectors_{dataset_name}.bin"
         if specific_file.exists():
             print(f"Found cached GT vectors for dataset '{dataset_name}': {specific_file}")
@@ -98,7 +83,6 @@ def find_cached_gt_vectors(base_file: str, dataset_name: str = None) -> str | No
             print(f"No cached GT vectors found for dataset '{dataset_name}' at {specific_file}")
             return None
     else:
-        # Fallback: glob for any cached_gt_vectors_*.bin file
         candidates = sorted(
             base_dir.glob("cached_gt_vectors_*.bin"),
             key=lambda p: p.stat().st_mtime,
@@ -126,12 +110,9 @@ def compute_oracle(
     target_recalls: list = None,
     out_csv:        str  = "oracle_results.csv",
 ):
-    """Compute the oracle optimal number of partitions per recall target.
-
-    For each recall target τ and each query, the oracle sorts that query's
-    ground-truth partition distribution in descending order and greedily
-    accumulates partitions until the cumulative mass reaches τ.  It reports
-    the number of partitions needed and the actual recall achieved.
+    """Compute oracle: optimal partitions per recall target via greedy accumulation.
+    
+    For each target, greedily accumulates partitions ranked by GT density until the target recall is reached.
 
     Parameters
     ----------
@@ -154,31 +135,25 @@ def compute_oracle(
     if target_recalls is None:
         target_recalls = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.97, 0.98, 0.99]
 
-    # ── Load ground truth ─────────────────────────────────────────────────
     gt          = read_fbin_ground_truth(gt_file)       # (num_queries, K_gt)
     num_queries = gt.shape[0]
     gt_indices_flat = gt[:, :k_neighbors].ravel()       # (Q*k,), may contain duplicates
 
     print(f"Loaded ground truth: {num_queries} queries, k={k_neighbors}")
 
-    # ── Load partition map ────────────────────────────────────────────────
     partitions     = read_partitions_bin(partition_file)
     num_partitions = int(partitions.max()) + 1
 
     print(f"Loaded partitions: {len(partitions)} centers, {num_partitions} partitions")
 
-    # ── Load router ───────────────────────────────────────────────────────
     router = hnswlib.Index(space="l2", dim=dim)
     router.load_index(router_path)
     router.set_ef(ef)
 
     print(f"Loaded router index with {router.get_current_count()} elements")
 
-    # ── Gather GT vectors (unique only) and route to partitions ───────────
-    # np.unique returns sorted unique indices and an inverse map such that
-    #   unique_indices[inverse] == gt_indices_flat
-    # This aligns with the C++ needed_indices (also sorted) so cache rows
-    # correspond 1-to-1 with unique_indices.
+    # np.unique returns sorted unique indices and an inverse map:
+    # unique_indices[inverse] == gt_indices_flat
     unique_indices, inverse = np.unique(gt_indices_flat, return_inverse=True)
 
     cache_path = find_cached_gt_vectors(base_file, dataset_name=dataset_name)
@@ -205,7 +180,6 @@ def compute_oracle(
     gt_part_ids     = unique_part_ids[inverse]          # (Q*k,)
     gt_part_matrix  = gt_part_ids.reshape(num_queries, k_neighbors)
 
-    # ── Build per-query partition distributions ───────────────────────────
     # query_dist[i, p] = fraction of query i's GT neighbours in partition p
     query_dist = np.zeros((num_queries, num_partitions), dtype=np.float64)
     for i in range(num_queries):
@@ -216,7 +190,6 @@ def compute_oracle(
     sorted_dist = np.sort(query_dist, axis=1)[:, ::-1]     # (Q, P)
     cumsum      = np.cumsum(sorted_dist, axis=1)            # (Q, P)
 
-    # ── Oracle per recall target ──────────────────────────────────────────
     oracle_optimal_activations: dict = {}
     oracle_optimal_recall:      dict = {}
     rows = []
@@ -252,7 +225,6 @@ def compute_oracle(
             "mean_recall":     mean_recall,
         })
 
-    # ── Write CSV ─────────────────────────────────────────────────────────
     lines = ["recall_target,mean_partitions,mean_recall"] + [
         f"{r['recall_target']:.2f},{r['mean_partitions']:.4f},{r['mean_recall']:.6f}"
         for r in rows
@@ -264,7 +236,6 @@ def compute_oracle(
     return oracle_optimal_activations, oracle_optimal_recall
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

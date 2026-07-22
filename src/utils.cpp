@@ -7,11 +7,9 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DATASETS registry (declared extern in utils.h)
-//
-// Two kinds of entries:
-//   • Streaming (dynamic) datasets — fields: base_file, runbook, query_file,
+//   Streaming (dynamic) datasets — fields: base_file, runbook, query_file,
 //     ground_truth_dir.  One per (family, scale, workload).
-//   • Static (base) datasets       — fields: base_file, query_file, gt_file.
+//   Static (base) datasets       — fields: base_file, query_file, gt_file.
 //
 // Families: bigann/sift (u8, 128-dim) and msturing (f32, 100-dim).
 // Edit the paths below to point at your local copies of the data.

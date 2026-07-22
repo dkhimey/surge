@@ -27,11 +27,11 @@
 
 #include "index.h"
 
-// ─── Hyper-parameters ────────────────────────────────────────────────────────
+// Constants
 static constexpr int EF_SEARCH = 200;
-static constexpr int NUM_RUNS  = 10;  // timed passes per (mode, param) combo
+static constexpr int NUM_RUNS  = 10;  // timed passes per (mode, param)
 
-// ─── Sweep grids (must match dynamic_runbook_experiment.cpp) ───────────────
+// Sweep parameter grids
 static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {1, 2, 5, 10, 15, 20, 25, 30, 40, 60, 80, 100};
 static const std::vector<int>   NPROBE_PARAMS           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 static const std::vector<float> TARGET_PARAMS           = {.6f, .7f, .75f, .8f, .85f,
@@ -59,9 +59,8 @@ static std::string mode_to_string(RoutingMode m)
     return "Unknown";
 }
 
-// ─── routeQuery ──────────────────────────────────────────────────────────────
-// Identical to dynamic_runbook_experiment.cpp — kept here so this file
-// compiles standalone without a shared header.
+// Route a single query using the given mode and parameter
+// Identical to dynamic_runbook_experiment.cpp
 static std::set<int> routeQuery(
     float*                           vec,
     hnswlib::HierarchicalNSW<float>* hnsw,
@@ -123,16 +122,10 @@ static std::set<int> routeQuery(
 
         const double d0_raw   = static_cast<double>(centers[0].first);
         const double dmax_raw = static_cast<double>(centers.back().first);
-        // Normalise by the spread of the candidate set, not the absolute scale.
-        // This maps [d_0, d_max] -> [0, 1] so the nearest centroid always gets
-        // exp(0)=1 and the farthest exp(-1)≈0.37, giving real discrimination
-        // even on concentrated-distance datasets like MSTuring where d_r ≈ d_0
-        // makes (d_r - d_0)/d_0 ≈ 0 for every candidate.
+        // Normalise by spread: [d_0, d_max] -> [0, 1]
         const double d_spread = (dmax_raw - d0_raw) + 1e-10;
 
-        // Accumulate per-partition scores: |rho(c)| * exp(-(d_r - d_0) / d_spread).
-        // Aggregating by partition lets a dominant nearby partition accumulate
-        // enough mass to be selected alone for low recall targets.
+        // Accumulate per-partition scores: |rho(c)| * exp(-(d_r - d_0) / d_spread)
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
             const double rel_d = (static_cast<double>(centers[r].first) - d0_raw)
@@ -172,7 +165,7 @@ static std::set<int> routeQuery(
     return target_ranks;
 }
 
-// ─── AllToAllV helper ─────────────────────────────────────────────────────────
+// AllToAllV: distribute vectors to all ranks based on partition assignment
 template<typename T>
 static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
                       std::vector<std::vector<T>>&       recv_bufs,
@@ -201,9 +194,7 @@ static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
         recv_bufs[r].assign(rf.begin() + rd[r], rf.begin() + rd[r] + rc[r]);
 }
 
-// ─── bcastRoutingState ────────────────────────────────────────────────────────
-// Broadcasts the coordinator's meta-HNSW and partition assignment to every
-// other rank so they can route queries locally.
+// Broadcast routing state (meta-HNSW and partitions) from rank 0 to all others
 static void bcastRoutingState(
     int                              rank,
     int                              dim,
@@ -215,7 +206,7 @@ static void bcastRoutingState(
     std::vector<int>&                 out_counts,
     hnswlib::SpaceInterface<float>*   space)
 {
-    // 1. Partitions vector
+    // Broadcast partition assignments
     {
         int n = (rank == 0) ? static_cast<int>(coord_parts->size()) : 0;
         MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -225,7 +216,7 @@ static void bcastRoutingState(
             n, MPI_INT, 0, MPI_COMM_WORLD);
         if (rank == 0) out_parts = *coord_parts;
     }
-    // 1b. Per-centroid vector counts
+    // Broadcast per-centroid counts
     {
         int n = (rank == 0) ? static_cast<int>(coord_counts->size()) : 0;
         MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -235,7 +226,7 @@ static void bcastRoutingState(
             n, MPI_INT, 0, MPI_COMM_WORLD);
         if (rank == 0) out_counts = *coord_counts;
     }
-    // 2. Meta-HNSW serialised bytes
+    // Broadcast HNSW binary
     {
         int hnsw_size = 0;
         std::vector<char> buf;
@@ -258,19 +249,9 @@ static void bcastRoutingState(
     }
 }
 
-// ─── runSearchPass ────────────────────────────────────────────────────────────
-// One full pass over all queries for a single (mode, param) combo.
-//
-// All ranks participate:
-//   Phase 1 (routing): each rank routes its query chunk → send_qids / send_qvecs
-//   Phase 2 (dispatch): AllToAllV sends (qid, qvec) to target executor ranks
-//   Phase 3 (search):  executor ranks call searchLocalBatch on received queries;
-//                      coordinator sends empty buffers (it has no shard)
-//   Phase 4 (return):  AllToAllV returns (qid, result_ids, result_dists)
-//   Phase 5 (merge):   each rank merges its results and (optionally) scores recall
-//
-// Returns per-query part counts (for avg_parts_searched) and hit count.
-// Timing is the caller's responsibility (barrier + MPI_Wtime).
+// One pass over all queries for a (mode, param) combo
+// Phase 1: route locally  Phase 2: dispatch via AllToAllV  Phase 3: execute
+// Phase 4: return results  Phase 5: merge and score recall
 static void runSearchPass(
     int                              rank,
     int                              world_size,
@@ -299,7 +280,8 @@ static void runSearchPass(
     out_route_time  = 0.0;
     out_search_time = 0.0;
     out_search_load = 0;
-    // ── Phase 1: local routing ────────────────────────────────────────────────
+
+    // Phase 1: route queries locally to target ranks
     std::vector<std::vector<uint32_t>> send_qids(world_size);
     std::vector<std::vector<float>>    send_qvecs(world_size);
     long long my_total_parts = 0;
@@ -337,13 +319,13 @@ static void runSearchPass(
     }
     out_route_time = MPI_Wtime() - t_route0;
 
-    // ── Phase 2: dispatch queries to executors ────────────────────────────────
+    // Phase 2: send queries to executors via AllToAllV
     std::vector<std::vector<uint32_t>> recv_qids;
     std::vector<std::vector<float>>    recv_qvecs;
     AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, world_size, MPI_COMM_WORLD);
     AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    world_size, MPI_COMM_WORLD);
 
-    // ── Phase 3: search + prepare return buffers ──────────────────────────────
+    // Phase 3: execute searches on each rank's shard
     const size_t chunk = (nq + world_size - 1) / world_size;
 
     std::vector<std::vector<uint32_t>> snd_rqids(world_size);
@@ -383,7 +365,7 @@ static void runSearchPass(
     out_search_load = my_search_load;
     // Coordinator: snd_r* buffers remain empty — it holds no shard.
 
-    // ── Phase 4: return results to query owners ───────────────────────────────
+    // Phase 4: return results to query owners via AllToAllV
     std::vector<std::vector<uint32_t>> rcv_rqids;
     std::vector<std::vector<uint32_t>> rcv_rids;
     std::vector<std::vector<float>>    rcv_rdists;
@@ -391,7 +373,7 @@ static void runSearchPass(
     AllToAllV(snd_rids,   rcv_rids,   MPI_UINT32_T, world_size, MPI_COMM_WORLD);
     AllToAllV(snd_rdists, rcv_rdists,  MPI_FLOAT,    world_size, MPI_COMM_WORLD);
 
-    // ── Phase 5: merge + recall ───────────────────────────────────────────────
+    // Phase 5: merge results and compute recall
     using KNNVec = std::vector<std::pair<float, uint32_t>>;
     std::vector<KNNVec> neighbors(my_qe - my_qs);
 
@@ -452,7 +434,7 @@ int main(int argc, char** argv)
     const auto sweep_combos = build_sweep_combos();
     const int  n_combos     = static_cast<int>(sweep_combos.size());
 
-    // ── MPI init ──────────────────────────────────────────────────────────────
+    // Initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     if (provided < MPI_THREAD_MULTIPLE) {
@@ -474,33 +456,31 @@ int main(int argc, char** argv)
         MPI_Finalize(); return 1;
     }
 
-    // ── Dataset info ──────────────────────────────────────────────────────────
+    // Load dataset metadata
     const std::string base_file  = DATASETS[dataset_name]["base_file"];
     const std::string query_file = DATASETS[dataset_name]["query_file"];
     const FileFormat  file_format = getFileFormat(base_file);
 
     auto [nvectors, dim] = get_dataset_info(base_file);
 
-    // ── Index directory convention (shared with the streaming experiments) ────
+    // Index directory follows streaming experiment naming
     const std::string meta_dir = dataset_name + "_" + std::to_string(num_partitions);
 
     std::string log_id = "shared_static_" + dataset_name + "_" + std::to_string(num_partitions);
     Log logger(log_id);
     Communicator comm;
 
-    // ── Shared routing state (all ranks) ─────────────────────────────────────
+    // Routing state shared across all ranks
     std::vector<int>                  routing_partitions;
     std::vector<int>                  routing_counts;
     hnswlib::L2Space                  meta_space(dim);
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
-    // ── Load index ────────────────────────────────────────────────────────────
+    // Load indices
     Coordinator* meta_index = nullptr;
     Executor*    sub_index  = nullptr;
 
-    // All ranks already know nvectors and dim from get_dataset_info above.
-    // No coordinator→executor broadcast is needed before loading — each rank
-    // loads its own shard directly from disk and passes dim to its constructor.
+    // Each rank loads its assigned shard directly from disk
 
     if (rank == 0) {
         // Coordinator: load meta-index, then broadcast routing state.
@@ -541,14 +521,14 @@ int main(int argc, char** argv)
         std::cout << "[Static] Executor " << rank << " ready\n";
     }
 
-    // ── Load queries (all ranks) ───────────────────────────────────────────────
+    // Load queries on all ranks
     std::vector<float> queries = readVecs(query_file, dim);
     const size_t nq    = queries.size() / dim;
     const size_t chunk = (nq + world_size - 1) / world_size;
     const size_t my_qs = static_cast<size_t>(rank) * chunk;
     const size_t my_qe = std::min(my_qs + chunk, nq);
 
-    // ── Ground truth (all ranks load for recall computation) ──────────────────
+    // Load ground truth if available
     std::vector<std::vector<int>> gt;
     bool have_gt = false;
     {
@@ -565,9 +545,8 @@ int main(int argc, char** argv)
                   << (have_gt ? " with ground truth" : " (no ground truth)")
                   << "\n";
 
-    // ── Distance-spread diagnostic (rank 0 only) ─────────────────────────────
-    // Measures (d_max - d_0) / d_0 over a sample of queries to verify whether
-    // the RecallTarget distance normaliser assumption holds on this dataset.
+    // Diagnostic: measure distance spread over query sample
+    // Verifies RecallTarget distance normalisation assumption
     if (rank == 0) {
         const size_t knn_diag  = 50;
         const size_t n_sample  = std::min<size_t>(1000, nq);
@@ -627,7 +606,7 @@ int main(int argc, char** argv)
     }
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // ── Open CSV (rank 0 only) ─────────────────────────────────────────────────
+    // Open CSV for results
     std::ofstream csv;
     if (rank == 0) {
         csv.open(output_file, std::ios::out);
@@ -638,8 +617,7 @@ int main(int argc, char** argv)
         csv << "mode,param,recall@" << k << ",qps,avg_parts_searched\n";
     }
 
-    // ── Open per-rank diagnostics CSV (rank 0 only) ───────────────────────────
-    // One row per combo; per-executor cells are "load:route_t:search_t".
+    // Open per-rank diagnostic CSV
     std::ofstream diag;
     if (rank == 0) {
         diag.open(output_file + std::string(".diag.csv"), std::ios::out);
@@ -650,17 +628,12 @@ int main(int argc, char** argv)
         }
     }
 
-    // Hot-node tracking (rank 0): per-mode cumulative per-executor query load,
-    // and how often each executor is THE hottest, summed over that mode's combos.
+    // Track which executor is hottest per mode
     std::unordered_map<std::string, std::vector<long long>> cum_load;   // mode → load[world_size]
     std::unordered_map<std::string, std::vector<int>>       hot_count;  // mode → times-hottest[world_size]
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Sweep: for each (mode, param) combo:
-    //    1. Warmup pass   – measures recall, not timed
-    //    2. NUM_RUNS timed passes – all queries, barrier-to-barrier,
-    //                               MPI_Reduce(MAX) for true end-to-end time
-    // ══════════════════════════════════════════════════════════════════════════
+    // Sweep parameter combinations: run warmup pass, then NUM_RUNS timed passes
+    // QPS = (total queries) / (min elapsed time across all runs)
     for (int ci = 0; ci < n_combos; ci++) {
         const auto& [mode, param]      = sweep_combos[ci];
         const std::string mode_str     = mode_to_string(mode);
@@ -669,7 +642,7 @@ int main(int argc, char** argv)
             std::cout << "[Static] combo " << (ci+1) << "/" << n_combos
                       << "  mode=" << mode_str << "  param=" << param << "\n";
 
-        // ── Warmup pass (measures recall, not timed) ──────────────────────────
+        // Warmup pass (measures recall, not timed)
         long long warmup_parts = 0;
         uint64_t  warmup_hits  = 0;
         double    dbg_rt = 0.0, dbg_st = 0.0;
@@ -703,9 +676,7 @@ int main(int argc, char** argv)
             std::cout << "  [warmup] recall@" << k << "=" << recall
                       << "  avg_parts=" << avg_parts_warmup << "\n";
 
-        // ── Timed passes ──────────────────────────────────────────────────────
-        // Each run is timed independently.  QPS is computed from the minimum
-        // elapsed time (max-across-ranks per run, then min across runs).
+        // Timed passes: track minimum elapsed time across runs
         long long timed_parts_acc = 0;
         double    min_elapsed     = std::numeric_limits<double>::max();
 

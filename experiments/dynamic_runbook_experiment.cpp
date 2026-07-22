@@ -34,9 +34,7 @@
 #include <mpi.h>
 #include <omp.h>
 
-// POSIX mmap headers — used by BaseMmap below to sparse-read GT vectors
-// from base_file for theoretical-recall computation (matches the offline
-// Python script's np.memmap pattern).
+// POSIX headers for mmap GT reads
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -51,7 +49,7 @@
 
 static constexpr const char* CKPT_COMMIT_MARKER = "COMMITTED";
 
-// mmap helper for sparse GT vector reads 
+// Memory-mapped file reader for GT vectors
 class BaseMmap {
 public:
     BaseMmap(const std::string& path, FileFormat format)
@@ -89,8 +87,7 @@ public:
     uint32_t n()   const { return n_; }
     uint32_t dim() const { return dim_; }
 
-    // Copy vector at index `id` into `out` (resized to dim()).  Widens
-    // u8 → float on the fly.
+    // Read vector at index `id`, widening u8 → float if needed
     void readVector(uint32_t id, std::vector<float>& out) const {
         out.resize(dim_);
         const char* payload = static_cast<const char*>(base_) + 8;
@@ -115,7 +112,7 @@ private:
     FileFormat format_;
 };
 
-// ─── Build hyper-parameters ──────────────────────────────────────────────────
+// Tuning parameters
 static constexpr int    NCENTERS             = 10000;
 static constexpr int    EF_CONSTRUCTION      = 200;
 static constexpr int    M_META               = 16;
@@ -154,7 +151,7 @@ static std::string mode_to_string(RoutingMode m)
 }
 
 
-// ─── routeQuery: local routing without Coordinator object ────────────────────
+// Route single query by mode: BranchingFactor, NProbe, or RecallTarget
 static std::set<int> routeQuery(
     float*                           vec,
     hnswlib::HierarchicalNSW<float>* hnsw,
@@ -208,9 +205,7 @@ static std::set<int> routeQuery(
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
-        // Size weight: number of routing centers per partition (precomputed by
-        // caller), matching compute_theoretical_recall_updated.py
-        // (part_size = np.bincount(partitions)).
+        // Partition probabilities by distance and size
         const double d0 = static_cast<double>(centers[0].first) + 1e-10;
 
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
@@ -248,7 +243,7 @@ static std::set<int> routeQuery(
     return target_ranks;
 }
 
-// ─── Generic AllToAllV helper ─────────────────────────────────────────────────
+// MPI AllToAllV wrapper
 template<typename T>
 static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
                       std::vector<std::vector<T>>&       recv_bufs,
@@ -277,7 +272,7 @@ static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
         recv_bufs[r].assign(rf.begin() + rd[r], rf.begin() + rd[r] + rc[r]);
 }
 
-// ─── Broadcast routing state from coordinator to all executors ────────────────
+// Broadcast meta-HNSW, partitions, and labels from rank 0
 static void bcastRoutingState(
     int                                      rank,
     int                                      dim,
@@ -290,7 +285,7 @@ static void bcastRoutingState(
     hnswlib::SpaceInterface<float>*          space,
     bool                                     include_ltc)
 {
-    // 1. Partitions
+    // Broadcast partitions
     {
         int n = (rank == 0) ? static_cast<int>(coord_parts->size()) : 0;
         MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -300,7 +295,7 @@ static void bcastRoutingState(
             n, MPI_INT, 0, MPI_COMM_WORLD);
         if (rank == 0) out_parts = *coord_parts;
     }
-    // 2. Meta-HNSW bytes
+    // Broadcast meta-HNSW
     {
         int hnsw_size = 0;
         std::vector<char> buf;
@@ -321,7 +316,7 @@ static void bcastRoutingState(
             out_meta->setEf(EF_SEARCH);
         }
     }
-    // 3. (Optional) label_to_center
+    // Broadcast label_to_center
     if (include_ltc) {
         int n_lc = (rank == 0) ? static_cast<int>(coord_ltc->size()) : 0;
         MPI_Bcast(&n_lc, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -352,15 +347,9 @@ static std::string find_latest_checkpoint(const std::string& ckpt_base)
     for (const auto& entry : std::filesystem::directory_iterator(ckpt_base, ec)) {
         if (ec || !entry.is_directory()) continue;
         const std::string name = entry.path().filename().string();
-        // Expect "ckpt_s<N>" where N is a non-negative integer.
         if (name.size() <= 6 || name.substr(0, 6) != "ckpt_s") continue;
         try {
             long long n = std::stoll(name.substr(6));
-            // Validate: the checkpoint must be COMMITTED. The marker is written
-            // only after every rank durably fsynced + verified its files, so a
-            // checkpoint that was interrupted mid-write (the cause of the
-            // "Index seems to be corrupted" aborts on resume) is skipped here
-            // and resume falls back to the previous committed checkpoint.
             const std::string marker = entry.path().string() + "/" + CKPT_COMMIT_MARKER;
             const std::string meta   = entry.path().string() + "/metadata.bin";
             if (!std::filesystem::exists(marker)) {
@@ -376,7 +365,6 @@ static std::string find_latest_checkpoint(const std::string& ckpt_base)
     return best_dir;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
     if (argc < 7) {
@@ -440,28 +428,13 @@ int main(int argc, char** argv)
     const std::string gt_prefix      = argv[5];
     const std::string output_file    = argv[6];
 
-    // ── Optional starting-state flags ────────────────────────────────────────
-    // When both --init-state-dir and --init-partitions are supplied, Phase 1
-    // loads the routing state produced by runbook_centers.cpp step
-    // <init_state_step> instead of running KMeans from scratch.
+    // Optional starting state from cluster analysis
     std::string init_state_dir;
     std::string init_partitions_file;
     int         init_state_step = 1;
-    // ── Search-scaling flags (mutually exclusive; default = no scaling) ──────
-    //   --search-scale <f>     multiply every search step's query batch by f.
-    //   --search-fraction <p>  choose f automatically so that searched vectors
-    //                          make up fraction p of all (insert+delete+search)
-    //                          vectors over the whole runbook, holding the
-    //                          insert/delete steps fixed.  p must be in (0,1).
-    // Both forms only change the SEARCH workload; the query batch is tiled
-    // (logical query q uses original query q % nq_orig) so recall/GT stay
-    // correct and base query memory is not duplicated.
-    double      search_scale_arg     = 1.0;   // --search-scale (single)
-    // --search-fraction accepts ONE OR MORE comma-separated fractions, e.g.
-    // "0.10,0.25,0.50".  Each fraction becomes its own search variant: every
-    // search step is run once per variant (× the existing mode/param sweep),
-    // and the fraction is recorded in the new "search_fraction" CSV column.
-    std::string search_fractions_arg;          // raw comma-separated list ("" = unset)
+    // Search-scaling flags
+    double      search_scale_arg     = 1.0;
+    std::string search_fractions_arg;
     for (int ai = 7; ai < argc; ++ai) {
         const std::string a = argv[ai];
         if      (a == "--init-state-dir"   && ai + 1 < argc) init_state_dir       = argv[++ai];
@@ -487,15 +460,13 @@ int main(int argc, char** argv)
     const std::string ckpt_base =
         "checkpoints/" + dataset_name + "_t" + std::to_string(full_threshold);
     const bool        use_delta_rebuild = true;
-
-
     const bool        maintenance_enabled = (full_threshold < NCENTERS);
 
     
     const auto sweep_combos = build_sweep_combos();
     const int  n_combos     = static_cast<int>(sweep_combos.size());
 
-    // ── MPI init ─────────────────────────────────────────────────────────────
+    // Initialize MPI with thread support
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     if (provided < MPI_THREAD_MULTIPLE) {
@@ -517,14 +488,12 @@ int main(int argc, char** argv)
         MPI_Finalize(); return 1;
     }
 
-    // ── Dataset info ─────────────────────────────────────────────────────────
     const std::string base_file  = DATASETS[dataset_name]["base_file"];
     const std::string query_file = DATASETS[dataset_name]["query_file"];
 
     auto [nvectors, dim] = get_dataset_info(base_file);
     const FileFormat file_format = getFileFormat(base_file);
 
-    // ── Runbook ──────────────────────────────────────────────────────────────
     const std::string runbook_path = DATASETS[dataset_name]["runbook"];
     std::vector<RunbookStep> steps = load_runbook(runbook_path, dataset_name);
     if (steps.empty() || steps[0].operation != "insert") {
@@ -532,8 +501,7 @@ int main(int argc, char** argv)
         MPI_Finalize(); return 1;
     }
 
-    // ── Resolve search variants (scale + fraction label) ─────────────────────
-    struct SearchVariant { double scale; double fraction; }; // fraction < 0 = not fraction-based
+    struct SearchVariant { double scale; double fraction; }; // frac < 0 = not fraction-based
     std::vector<SearchVariant> search_variants;
     {
         auto [nq_orig_v, q_dim_v] = get_dataset_info(query_file);
@@ -553,7 +521,6 @@ int main(int argc, char** argv)
         };
 
         if (!search_fractions_arg.empty()) {
-            // Parse comma-separated fractions (manual split; avoids <sstream>).
             size_t pos = 0;
             const std::string& s_in = search_fractions_arg;
             while (pos < s_in.size()) {
@@ -598,20 +565,18 @@ int main(int argc, char** argv)
         }
     }
 
-    // ── Log + communicator ────────────────────────────────────────────────────
     std::string log_id = "shared_sweep_" + dataset_name + "_" + std::to_string(num_partitions);
     Log logger(log_id);
     Communicator comm;
 
-    // ── Shared routing state (all ranks) ─────────────────────────────────────
+    // Routing state shared across ranks
     std::unordered_map<int,int>       label_to_center;
-    std::unordered_map<int,int>       label_to_shard;    // label → executor rank (1..P); exact even after delta rebuilds
+    std::unordered_map<int,int>       label_to_shard;    // label to executor rank
     std::vector<int>                  routing_partitions;
-    std::vector<int>                  routing_center_counts;  // center_id → active vector count
+    std::vector<int>                  routing_center_counts;  // counts per center
     hnswlib::L2Space                  meta_space(dim);
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
-    // ── Checkpoint detection ──────────────────────────────────────────────────
     long long ckpt_resume_s_ll = 1LL;
     if (rank == 0) {
         const std::string found = find_latest_checkpoint(ckpt_base);
@@ -636,15 +601,9 @@ int main(int argc, char** argv)
     MPI_Bcast(&ckpt_resume_s_ll, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
     const size_t resume_s  = static_cast<size_t>(ckpt_resume_s_ll);
     const bool   resuming  = (resume_s > 1);
-    // All ranks reconstruct the resume checkpoint path from resume_s.
-    // (Checkpoint at loop index s stores next_s = s+1, so ckpt dir = ckpt_s<resume_s-1>.)
     const std::string resume_ckpt = resuming
         ? ckpt_base + "/ckpt_s" + std::to_string(resume_s - 1)
         : "";
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //                         PHASE 1 : INITIAL BUILD
-    // ══════════════════════════════════════════════════════════════════════════
 
     if (rank == 0) {
         const RunbookStep& init = steps[0];
@@ -711,7 +670,7 @@ int main(int argc, char** argv)
 
         routing_hnsw = metaIndex.getMetaHNSW();
 
-        // Broadcast routing state to all executors (fresh or resume — same call).
+        // Broadcast routing state to executors
         bcastRoutingState(rank, dim,
                           metaIndex.getMetaHNSW(),
                           &metaIndex.getPartitions(),
@@ -719,15 +678,13 @@ int main(int argc, char** argv)
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
-        // ── Populate label_to_shard ───────────────────────────────────────────
-        // label_to_shard[label] = executor_rank tracks exact ownership so deletes
+        // Compute label to shard mapping from label to center
         if (!resuming) {
-            // Fresh start: label_to_center is accurate — derive label_to_shard.
             for (auto& [lbl, cid] : label_to_center)
                 if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
                     label_to_shard[lbl] = routing_partitions[cid] + 1;
         } else {
-            // Resume: load saved label_to_shard (accurate even after delta rebuilds).
+            // Restore label to shard mapping
             {
                 std::ifstream lts(resume_ckpt + "/coordinator/labels_to_shards.bin",
                                   std::ios::binary);
@@ -742,15 +699,14 @@ int main(int argc, char** argv)
                     }
                 } else {
                     std::cerr << "[Sweep] WARNING: labels_to_shards.bin not found; "
-                              << "deriving label_to_shard from label_to_center "
-                              << "(may be stale for vectors moved during prior delta rebuilds)\n";
+                              << "deriving from label_to_center (may be stale)\n";
                     for (auto& [lbl, cid] : label_to_center)
                         if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
                             label_to_shard[lbl] = routing_partitions[cid] + 1;
                 }
             }
-            // Broadcast to executors so all ranks share the same label_to_shard.
             {
+            // Broadcast label to shard to executors
                 int n_lts = static_cast<int>(label_to_shard.size());
                 MPI_Bcast(&n_lts, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
@@ -760,7 +716,7 @@ int main(int argc, char** argv)
             }
         }
 
-        // ── Static ground truth ───────────────────────────────────────────────
+        // Load static ground truth if available
         std::vector<std::vector<int>> static_gt;
         bool have_static_gt = false;
         auto gt_it = DATASETS[dataset_name].find("gt_file");
@@ -770,7 +726,6 @@ int main(int argc, char** argv)
             have_static_gt = !static_gt.empty();
         }
 
-        // ── Open CSV ─────────────────────────────────────────────────────────
         std::ofstream csv(output_file, std::ios::out | std::ios::app);
         if (!csv.is_open()) {
             std::cerr << "ERROR: cannot open output file: " << output_file << "\n";
@@ -791,7 +746,6 @@ int main(int argc, char** argv)
             csv << "\n";
         }
 
-        // ── Rebuild statistics struct ─────────────────────────────────────────
         struct RebuildStats {
             int         centers_moved             = -1;
             int         elements_moved            = -1;
@@ -845,7 +799,7 @@ int main(int argc, char** argv)
             csv.flush();
         };
 
-        // ── Helper: collect shard sizes ───────────────────────────────────────
+        // Collect shard sizes from all ranks
         auto collect_sizes = [&]() -> std::vector<unsigned long long> {
             unsigned long long dummy = 0;
             std::vector<unsigned long long> sizes(world_size, 0);
@@ -854,7 +808,7 @@ int main(int argc, char** argv)
             return std::vector<unsigned long long>(sizes.begin() + 1, sizes.end());
         };
 
-        // ── Helper: sync routing after rebuild ────────────────────────────────
+        // Update routing state after rebuild
         auto sync_routing_after_rebuild = [&]() {
             routing_hnsw       = metaIndex.getMetaHNSW();
             routing_partitions = metaIndex.getPartitions();
@@ -866,7 +820,7 @@ int main(int argc, char** argv)
                               &meta_space, false);
         };
 
-        // ── Helper: sync label_to_shard after rebuild (coordinator side) ──────
+        // Update label to shard mapping after rebuild
         auto sync_label_to_shard_after_rebuild_coord = [&]() {
             int my_n = 0;
             std::vector<int> all_ns(world_size);
@@ -884,8 +838,7 @@ int main(int argc, char** argv)
                     label_to_shard[all_moved[i]] = r;
         };
 
-        // Initial insert row (written on fresh start only; on resume the row
-        // is already present in the CSV from the previous run).
+        // Write initial insert to CSV
         if (!resuming) {
             auto sizes = collect_sizes();
             write_row(init.step_num, "insert", "", -1.0f,
@@ -893,11 +846,9 @@ int main(int argc, char** argv)
                       kNoRebuild, sizes);
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        //                    COORDINATOR STREAMING LOOP
-        // ══════════════════════════════════════════════════════════════════════
+        // Main streaming loop
         std::string last_ckpt_dir = resume_ckpt;
-        int my_ckpt_write_ok = 1;  // set in checkpoint block; used by Allreduce
+        int my_ckpt_write_ok = 1;
 
         for (size_t s = resume_s; s < steps.size(); s++) {
             const RunbookStep& step = steps[s];
@@ -911,7 +862,6 @@ int main(int argc, char** argv)
             MPI_Bcast(&op_code,  1, MPI_INT, 0, MPI_COMM_WORLD);
             MPI_Bcast(bcast_buf, 3, MPI_INT, 0, MPI_COMM_WORLD);
 
-            // ── INSERT ────────────────────────────────────────────────────────
             if (step.operation == "insert") {
                 const int n_insert = step.end - step.start;
                 std::cout << "[Sweep] Step " << step.step_num
@@ -963,7 +913,7 @@ int main(int argc, char** argv)
                 AllToAllV(send_ids,  recv_ids,  MPI_INT,   world_size, MPI_COMM_WORLD);
                 AllToAllV(send_vecs, recv_vecs, MPI_FLOAT, world_size, MPI_COMM_WORLD);
 
-                // Allgatherv: sync label_to_center.
+                // Synchronize label to center mapping
                 {
                     const int my_n = static_cast<int>(my_assignments.size());
                     std::vector<int> all_ns(world_size);
@@ -986,7 +936,7 @@ int main(int argc, char** argv)
                                    MPI_INT, MPI_COMM_WORLD);
                     for (int i = 0; i < total; i++)
                         label_to_center[all_labels[i]] = all_centers[i];
-                    // Mirror into label_to_shard (routing_partitions is valid here).
+                    // Update label to shard from new center assignment
                     for (int i = 0; i < total; i++) {
                         const int cid = all_centers[i];
                         if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
@@ -1013,16 +963,12 @@ int main(int argc, char** argv)
                 if (maintenance_enabled && rebuild_check_due) {
                     rb_type = metaIndex.checkNeedRebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
-                    // Collect the max tombstone ratio across all executor shards
                     double coord_ratio = 0.0;
                     MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
                                MPI_MAX, 0, MPI_COMM_WORLD);
                 }
                 const bool tombstone_forces = (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
 
-                // Rebuild if the center-movement threshold is met OR a shard's
-                // tombstone ratio crossed the limit.  A tombstone-forced rebuild
-                // is always full; otherwise delta when enabled.
                 int do_rebuild = (rb_type > 0 || tombstone_forces) ? 1 : 0;
                 MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
@@ -1037,7 +983,6 @@ int main(int argc, char** argv)
                                   << (rb_type > 0 ? "\n"
                                                   : " (center-movement threshold not met)\n");
 
-                    // Dispatch  
                     const double t_rb0 = MPI_Wtime();
                     if (rb_type > 0) {
                         if (actual_delta) metaIndex.doRebuildDelta(world_size);
@@ -1047,7 +992,6 @@ int main(int argc, char** argv)
                     }
                     rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
-                    // Repartition stats are valid after dispatch for both paths.
                     rb_stats.rebuild_type     = actual_delta ? "delta" : "full";
                     rb_stats.centers_moved    = metaIndex.getCachedCentersMoved();
                     rb_stats.elements_moved   = metaIndex.getCachedElementsMoved();
@@ -1067,7 +1011,6 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
-                    // Delta rebuild only: collect total remaining deleted slots.
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
@@ -1108,7 +1051,6 @@ int main(int argc, char** argv)
                               total_rb_s, -1.0, -1.0, -1.0, -1.0, rb_stats, sizes);
                 }
 
-            // ── DELETE ────────────────────────────────────────────────────────
             } else if (step.operation == "delete") {
                 const int n_delete = step.end - step.start;
                 std::cout << "[Sweep] Step " << step.step_num
@@ -1126,7 +1068,7 @@ int main(int argc, char** argv)
                 for (int i = 0; i < n_delete; i++) {
                     const int cid = del_center_ids[i];
                     if (cid == -1) continue;
-                    // Coordinator has no shard — only erases from routing maps.
+                    // Remove from routing maps
                     label_to_center.erase(step.start + i);
                     label_to_shard.erase(step.start + i);
                 }
@@ -1178,7 +1120,6 @@ int main(int argc, char** argv)
                                   << (rb_type > 0 ? "\n"
                                                   : " (center-movement threshold not met)\n");
 
-                    // Dispatch
                     const double t_rb0 = MPI_Wtime();
                     if (rb_type > 0) {
                         if (actual_delta) metaIndex.doRebuildDelta(world_size);
@@ -1207,7 +1148,6 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
-                    // Delta rebuild only
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
@@ -1248,18 +1188,13 @@ int main(int argc, char** argv)
                               total_rb_s, -1.0, -1.0, -1.0, -1.0, rb_stats, sizes);
                 }
 
-            // ── SEARCH (sweep) ────────────────────────────────────────────────
             } else if (step.operation == "search") {
                 std::cout << "[Sweep] Step " << step.step_num
                           << "  SEARCH (" << n_combos << " combos)\n";
 
-                // Load queries (not timed).
                 std::vector<float> queries = readVecs(query_file, dim);
-                // nq_orig = distinct queries present in the file.  Each search
-                // variant below scales this to nq = round(nq_orig * variant.scale)
                 const size_t nq_orig = queries.size() / dim;
 
-                // Load GT once for the whole sweep over this search step.
                 std::vector<std::vector<int>> gt;
                 bool have_gt = false;
                 if (!gt_prefix.empty()) {
@@ -1272,8 +1207,6 @@ int main(int argc, char** argv)
                 }
                 if (!have_gt && have_static_gt) { gt = static_gt; have_gt = true; }
 
-                // Broadcast current center_counts to all ranks so every rank uses
-                // the same per-cluster size prior in routeQuery (RecallTarget mode).
                 {
                     routing_center_counts = metaIndex.getCenterCounts();
                     int n = static_cast<int>(routing_center_counts.size());
@@ -1291,28 +1224,18 @@ int main(int argc, char** argv)
                     double      qps;
                     double      recall;
                     double      avg_parts;
-                    // Theoretical recall via the exact label_to_shard ownership map
-                    // (online method, matching gp-ann); -1 if no GT for this step.
                     double      theoretical_recall;
                     size_t      num_queries;   // scaled query count actually run (nq)
                 };
                 std::vector<ComboResult> combo_results;
                 combo_results.reserve(static_cast<size_t>(n_combos) * search_variants.size());
 
-                // Precompute once: routing centers per partition (scale-independent).
-                // Matches np.bincount(partitions); passed into routeQuery so
-                // RecallTarget mode doesn't recompute it per query.
                 std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
                 for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
 
-                // ── Search-variant loop ───────────────────────────────────────────
-                // Each variant is one (scale, fraction).  Every variant runs the
-                // identical MPI-collective sequence (same combos in the same order),
-                // so all ranks stay in lockstep; the executor mirrors this loop.
                 for (const auto& variant : search_variants) {
                     const double search_scale     = variant.scale;
                     const double variant_fraction = variant.fraction;
-                    // Per-variant scaled query count + slice over the SCALED space.
                     const size_t nq = (nq_orig == 0) ? 0
                         : std::max<size_t>(1,
                               static_cast<size_t>(static_cast<double>(nq_orig) * search_scale + 0.5));
@@ -1320,13 +1243,10 @@ int main(int argc, char** argv)
                     const size_t my_qs = static_cast<size_t>(rank) * chunk;
                     const size_t my_qe = std::min(my_qs + chunk, nq);
 
-                // ── Theoretical-recall setup ─────────────────────────────
                 std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
                 if (have_gt) {
                     #pragma omp parallel for schedule(static)
                     for (size_t q = my_qs; q < my_qe; q++) {
-                        // First tile only: tile copies (q >= nq_orig) reuse the
-                        // same GT, so resolving them again would be redundant.
                         if (q >= nq_orig || q >= gt.size()) continue;
                         const auto& gt_q = gt[q];
                         const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
@@ -1349,8 +1269,7 @@ int main(int argc, char** argv)
                     std::vector<std::vector<uint32_t>> send_qids(world_size);
                     std::vector<std::vector<float>>    send_qvecs(world_size);
                     long long my_total_parts = 0;
-                    // Theoretical-recall accumulator over this rank's slice
-                    // (computed alongside routing; pre-timing).
+                    // Theoretical-recall accumulator (pre-timing)
                     double    my_theo_sum     = 0.0;
                     long long my_theo_counted = 0;
 
@@ -1512,13 +1431,12 @@ int main(int argc, char** argv)
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-                // Collect shard sizes once for all combo rows in this step.
+                // Collect shard sizes for all combo rows
                 auto sizes = collect_sizes();
                 for (auto& cr : combo_results) {
                     write_row(step.step_num, "search",
                               cr.mode_str, cr.param,
-                              // range = original (distinct) query set; num_queries
-                              // carries the scaled count actually run.
+                              // range = original query set; num_queries = scaled count
                               0, static_cast<int>(nq_orig),
                               cr.time_s, cr.qps, cr.recall,
                               cr.theoretical_recall,
@@ -1538,7 +1456,7 @@ int main(int argc, char** argv)
                            sizes_tmp.data(), 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             }
 
-            // ── CHECKPOINT ────────────────────────────────────────────────────
+            // CHECKPOINT
             if (s % CHECKPOINT_INTERVAL == 0) {
                 const std::string ckpt_dir =
                     ckpt_base + "/ckpt_s" + std::to_string(s);
@@ -1547,14 +1465,14 @@ int main(int argc, char** argv)
                 std::cout << "[Sweep] Step " << step.step_num
                           << "  checkpoint -> " << ckpt_dir << "\n";
 
-                // ── Write coordinator state ───────────────────────────────
+                // Write coordinator state
                 int coord_write_ok = 1;
                 std::filesystem::create_directories(coord_dir);
 
                 // Save meta-HNSW, partitions, center positions, center counts.
                 metaIndex.save(coord_dir);
 
-                // fsync every file 
+                // Fsync all coordinator files
                 {
                     std::error_code ec;
                     for (const auto& e :
@@ -1583,8 +1501,7 @@ int main(int argc, char** argv)
                         ltc.flush();
                         ltc.close();
                         if (!ltc || !surge::fsync_file(p)) {
-                            std::cerr << "[Sweep] ERROR: write/fsync failed for "
-                                      << p << "\n";
+                            std::cerr << "[Sweep] ERROR: write/fsync failed for " << p << "\n";
                             coord_write_ok = 0;
                         }
                     }
@@ -1607,8 +1524,7 @@ int main(int argc, char** argv)
                         lts.flush();
                         lts.close();
                         if (!lts || !surge::fsync_file(p)) {
-                            std::cerr << "[Sweep] ERROR: write/fsync failed for "
-                                      << p << "\n";
+                            std::cerr << "[Sweep] ERROR: write/fsync failed for " << p << "\n";
                             coord_write_ok = 0;
                         }
                     }
@@ -1640,13 +1556,13 @@ int main(int argc, char** argv)
                     std::cerr << "[Sweep] WARNING: coordinator checkpoint write failed "
                               << "at " << ckpt_dir << "\n";
 
-                // ── barrier + all-ranks write validation ───────────────────
+                // barrier + all-ranks write validation
                 MPI_Barrier(MPI_COMM_WORLD);
                 int all_ckpt_writes_ok = 0;
                 MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
                               1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
-                // ── commit (rank 0 writes the marker LAST) ────────────────
+                // commit (rank 0 writes the marker LAST)
                 if (all_ckpt_writes_ok) {
                     try {
                         surge::atomic_durable_write(
@@ -1662,11 +1578,11 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // ── barrier so the marker is durable before anyone deletes ─
+                // barrier so the marker is durable before anyone deletes
                 MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 MPI_Barrier(MPI_COMM_WORLD);
 
-                // ── remove the previous checkpoint ──────────
+                // remove the previous checkpoint
                 if (all_ckpt_writes_ok) {
                     if (!last_ckpt_dir.empty() &&
                             std::filesystem::exists(last_ckpt_dir)) {
@@ -1696,16 +1612,12 @@ int main(int argc, char** argv)
         csv.close();
         std::cout << "[Sweep] Done. Results written to " << output_file << "\n";
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //                        EXECUTOR (rank > 0)
-    // ══════════════════════════════════════════════════════════════════════════
     } else {
 
         Executor subIndex(rank, dim, comm, &logger);
 
-        if (!resuming) {
-            // Phase 1: receive initial vectors and build sub-HNSW.
-            {
+        // Receive initial vectors and build shard
+        {
                 bool done = false;
                 while (!done) {
                     MessageHeader hdr;
@@ -1723,25 +1635,22 @@ int main(int argc, char** argv)
                 if (hdr.type == SET_EF_SEARCH) subIndex.setEfSearch(hdr.size);
             }
         } else {
-            // Phase 1: resume — load this executor's shard from checkpoint.
             std::cout << "[Sweep Executor " << rank
-                      << "] Loading shard from " << resume_ckpt << "\n";
+                      << "] Loading from " << resume_ckpt << "\n";
             subIndex.load(resume_ckpt + "/shard", EF_SEARCH);
         }
 
-        // Receive routing state broadcast from coordinator (fresh or resume).
+        // Receive routing state from coordinator
         bcastRoutingState(rank, dim, nullptr, nullptr, nullptr,
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
-        // ── Populate label_to_shard ───────────────────────────────────────────
+        // Populate label_to_shard
         if (!resuming) {
-            // Fresh start: label_to_center is accurate — derive label_to_shard.
             for (auto& [lbl, cid] : label_to_center)
                 if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
                     label_to_shard[lbl] = routing_partitions[cid] + 1;
         } else {
-            // Resume: receive label_to_shard broadcast from coordinator.
             int n_lts = 0;
             MPI_Bcast(&n_lts, 1, MPI_INT, 0, MPI_COMM_WORLD);
             std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
@@ -1756,7 +1665,7 @@ int main(int argc, char** argv)
                        nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
         }
 
-        // ── Helper: sync label_to_shard after rebuild ───────────
+        // Helper: sync label_to_shard after rebuild
         auto sync_label_to_shard_after_rebuild_exec = [&]() {
             const auto& arrived = subIndex.getLastRebuildMovedLabels();
             const int my_n = static_cast<int>(arrived.size());
@@ -1775,9 +1684,9 @@ int main(int argc, char** argv)
                     label_to_shard[all_moved[i]] = r;
         };
 
-        // ══════════════════════════════════════════════════════════════════════
+        // Section marker
         //                    EXECUTOR STREAMING LOOP
-        // ══════════════════════════════════════════════════════════════════════
+        // Section marker
         // Mirrors the coordinator's tracking variable (see coordinator loop).
         std::string last_ckpt_dir = resume_ckpt;
 
@@ -1790,7 +1699,6 @@ int main(int argc, char** argv)
             const int range_start = bcast_buf[1];
             const int range_end   = bcast_buf[2];
 
-            // ── INSERT ────────────────────────────────────────────────────────
             if (op_code == 0) {
                 const int n_insert = range_end - range_start;
 
@@ -1942,7 +1850,6 @@ int main(int argc, char** argv)
                                nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
                 }
 
-            // ── DELETE ────────────────────────────────────────────────────────
             } else if (op_code == 1) {
                 const int n_delete = range_end - range_start;
 
@@ -2032,12 +1939,12 @@ int main(int argc, char** argv)
                                nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
                 }
 
-            // ── SEARCH (executor side of sweep loop) ──────────────────────────
+            // SEARCH (executor side of sweep loop)
             } else if (op_code == 2) {
                 std::vector<float> queries = readVecs(query_file, dim);
                 const size_t nq_orig = queries.size() / dim;
 
-                // Load GT for recall computation (matches coordinator's load).
+                // Load ground truth for recall computation
                 std::vector<std::vector<int>> gt;
                 bool have_gt = false;
                 if (!gt_prefix.empty()) {
@@ -2050,7 +1957,6 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // Receive center_counts broadcast from coordinator.
                 {
                     int n = 0;
                     MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -2062,7 +1968,7 @@ int main(int argc, char** argv)
                 std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
                 for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
 
-                // ── Search-variant loop ─────────────
+                // Search-variant loop
                 for (const auto& variant : search_variants) {
                     const double search_scale = variant.scale;
                     const size_t nq = (nq_orig == 0) ? 0
@@ -2072,7 +1978,7 @@ int main(int argc, char** argv)
                     const size_t my_qs = static_cast<size_t>(rank) * chunk;
                     const size_t my_qe = std::min(my_qs + chunk, nq);
 
-                // ── Theoretical-recall setup (mirrors coordinator) ───────
+                // Theoretical-recall setup (mirrors coordinator)
                 std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
                 if (have_gt) {
                     #pragma omp parallel for schedule(static)
@@ -2125,9 +2031,7 @@ int main(int argc, char** argv)
                                 local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
                             }
 
-                            // Theoretical recall: first tile only (mirrors coordinator).
-                            if (q >= nq_orig) continue;
-                            const auto& glist = gt_partitions[q - my_qs];
+                    const auto& glist = gt_partitions[q - my_qs];
                             if (!glist.empty()) {
                                 int inter = 0;
                                 for (int pid : glist) {
@@ -2162,7 +2066,7 @@ int main(int argc, char** argv)
                     AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, world_size, MPI_COMM_WORLD);
                     AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    world_size, MPI_COMM_WORLD);
 
-                    // Search received queries and prepare return buffers.
+                    // Search received queries and aggregate results
                     std::vector<std::vector<uint32_t>> snd_rqids(world_size);
                     std::vector<std::vector<uint32_t>> snd_rids(world_size);
                     std::vector<std::vector<float>>    snd_rdists(world_size);
@@ -2283,7 +2187,7 @@ int main(int argc, char** argv)
                            nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             }
 
-            // ── CHECKPOINT ────────────────────────────────────────────────────
+            // CHECKPOINT
             if (s % CHECKPOINT_INTERVAL == 0) {
                 const std::string ckpt_dir =
                     ckpt_base + "/ckpt_s" + std::to_string(s);
@@ -2303,7 +2207,7 @@ int main(int argc, char** argv)
                               << " (disk full? fsync/verify error?)\n";
                 }
 
-                // ── Barrier + all-ranks write validation ──────────────────────
+                // Synchronize all ranks
                 MPI_Barrier(MPI_COMM_WORLD);
                 int all_ckpt_writes_ok = 0;
                 MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
@@ -2313,7 +2217,7 @@ int main(int argc, char** argv)
                 MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 MPI_Barrier(MPI_COMM_WORLD);
 
-                // ── Delete old checkpoint (this rank's local copy) ────────────
+                // Delete old checkpoint (this rank's local copy)
                 if (all_ckpt_writes_ok) {
                     if (!last_ckpt_dir.empty()) {
                         std::error_code ec;

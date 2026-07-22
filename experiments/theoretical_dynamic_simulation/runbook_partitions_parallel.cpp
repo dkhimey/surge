@@ -34,9 +34,7 @@ extern "C" {
 
 namespace fs = std::filesystem;
 
-// ---------------------------------------------------------------------------
 // CSV helpers
-// ---------------------------------------------------------------------------
 
 static std::vector<int> load_counts(const fs::path& path) {
     std::ifstream f(path);
@@ -54,9 +52,7 @@ static fs::path counts_path(const fs::path& in_dir, int step) {
     return in_dir / oss.str();
 }
 
-// ---------------------------------------------------------------------------
 // Step number extraction
-// ---------------------------------------------------------------------------
 
 static int step_num_base(const fs::path& p) {
     // step_000002_base_layer.csv -> 2
@@ -64,9 +60,7 @@ static int step_num_base(const fs::path& p) {
     return std::stoi(name.substr(6, name.find('_', 6) - 6)); // skip "step_", read up to first '_'
 }
 
-// ---------------------------------------------------------------------------
-// Build CSR and run KaFFPa; write result into caller-supplied buffer
-// ---------------------------------------------------------------------------
+// Build CSR graph and partition with KaFFPa
 
 static void process_csv(
     const fs::path& edges_csv,
@@ -80,7 +74,7 @@ static void process_csv(
     int*   out_part,
     int    num_nodes)
 {
-    // Pass 1 — read raw triples, compute w_max, accumulate degrees
+    // Read edges and compute normalized weights
     std::ifstream ef(edges_csv);
     if (!ef) throw std::runtime_error("Cannot open " + edges_csv.string());
 
@@ -114,7 +108,7 @@ static void process_csv(
         wgt[i] = std::max(1, static_cast<int>(std::llround(inv_dist[i] / w_max * 10000.0)));
     inv_dist.clear();
 
-    // Pass 2 — build CSR
+    // Build compressed sparse row graph
     std::vector<int> xadj(num_nodes + 1, 0);
     for (int u = 0; u < num_nodes; ++u)
         xadj[u + 1] = xadj[u] + degree[u];
@@ -143,9 +137,7 @@ static void process_csv(
            &edgecut, out_part);
 }
 
-// ---------------------------------------------------------------------------
 // Partition label matching
-// ---------------------------------------------------------------------------
 
 static std::pair<std::vector<int>, int> match_partitions(
     const int*              new_blocks,
@@ -173,9 +165,7 @@ static std::pair<std::vector<int>, int> match_partitions(
     return {relabeled, moved};
 }
 
-// ---------------------------------------------------------------------------
-// Save partition
-// ---------------------------------------------------------------------------
+// Save partition to file
 
 static void save_blocks(const fs::path& path, const std::vector<int>& blocks, int moved_nodes) {
     std::ofstream f(path);
@@ -184,9 +174,7 @@ static void save_blocks(const fs::path& path, const std::vector<int>& blocks, in
     f << moved_nodes << "\n";
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+// Main entry point
 
 static void usage(const char* prog) {
     std::cerr << "Usage: " << prog
@@ -243,15 +231,12 @@ int main(int argc, char* argv[]) {
     const double imbalance = 0.03;
     const int    seed      = 0;
 
-    // num_nodes is constant — read from the first step's counts file
+    // Load node count from first step
     const int num_nodes = static_cast<int>(
         load_counts(counts_path(in_dir, step_num_base(files[0]))).size());
     std::cout << num_nodes << " nodes per step, " << n_steps << " steps\n";
 
-    // -----------------------------------------------------------------------
-    // Allocate shared buffer: n_steps contiguous slots of num_nodes ints each.
-    // Slot for step i starts at shared_buf + i * num_nodes.
-    // -----------------------------------------------------------------------
+    // Allocate shared buffer for partition results
     const size_t buf_bytes = static_cast<size_t>(n_steps) * num_nodes * sizeof(int);
     int* shared_buf = static_cast<int*>(
         mmap(nullptr, buf_bytes, PROT_READ | PROT_WRITE,
@@ -262,9 +247,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // -----------------------------------------------------------------------
-    // Parallel phase: process pool
-    // -----------------------------------------------------------------------
+    // Parallel partitioning with worker pool
     const int max_workers = static_cast<int>(std::thread::hardware_concurrency());
     std::cout << "Partitioning with pool of " << max_workers << " workers...\n";
 
@@ -331,9 +314,7 @@ int main(int argc, char* argv[]) {
                   << " (pid " << done << ")\n";
     }
 
-    // -----------------------------------------------------------------------
-    // Sequential matching + save phase
-    // -----------------------------------------------------------------------
+    // Label matching and output
     std::cout << "All partitions done. Running label matching...\n";
     std::vector<int> prev_blocks;
 
@@ -350,7 +331,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::string out_name = files[i].filename().string();
-        // step000002_base_layer.csv -> step000002_partitions.csv
+        // Replace base_layer with partitions in filename
         auto pos = out_name.find("base_layer");
         if (pos != std::string::npos) out_name.replace(pos, 10, "partitions");
         save_blocks(out_dir / out_name, blocks, moved_nodes);

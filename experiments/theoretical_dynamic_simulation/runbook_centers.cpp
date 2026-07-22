@@ -1,11 +1,5 @@
 // runbook_centers.cpp
-//
-// Per-step routing-state generator. Replays a Big-ANN streaming runbook and, for
-// every update step, produces the coordinator's routing state used by the
-// theoretical-recall pipeline and by dynamic_runbook_experiment's --init-state-dir
-// starting state. KaHIP partitioning of the emitted base layer is handled by
-// runbook_partitions_parallel.cpp.
-//
+// Replays a streaming runbook and produces per-step routing state (centres, HNSW index, etc.).
 // Output per step: step_NNNNNN_{centers.csv, center_counts.csv, hnsw.bin,
 // base_layer.csv}. KMeans and HNSW assignment are seeded (mt19937(42), hnswlib
 // seed 100) so runs are reproducible; see --help for the full flag list.
@@ -36,43 +30,19 @@
 
 namespace fs = std::filesystem;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Must match hnsw_per_step.cpp
-constexpr double MIN_EDGE_DIST = 1e-4;
-
-// KMeans defaults (sklearn KMeans defaults: max_iter=300, tol=1e-4)
-// Here tol is absolute squared centroid shift (see difference #4 above)
-constexpr int    KMEANS_MAX_ITER = 300;
-constexpr float  KMEANS_TOL      = 1e-4f;   // squared-shift threshold
-constexpr int    KMEANS_SEED     = 42;
-constexpr int    SAMPLE_LIMIT    = 100000;   // max vectors sampled for initial KMeans
-
-// HNSW construction parameters (must match Python _build_hnsw and hnsw_per_step)
-constexpr int    HNSW_M              = 16;
+constexpr double MIN_EDGE_DIST      = 1e-4;      // Must match hnsw_per_step.cpp
+constexpr int    KMEANS_MAX_ITER    = 300;       // Match sklearn defaults
+constexpr float  KMEANS_TOL         = 1e-4f;     // Squared centroid shift threshold
+constexpr int    KMEANS_SEED        = 42;
+constexpr int    SAMPLE_LIMIT       = 100000;
+constexpr int    HNSW_M             = 16;        // Must match Python parameters
 constexpr int    HNSW_EF_CONSTRUCTION = 200;
-constexpr int    HNSW_EF_SEARCH       = 200;
-
-// Batch size for HNSW queries (matches Python's batch_size=100000)
-constexpr int    QUERY_BATCH_SIZE = 100000;
+constexpr int    HNSW_EF_SEARCH     = 200;
+constexpr int    QUERY_BATCH_SIZE   = 100000;
 
 
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Vector file I/O
-//
-// Supported formats (all share the same 8-byte header):
-//   .fbin   – float32  (4 bytes/element)
-//   .u8bin  – uint8    (1 byte/element)  → promoted to float32 on read
-//   .i8bin  – int8     (1 byte/element)  → promoted to float32 on read
-//
-// Format is detected from the file extension; use --vector-type to override.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Returns {num_points, dim}  – header format is identical for all three types
+// Read header {num_points, dim} from binary file
 static std::pair<uint32_t, uint32_t> fbin_header(const std::string& filename) {
     std::ifstream f(filename, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open: " + filename);
@@ -96,14 +66,7 @@ static std::vector<float> read_vec_slice(const std::string& filename,
     return readVecs(filename, dim, static_cast<int>(count), static_cast<int>(start));
 }
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// KMeans++ initialization + Lloyd's iterations (single run)
-//
-// Returns the converged centres and the final inertia (sum of squared distances
-// from each sample to its assigned centre).  The caller picks the best of
-// n_init runs via run_kmeans_best_of_n.
-// ─────────────────────────────────────────────────────────────────────────────
+// Run one KMeans++ initialization + Lloyd's iterations; return centres and inertia
 static std::pair<std::vector<float>, double> run_kmeans_once(
     const float* sample,
     int   n_points,
@@ -114,7 +77,7 @@ static std::pair<std::vector<float>, double> run_kmeans_once(
     float tol      = KMEANS_TOL,
     bool  verbose  = false)
 {
-    // ── k-means++ initialisation ─────────────────────────────────────────────
+    // k-means++ initialization
     std::vector<float> centers(static_cast<size_t>(k) * dim);
     std::vector<float> min_dist(n_points, std::numeric_limits<float>::max());
 
@@ -148,7 +111,7 @@ static std::pair<std::vector<float>, double> run_kmeans_once(
                   centers.data() + static_cast<size_t>(c) * dim);
     }
 
-    // ── Lloyd's iterations ───────────────────────────────────────────────────
+    // Lloyd's iterations
     std::vector<int>    labels(n_points);
     std::vector<double> new_sums(static_cast<size_t>(k) * dim);
     std::vector<int>    cnt(k);
@@ -199,8 +162,7 @@ static std::pair<std::vector<float>, double> run_kmeans_once(
         }
     }
 
-    // ── Inertia (sum of squared distances) ───────────────────────────────────
-    // Used to select the best run.  Same definition as sklearn's inertia_.
+    // Compute inertia (sum of squared distances)
     double inertia = 0.0;
     for (int i = 0; i < n_points; ++i)
         inertia += static_cast<double>(
@@ -210,17 +172,7 @@ static std::pair<std::vector<float>, double> run_kmeans_once(
     return {std::move(centers), inertia};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// run_kmeans_best_of_n
-//
-// Runs k-means++ n_init times (each with an independent seeded RNG derived from
-// base_seed) and returns the centres with the lowest inertia.
-//
-// This matches sklearn KMeans(random_state=42) behaviour:
-//   sklearn <= 1.1 : n_init=10 by default → pass n_init=10 to match exactly.
-//   sklearn >= 1.2 : n_init='auto'=1 for k-means++ → pass n_init=1.
-//   Check with: from sklearn.cluster import KMeans; print(KMeans().n_init)
-// ─────────────────────────────────────────────────────────────────────────────
+// Run k-means++ n_init times; return centres with lowest inertia
 static std::vector<float> run_kmeans(
     const float* sample,
     int   n_points,
@@ -241,8 +193,6 @@ static std::vector<float> run_kmeans(
         if (verbose || n_init > 1)
             std::cout << "    KMeans run " << (run + 1) << "/" << n_init << "\n";
 
-        // Derive a per-run seed from base_seed + run (same trick sklearn uses
-        // internally when random_state is an integer).
         std::mt19937 gen(static_cast<uint32_t>(base_seed + run));
 
         auto [centers, inertia] = run_kmeans_once(
@@ -261,14 +211,7 @@ static std::vector<float> run_kmeans(
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Load initial centres from a CSV file (for diagnosis: bypass C++ KMeans and
-// use centres produced by the Python pipeline at step 1 to isolate whether the
-// quality gap is in KMeans or in subsequent HNSW routing).
-//
-// File format: k rows × dim columns of float values separated by commas —
-// identical to the step_NNNNNN_centers.csv output format.
-// ─────────────────────────────────────────────────────────────────────────────
+// Load initial centres from CSV file (for diagnosis/bypass of C++ KMeans)
 static std::vector<float> load_centers_csv(const std::string& path, int k, int dim) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("Cannot open initial-centers file: " + path);
@@ -295,17 +238,7 @@ static std::vector<float> load_centers_csv(const std::string& path, int k, int d
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Load point_to_centroid assignments from a CSV file
-//
-// File format: one line per vector, "global_id,centroid_index"
-// (no header).  Generate from Python's point_to_centroid.npy with:
-//   import numpy as np
-//   d = np.load('point_to_centroid.npy', allow_pickle=True).item()
-//   with open('point_to_centroid.csv', 'w') as f:
-//       for gid, cid in d.items():
-//           f.write(f'{gid},{cid}\n')
-// ─────────────────────────────────────────────────────────────────────────────
+// Load point_to_centroid assignments from CSV (one line per vector: global_id,centroid_index)
 static std::unordered_map<uint32_t, int>
 load_assignments_csv(const std::string& path)
 {
@@ -329,16 +262,7 @@ load_assignments_csv(const std::string& path)
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HNSW wrapper
-//
-// Wraps hnswlib::HierarchicalNSW with identical parameters to the Python
-// _build_hnsw helper (M=16, ef_construction=200, ef_search=200) and to the
-// HNSW built by hnsw_per_step.cpp.  Because both use the same hnswlib default
-// random_seed=100, a graph built here from a given set of centres will be
-// structurally identical to what hnsw_per_step.cpp would produce from the same
-// centres CSV, so the assignment HNSW can serve double duty for step 4.
-// ─────────────────────────────────────────────────────────────────────────────
+// HNSW wrapper with parameters matching Python _build_hnsw
 struct HnswWrapper {
     // Note: space must outlive index, so it is declared first (destroyed last)
     std::unique_ptr<hnswlib::L2Space>                  space;
@@ -420,12 +344,7 @@ static std::vector<int> hnsw_query1(const HnswWrapper& h,
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Centroid utilities
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Compute float32 centres from double accumulators.
-// Mirrors Python: cluster_sums / np.maximum(counts, 1)[:, None]  .astype(np.float32)
+// Compute float32 centres from double accumulators
 static std::vector<float> compute_centers(const std::vector<double>&  sums,
                                            const std::vector<int64_t>& counts,
                                            int k, int dim)
@@ -442,19 +361,13 @@ static std::vector<float> compute_centers(const std::vector<double>&  sums,
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CSV / binary output helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 static std::string step_prefix(int step) {
     std::ostringstream oss;
     oss << "step_" << std::setw(6) << std::setfill('0') << step;
     return oss.str();
 }
 
-// Save centres CSV.
-// Matches Python: np.savetxt(path, centres.astype(np.float32), delimiter=",")
-// np.savetxt uses '%.18e' format for float arrays.
+// Save centres CSV in scientific notation (matches Python np.savetxt)
 static void save_centers_csv(const fs::path& out_dir, int step,
                                const std::vector<float>& centers, int k, int dim)
 {
@@ -473,12 +386,7 @@ static void save_centers_csv(const fs::path& out_dir, int step,
     }
 }
 
-// Save counts CSV.
-// Python writes counts in '%.18e' scientific notation (np.savetxt default for
-// all dtypes including int32).  That causes std::stoi in hnsw_per_step.cpp and
-// runbook_partitions_parallel.cpp to truncate at the decimal point, silently
-// corrupting node weights.  We intentionally write plain decimal integers so
-// std::stoi parses correctly — see difference #8 in the header comment.
+// Save counts as plain decimal integers (not scientific notation) to avoid stoi truncation
 static void save_counts_csv(const fs::path& out_dir, int step,
                               const std::vector<int64_t>& counts, int k)
 {
@@ -489,7 +397,7 @@ static void save_counts_csv(const fs::path& out_dir, int step,
         f << static_cast<int32_t>(counts[c]) << '\n';
 }
 
-// Save serialised HNSW index (for use by compute_theoretical_recall.py).
+// Save HNSW index binary
 static void save_hnsw_bin(const fs::path& out_dir, int step,
                            const HnswWrapper& h)
 {
@@ -497,7 +405,7 @@ static void save_hnsw_bin(const fs::path& out_dir, int step,
     h.index->saveIndex(path.string());
 }
 
-// Euclidean distance (not squared) – matches hnsw_per_step.cpp
+// Euclidean distance (not squared)
 static double euclidean_distance_d(const float* a, const float* b, int dim) {
     double s = 0.0;
     for (int i = 0; i < dim; ++i) {
@@ -507,18 +415,8 @@ static double euclidean_distance_d(const float* a, const float* b, int dim) {
     return std::sqrt(s);
 }
 
-// Save base-layer edge list CSV.
-// Three modes to match hnsw_per_step.cpp:
-//
-//   mode 0 (default)       – all nodes, no zero-count filtering in output
-//   mode 1 (ignore-zero)   – HNSW has all nodes; edges to/from zero-count
-//                            nodes suppressed  (--ignore-zero-count)
-//   mode 2 (skip-insert)   – zero-count nodes not inserted; external labels
-//                            used  (--skip-zero-count-inserts)
-//
-// For mode 0 and 1 the HNSW must have been built with all k nodes (internal
-// id == external label).  For mode 2 provide the label_map from
-// build_hnsw_skip_zero().
+// Save base-layer edge list CSV
+// mode 0: all nodes  |  mode 1: suppress zero-count edges  |  mode 2: skip zero-count nodes
 static void save_base_layer_csv(
     const fs::path&             out_dir,
     int                         step,
@@ -535,7 +433,6 @@ static void save_base_layer_csv(
     if (!f) throw std::runtime_error("Cannot write: " + path.string());
 
     if (mode == 2) {
-        // Iterate over internal IDs; look up external labels via label_map
         size_t cur_count = h.index->getCurrentElementCount();
         for (size_t iid = 0; iid < cur_count; ++iid) {
             int ext_i = label_map[iid];
@@ -558,7 +455,6 @@ static void save_base_layer_csv(
             }
         }
     } else {
-        // mode 0 or 1: internal_id == external label
         for (int i = 0; i < k_orig; ++i) {
             if (mode == 1 && counts[i] == 0) continue;
 
@@ -579,32 +475,9 @@ static void save_base_layer_csv(
                 f << i << ',' << nb << ',' << dist << '\n';
             }
         }
-
-        // for (size_t i = 0; i < k_orig; i++) {
-        //     // Low-level access to base layer
-        //     auto bottom = h.index->get_linklist_at_level(i, 0);
-        //     int nlinks = h.index->getListCount(bottom);
-        //     hnswlib::tableint *links = (hnswlib::tableint *)(bottom + 1);
-
-        //     // output edge weight == distance between i, j
-        //     for (int j = 0; j < nlinks; j++) {
-        //         // float dist = dist_func(centers[i].data(), centers[links[j]].data(), &dim);
-        //         double dist = euclidean_distance(centers[i], centers[links[j]]);
-
-        //         if (!std::isfinite(dist)) continue;
-        //         if (dist < MIN_EDGE_DIST) continue;
-
-        //         f << i << "," << links[j] << "," << dist << "\n";
-        //     }
-        // }
-    
     }
 }
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
 
 static void usage(const char* prog) {
     std::cerr
@@ -683,8 +556,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: --dataset is required.\n";
         usage(argv[0]);
     }
-
-    // Resolve the base vectors and runbook from the DATASETS registry (src/utils.cpp).
     if (auto it = DATASETS.find(dataset_key); it != DATASETS.end()) {
         const auto& cfg = it->second;
         if (auto f = cfg.find("base_file"); f != cfg.end()) vector_path  = f->second;
@@ -700,12 +571,10 @@ int main(int argc, char* argv[]) {
     if (out_dir.empty())
         out_dir = "cluster_history_" + dataset_key + "_" + std::to_string(k);
 
-    // ── Dataset info ─────────────────────────────────────────────────────────
     auto [total_pts, dim_u] = fbin_header(vector_path);
     const int dim = static_cast<int>(dim_u);
     std::cout << "Dataset : " << total_pts << " points, dim=" << dim << "\n";
 
-    // ── Runbook ───────────────────────────────────────────────────────────────
     auto steps = load_runbook(runbook_path, dataset_key);
     if (steps.empty()) {
         std::cerr << "No steps loaded from runbook for key '" << dataset_key << "'\n";
@@ -736,24 +605,15 @@ int main(int argc, char* argv[]) {
 
     fs::create_directories(out_dir);
 
-    // ── Pipeline state ────────────────────────────────────────────────────────
-    // cluster_sums[c*dim + d] = sum of component d over all currently-assigned
-    //                           vectors in cluster c  (float64, same as Python)
+    // Pipeline state
     const size_t sums_size = static_cast<size_t>(k) * dim;
     std::vector<double>  cluster_sums(sums_size, 0.0);
     std::vector<int64_t> counts(k, 0LL);
-
-    // point_to_centroid maps global vector ID → centroid index.
-    // Using unordered_map mirrors Python's dict.
     std::unordered_map<uint32_t, int> point_to_centroid;
     point_to_centroid.reserve(static_cast<size_t>(total_pts));
-
-    // HNSW built on updated centres after every update step.
-    // Used for both vector assignment (step 3) and base-layer extraction (step 4).
     std::unique_ptr<HnswWrapper>  assign_hnsw;
     bool initialised = false;
 
-    // ── Main loop ─────────────────────────────────────────────────────────────
     for (int step_id = 1; step_id <= static_cast<int>(steps.size()); ++step_id) {
         const auto& step = steps[step_id - 1];
         const auto& op   = step.operation;
@@ -763,31 +623,22 @@ int main(int argc, char* argv[]) {
             std::cout << "  [" << step.start << ", " << step.end << ")";
         std::cout << "\n";
 
-        // Search steps carry no vectors and do not change the index
         if (op == "search") continue;
 
-        // Read vectors for this step
         auto vecs = read_vec_slice(vector_path,
                                     static_cast<uint32_t>(step.start),
                                     static_cast<uint32_t>(step.end));
         const int n_vecs = step.end - step.start;
 
-        // ── INSERT ───────────────────────────────────────────────────────────
         if (op == "insert") {
 
             if (!initialised) {
-                // ── First insert: KMeans (or loaded centres) → assign → update ─
-
                 std::vector<float> init_centers;
 
                 if (!initial_centers_file.empty()) {
-                    // ── Diagnostic bypass: load centres from file ─────────────
-                    // Use the Python pipeline's step_000001_centers.csv here to
-                    // isolate whether divergence is in KMeans or HNSW routing.
                     std::cout << "  Loading initial centres from " << initial_centers_file << "\n";
                     init_centers = load_centers_csv(initial_centers_file, k, dim);
                 } else {
-                    // ── Normal path: run KMeans on a sample ──────────────────
                     const int sample_size = std::min(SAMPLE_LIMIT, n_vecs);
                     std::cout << "  Sampling " << sample_size << " / " << n_vecs << "\n";
 
@@ -813,18 +664,10 @@ int main(int argc, char* argv[]) {
                     std::cout << "  KMeans done\n";
                 }
 
-                // Reset accumulators (they are zero-initialised, but be explicit)
                 std::fill(cluster_sums.begin(), cluster_sums.end(), 0.0);
                 std::fill(counts.begin(),       counts.end(),       0LL);
 
                 if (!load_state_assignments_file.empty()) {
-                    // ── Full step-1 bypass: load Python's assignments ─────────
-                    // Populate point_to_centroid and cluster_sums from the saved
-                    // labels, then build HNSW from the loaded (Python) centres
-                    // without running any HNSW query or recomputing centres.
-                    // This puts C++ in bit-exact identical state to Python after
-                    // step 1, so divergence in step 2+ will reveal bugs in the
-                    // incremental update logic rather than in the initial assignment.
                     auto loaded_asgn = load_assignments_csv(load_state_assignments_file);
 
                     for (int i = 0; i < n_vecs; ++i) {
@@ -842,17 +685,9 @@ int main(int argc, char* argv[]) {
                         ++counts[lbl];
                     }
 
-                    // Build HNSW from the loaded (Python) centres — identical to
-                    // the HNSW Python uses for step-2 assignment.
                     assign_hnsw = build_hnsw_all(init_centers.data(), k, dim,
                                                  HNSW_M, HNSW_EF_CONSTRUCTION, ef_search);
                     initialised = true;
-
-                    // Export the step-1 label→centroid assignment (one centroid
-                    // id per line, batch order; global id = step.start + line)
-                    // so downstream tools (e.g. dynamic_runbook_experiment.cpp)
-                    // can load this starting state.  Matches the debug dump
-                    // produced for subsequent insert steps.
                     {
                         auto lpath = fs::path(out_dir) /
                             (step_prefix(step_id) + "_labels.csv");
@@ -864,22 +699,10 @@ int main(int argc, char* argv[]) {
                     }
 
                 } else {
-                    // ── Normal first-insert path (or --initial-centers alone) ──
-                    // Build HNSW on initial centres (before re-estimation from data)
                     assign_hnsw = build_hnsw_all(init_centers.data(), k, dim,
                                                  HNSW_M, HNSW_EF_CONSTRUCTION, ef_search);
 
-                    // Assign ALL vectors in this batch to nearest centre via HNSW
-                    // (matches Python: no batching on first insert)
                     auto labels = hnsw_query1(*assign_hnsw, vecs.data(), n_vecs);
-
-                    // Export the step-1 label→centroid assignment (one centroid
-                    // id per line, batch order; global id = step.start + line)
-                    // so downstream tools (e.g. dynamic_runbook_experiment.cpp)
-                    // can load this starting state.  Matches the debug dump
-                    // produced for subsequent insert steps.  These labels reflect
-                    // the assignment HNSW built from the initial centres, i.e. the
-                    // exact point_to_centroid stored below.
                     {
                         auto lpath = fs::path(out_dir) /
                             (step_prefix(step_id) + "_labels.csv");
@@ -899,9 +722,6 @@ int main(int argc, char* argv[]) {
                         ++counts[lbl];
                     }
 
-                    // Re-estimate centres from actual assignments, then rebuild HNSW.
-                    // This two-phase init (KMeans seed → assign → recompute → rebuild)
-                    // exactly mirrors the Python code.
                     auto updated_centers = compute_centers(cluster_sums, counts, k, dim);
                     assign_hnsw = build_hnsw_all(updated_centers.data(), k, dim,
                                                  HNSW_M, HNSW_EF_CONSTRUCTION, ef_search);
@@ -909,7 +729,6 @@ int main(int argc, char* argv[]) {
                 }
 
             } else {
-                // ── Subsequent insert: assign via HNSW in batches ─────────────
                 std::vector<int> labels(n_vecs);
                 for (int bs = 0; bs < n_vecs; bs += QUERY_BATCH_SIZE) {
                     int be = std::min(bs + QUERY_BATCH_SIZE, n_vecs);
@@ -929,30 +748,8 @@ int main(int argc, char* argv[]) {
                               << " labels → " << lpath.string() << "\n";
                 }
 
-                // ── Accumulate per-cluster sums in float32, then add to float64
-                // cluster_sums.
-                //
-                // Python's equivalent (lines 171-181 of the .py):
-                //   sums_new = np.zeros_like(cluster_centers_)   # float64
-                //   for c in range(k):
-                //       members = new_vecs[labels == c]          # float32
-                //       sums_new[c] = members.sum(axis=0)        # float32 sum
-                //   cluster_sums += sums_new                     # float64 += promoted-float32
-                //
-                // members.sum(axis=0) returns float32 (numpy default for float32 input).
-                // Promoting float32→float64 gives a different value than summing float64
-                // individually (the float32 sum has rounding error that is then
-                // "locked in" when promoted).  Using float64 individual additions
-                // produces more accurate sums, but the ~1-ULP difference in some
-                // centroid dimensions causes slightly different HNSW routing for
-                // boundary vectors.  Over many insert steps those routing differences
-                // accumulate in cluster_sums, which amplifies during delete phases
-                // (fewer vectors → each centroid is more sensitive to wrong sums).
-                //
-                // Solution: replicate Python's float32-batch accumulation exactly.
-                // ─────────────────────────────────────────────────────────────────
+                // Replicate Python's float32-batch accumulation for numerical precision
                 {
-                    // Per-cluster float32 batch sums (= Python's sums_new, stored as float32)
                     std::vector<float> sums_new(static_cast<size_t>(k) * dim, 0.0f);
 
                     for (int i = 0; i < n_vecs; ++i) {
@@ -961,13 +758,10 @@ int main(int argc, char* argv[]) {
                         point_to_centroid[gid] = lbl;
                         const float* v  = vecs.data()      + static_cast<size_t>(i)   * dim;
                         float*       sn = sums_new.data()  + static_cast<size_t>(lbl) * dim;
-                        for (int d = 0; d < dim; ++d) sn[d] += v[d];   // float32 accumulation
+                        for (int d = 0; d < dim; ++d) sn[d] += v[d];
                         ++counts[lbl];
                     }
 
-                    // Add float32 batch sums to float64 cluster_sums
-                    // (= Python's cluster_sums += sums_new, which promotes float32→float64
-                    // element-by-element)
                     for (int c = 0; c < k; ++c) {
                         double*      s  = cluster_sums.data() + static_cast<size_t>(c) * dim;
                         const float* sn = sums_new.data()     + static_cast<size_t>(c) * dim;
@@ -981,7 +775,6 @@ int main(int argc, char* argv[]) {
                                              HNSW_M, HNSW_EF_CONSTRUCTION, ef_search);
             }
 
-        // ── DELETE ───────────────────────────────────────────────────────────
         } else if (op == "delete") {
 
             for (int i = 0; i < n_vecs; ++i) {
@@ -1014,14 +807,9 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // ── Save step outputs ─────────────────────────────────────────────────
         auto centers = compute_centers(cluster_sums, counts, k, dim);
-
-        // Step 3 outputs (for runbook_partitions_parallel.cpp)
         save_centers_csv(out_dir, step_id, centers, k, dim);
         save_counts_csv(out_dir, step_id, counts, k);
-
-        // Step 4 outputs (HNSW binary for recall eval; base layer for step 5)
         save_hnsw_bin(out_dir, step_id, *assign_hnsw);
 
         if (mode == 2) {

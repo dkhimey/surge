@@ -26,7 +26,6 @@
 #define TAG_SEND_VECS 100000002
 #define TAG_SEND_LABELS 100000003
 
-// ========== Coordinator Implementation ==========
 Coordinator::Coordinator(
         int dim,
         Log* logger)
@@ -816,11 +815,8 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
     return 2;
 }
 
-// ── checkNeedRebuild ─────────────────────────────────────────────────────────
-// Runs rePartition, caches the result, and returns the rebuild type without
-// sending any MPI messages or modifying internal state.  Returns 0 if no
-// rebuild is needed, 1 for a full rebuild, 2 for a partial rebuild.
-// Must be followed by doRebuildSimple() when the return value is non-zero.
+// Prepare rebuild (via rePartition): returns 0 (no rebuild), 1 (full), or 2 (partial).
+// Caches result without MPI or state changes; must be followed by doRebuildSimple().
 int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
                                    int ef_construction, int M_meta) {
     // Discard any stale cached rebuild from a previous call.
@@ -850,17 +846,13 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
                                     &cached_repart_kaffpa_s_,
                                     &cached_repart_relabel_s_);
 
-    // No rebuild needed: to_move is below both thresholds.
-    // A threshold >= ncenters effectively disables that rebuild type.
-    // A threshold of 0 triggers a rebuild on every check.
+    // No rebuild if to_move below both thresholds; threshold >= ncenters disables that type
     if (to_move < full_threshold && to_move < partial_threshold) {
         delete new_meta;
         return 0;
     }
 
-    // Count centers and elements that will physically move between shards.
-    // new_parts is already relabeled by matchPartitions_ so it is directly
-    // comparable with the current partitions[] array.
+    // Count centers/elements that move; new_parts already relabeled by matchPartitions_
     {
         int centers = 0, elems = 0;
         for (size_t c = 0; c < new_parts.size(); c++) {
@@ -887,13 +879,8 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
     return cached_rebuild_type_;
 }
 
-// ── doRebuildSimple ──────────────────────────────────────────────────────────
-// Executes the rebuild prepared by checkNeedRebuild().  Sends the appropriate
-// FULL/PARTIAL_REBUILD_REQUEST header + serialised meta-HNSW + new partitions
-// to every executor, then blocks until each replies with REBUILD_SUCCESS.
-// Finally swaps the new meta-HNSW and partitions into the Coordinator's
-// internal state.  Safe only in serial (non-concurrent) contexts; it does not
-// update rebuild_state or drain the insert/delete logs.
+// Send rebuild to all executors (broadcasts meta-HNSW + partitions).
+// Serial only; does not drain insert/delete logs.
 void Coordinator::doRebuildSimple(int world_size) {
     assert(cached_new_meta_HNSW_ != nullptr && "doRebuildSimple called without a cached rebuild");
 
@@ -937,14 +924,9 @@ void Coordinator::doRebuildSimple(int world_size) {
     cached_rebuild_type_ = 0;
 }
 
-// ── doForceFullRebuild ────────────────────────────────────────────────────────
-// Prepare and execute a full rebuild without consulting checkNeedRebuild()'s
-// thresholds.  Mirrors the caching that checkNeedRebuild() performs for a full
-// rebuild, then reuses doRebuildSimple() so the on-wire protocol is identical to
-// a threshold-driven full rebuild (executors receive a FULL_REBUILD_REQUEST).
+// Force full rebuild (bypass threshold checks); reuses doRebuildSimple() protocol.
 void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_meta) {
-    // Discard any stale cached rebuild from a previous checkNeedRebuild() call
-    // that did not result in a rebuild this step.
+    // Clear any stale cache from previous checkNeedRebuild() call
     if (cached_new_meta_HNSW_) {
         delete cached_new_meta_HNSW_;
         cached_new_meta_HNSW_ = nullptr;
@@ -987,10 +969,7 @@ void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_
     doRebuildSimple(world_size);
 }
 
-// ── doRebuildDelta ────────────────────────────────────────────────────────────
-// Like doRebuildSimple() but sends INPLACE_REBUILD_REQUEST so each executor
-// performs a mark-delete + insert pass instead of a full graph reconstruction.
-// All other protocol details (meta-HNSW bytes + partition array) are identical.
+// Send in-place rebuild (mark-delete + insert) instead of graph reconstruction.
 void Coordinator::doRebuildDelta(int world_size) {
     assert(cached_new_meta_HNSW_ != nullptr && "doRebuildDelta called without a cached rebuild");
 
@@ -1008,14 +987,9 @@ void Coordinator::doRebuildDelta(int world_size) {
                  i, META_PARTITIONS_SEND, MPI_COMM_WORLD);
     }
 
-    // Participate in the executor-to-executor AllToAll vector exchange.
-    // Executors call MPI_Alltoall (counts) + 2x MPI_Alltoallv (vecs, labels)
-    // over MPI_COMM_WORLD after their classify pass.  The coordinator has no
-    // shard and sends/receives nothing, but must call the same three collectives
-    // to keep all ranks in step — otherwise the collectives never complete.
+    // Coordinator has no shard; call dummy alltoall to keep ranks in step
     {
-        // dummy_i / dummy_f: non-null stack pointers required by MPI even when
-        // all counts are zero.  Their values are never read.
+        // Non-null ptrs required by MPI for zero counts
         int   dummy_i = 0;
         float dummy_f = 0.0f;
         std::vector<int> zero_counts(world_size, 0);
@@ -1712,7 +1686,6 @@ int Coordinator::kmeans_(float* sample, size_t nPrime, size_t m_centers, float* 
     return iters;
 }
 
-// ========== Executor Implementation ==========
 Executor::Executor(int node_id, int dim, Communicator& comm, Log* logger)
     : node_id_(node_id),
       dim_(dim),
@@ -2140,18 +2113,9 @@ void Executor::reBuild(
     MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS, MPI_COMM_WORLD);
 }
 
-// ── reBuildDelta ─────────────────────────────────────────────────────────────
-// In-place rebuild: instead of constructing a fresh sub-HNSW, this method
-// (1) classifies every live element under the new partitions,
-// (2) mark-deletes elements that migrated away and sends them to their new
-//     owners via the same peer-exchange protocol as reBuild(),
-// (3) inserts the elements received from other workers using replace_deleted=true
-//     so that freed slots are preferentially reused, and
-// (4) logs / stores the count of deleted slots that were not reused (i.e. the
-//     number of departing elements whose graph positions remain as tombstones).
-//
-// Requires sub_HNSW_ to have been built with allow_replace_deleted=true,
-// which is always the case for indexes created by Executor::build().
+// In-place rebuild: classify live elements, mark-delete migrants, insert newcomers.
+// Preserves graph topology; reuses freed slots via replace_deleted=true.
+// Logs count of remaining deleted slots (tombstones for departed elements).
 void Executor::reBuildDelta(
     int meta_size,
     int ncenters,
@@ -2162,7 +2126,6 @@ void Executor::reBuildDelta(
     if (num_building_threads == -1)
         num_building_threads = omp_get_max_threads();
 
-    // ── Step 1: receive new meta-HNSW and partition assignments ──────────────
     std::vector<char> buf(meta_size);
     MPI_Recv(buf.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -2180,7 +2143,6 @@ void Executor::reBuildDelta(
     MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    // ── Step 2: classify live elements; collect those migrating away ──────────
     // Read pass: shared lock so no concurrent resize can occur.
     std::vector<std::vector<float>> send_vecs(world_size);
     std::vector<std::vector<int>>   send_labels(world_size);
@@ -2196,21 +2158,9 @@ void Executor::reBuildDelta(
 
             int ext_lbl = static_cast<int>(sub_HNSW_->getExternalLabel(iid));
 
-            // Canonical-ownership check: verify that label_lookup_ maps this
-            // label back to this exact internal ID.  A mismatch means the slot
-            // holds a "ghost" label — its label_lookup_ entry was already
-            // updated to point to a different (live) slot by a replace_deleted
-            // addPoint, but the stale label value was never cleared from the
-            // data buffer.  Visiting ghost slots would feed the wrong label into
-            // the mark-delete pass, potentially causing "markDelete: Label not
-            // found" if the live entry was subsequently erased.
-            //
-            // No lock is needed here: the rebuild protocol guarantees no
-            // concurrent writes to label_lookup_ during this iterate pass
-            // (insertLocalBatch requires exclusive graph_mutex_, which is
-            // blocked by our shared_lock above; no other shard touches this
-            // local map).  All OMP threads are read-only, so concurrent reads
-            // of the unordered_map are safe under the C++ standard.
+            // Canonical-ownership check: skip ghost labels (stale slots with label_lookup
+            // already pointing elsewhere via replace_deleted). No lock needed; rebuild
+            // protocol blocks insertLocalBatch during this iterate pass.
             {
                 const auto it = sub_HNSW_->label_lookup_.find(
                     static_cast<hnswlib::labeltype>(ext_lbl));
@@ -2258,7 +2208,6 @@ void Executor::reBuildDelta(
     std::cout << "[Executor " << node_id_ << "] delta rebuild iterate: departed="
               << n_departing << "\n";
 
-    // ── Step 3: AllToAll exchange ─────────────────────────────────────────────
     // All ranks (including the coordinator with empty buffers) call the same
     // three collectives, so no sub-communicator is needed.
     //
@@ -2320,7 +2269,6 @@ void Executor::reBuildDelta(
     std::cout << "[Executor " << node_id_ << "] delta rebuild exchange: arrived="
               << total_recv << "\n";
 
-    // ── Step 4: resize if needed, then insert with replace_deleted ────────────
     // After the mark-delete pass, sub_HNSW_->num_deleted_ counts every slot
     // currently available for reuse (including any prior stream-deleted elements
     // that were never replaced).  Incoming insertions with replace_deleted=true
@@ -2349,7 +2297,6 @@ void Executor::reBuildDelta(
     }
     double end_hnsw = MPI_Wtime();
 
-    // ── Step 5: compute and log remaining unfilled deleted slots ──────────────
     // With allow_replace_deleted=true, deleted_elements is kept in sync with
     // num_deleted_: every markDelete adds to it, every successful slot-reuse by
     // addPoint removes from it.  So deleted_elements.size() == num_deleted_ and
@@ -2588,7 +2535,6 @@ double Executor::getTombstoneRatio() const {
     return static_cast<double>(deleted) / static_cast<double>(total);
 }
 
-// ── insertLocalBatch ─────────────────────────────────────────────────────────
 // Insert a batch of vectors (received via AllToAllV in shared_batch_experiment)
 // directly into the local sub-HNSW without going through the MPI message
 // protocol.  Resizes the index if capacity would be exceeded.
@@ -2635,7 +2581,6 @@ void Executor::insertLocalBatch(const std::vector<float>& vecs,
         sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/true);
 }
 
-// ── markDeleteLocal ──────────────────────────────────────────────────────────
 // Mark a single vector deleted without MPI.  Ignores labels not present in
 // this shard (the label may have been routed to a different executor).
 void Executor::markDeleteLocal(int label) {
@@ -2647,7 +2592,6 @@ void Executor::markDeleteLocal(int label) {
     }
 }
 
-// ── markDeleteLocalBatch ─────────────────────────────────────────────────────
 // Mark a batch of vectors deleted in parallel.  hnswlib's markDelete is
 // internally thread-safe for distinct labels — it uses per-label
 // label_op_locks_, a separate label_lookup_lock for the lookup table, and
@@ -2667,7 +2611,6 @@ void Executor::markDeleteLocalBatch(const std::vector<int>& labels) {
     }
 }
 
-// ── searchLocalBatch ─────────────────────────────────────────────────────────
 // Search a batch of query vectors (received via AllToAllV phase-1) and return
 // results without MPI.  Each result vector is sorted nearest-first.
 std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>

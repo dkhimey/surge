@@ -1,27 +1,8 @@
 #!/usr/bin/env python3
 """
-branching_factor_oracle.py
-
 Matched-activation oracle for BranchingFactor routing.
 
-For each branching factor K the script:
-  1. Queries the routing HNSW with the actual query vectors to retrieve the
-     top-K nearest centroids, then maps them to partitions to get the
-     per-query unique partition count  n_q = |omega(q)|  (the number of
-     distinct partitions BranchingFactor K would visit for query q).
-  2. Computes the actual BranchingFactor K recall (using those same partitions).
-  3. Computes the oracle recall: for each query, picks the optimal n_q
-     partitions (the n_q partitions richest in GT neighbours) and reports
-     the resulting recall.
-
-The gap (oracle_recall - actual_recall) isolates routing quality from
-partition count -- it shows how much recall is left on the table because
-the HNSW search picks sub-optimal centroids, with the per-query partition
-budget held fixed.
-
-Unlike the nprobe and recall-target oracles, this script requires a
---query-file because the per-query partition counts n_q come from actually
-running the BranchingFactor routing on each query.
+For each K, computes oracle recall using the optimal K partitions.
 """
 
 import argparse
@@ -30,10 +11,9 @@ import hnswlib
 from pathlib import Path
 
 
-# ── I/O helpers ─────────────────────────────────────────────────────────────
 
 def read_fbin_ground_truth(filename):
-    """Read a ground-truth file in fbin or ibin format."""
+    """Read ground-truth file (fbin or ibin format); trailing seek handles both."""
     with open(filename, "rb") as f:
         num_queries = np.frombuffer(f.read(4), dtype=np.uint32)[0]
         K           = np.frombuffer(f.read(4), dtype=np.uint32)[0]
@@ -93,9 +73,7 @@ def mmap_u8bin(filename):
 
 def read_partitions_bin(filename):
     """Read a partitions.bin file written by Coordinator::save().
-
-    Format: uint64 size | int32[size]
-    """
+    Format: uint64 size | int32[size]"""
     with open(filename, "rb") as f:
         size = int(np.frombuffer(f.read(8), dtype=np.uint64)[0])
         data = np.frombuffer(f.read(size * 4), dtype=np.int32)
@@ -107,10 +85,8 @@ def read_partitions_bin(filename):
 
 
 def load_cached_gt_vectors(filename):
-    """Read a cached GT vector file written by saveCachedGTVectors().
-
-    Format: uint32 num_vecs | uint32 dim | float32[num_vecs * dim]
-    """
+    """Read cached GT vector file written by saveCachedGTVectors().
+    Format: uint32 num_vecs | uint32 dim | float32[num_vecs * dim]"""
     with open(filename, "rb") as f:
         header   = np.frombuffer(f.read(8), dtype=np.uint32)
         num_vecs = int(header[0])
@@ -124,7 +100,7 @@ def load_cached_gt_vectors(filename):
 
 
 def find_cached_gt_vectors(base_file: str, dataset_name: str = None) -> str | None:
-    """Look for a cached_gt_vectors_*.bin file in the same directory as the base file."""
+    """Find cached_gt_vectors_*.bin in base_file's directory; glob for most recent if no dataset_name."""
     base_dir = Path(base_file).parent
 
     if dataset_name:
@@ -150,7 +126,6 @@ def find_cached_gt_vectors(base_file: str, dataset_name: str = None) -> str | No
         return str(candidates[0])
 
 
-# ── Oracle ───────────────────────────────────────────────────────────────────
 
 def compute_branching_factor_oracle(
     router_path:       str,
@@ -198,20 +173,17 @@ def compute_branching_factor_oracle(
     if branching_factors is None:
         branching_factors = [1, 2, 5, 10, 15, 20, 25, 30, 35, 40, 50]
 
-    # ── Load ground truth ─────────────────────────────────────────────────
     gt          = read_fbin_ground_truth(gt_file)       # (Q_gt, K_gt)
     num_queries = gt.shape[0]
 
     print(f"Loaded ground truth: {num_queries} queries, k_gt={gt.shape[1]}, "
           f"using k={k_neighbors}")
 
-    # ── Load partition map ────────────────────────────────────────────────
     partitions     = read_partitions_bin(partition_file)
     num_partitions = int(partitions.max()) + 1
 
     print(f"Loaded partitions: {len(partitions)} centers, {num_partitions} partitions")
 
-    # ── Load router ───────────────────────────────────────────────────────
     router = hnswlib.Index(space="l2", dim=dim)
     router.load_index(router_path)
     max_bf    = max(branching_factors)
@@ -220,22 +192,19 @@ def compute_branching_factor_oracle(
 
     print(f"Loaded router index with {n_centers} elements, ef={max(ef, max_bf)}")
 
-    # ── Load query vectors ────────────────────────────────────────────────
     end = min(max_queries, num_queries)
     if query_format == "u8bin":
         queries = read_u8bin_slice(query_file, 0, end)
     else:
         queries = read_fbin_slice(query_file, 0, end)
 
-    # Trim GT to match the queries actually loaded.
+    # Trim GT to match queries actually loaded
     gt          = gt[:end]
     num_queries = end
 
     print(f"Loaded {num_queries} query vectors (dim={queries.shape[1]})")
 
-    # ── Route GT vectors to partitions ────────────────────────────────────
-    # Use unique GT indices to avoid redundant HNSW lookups and to align with
-    # any cached GT vector file (which stores unique indices in sorted order).
+    # Use unique GT indices to avoid redundant HNSW lookups and align with cached files
     gt_indices_flat         = gt[:, :k_neighbors].ravel()        # (Q*k,)
     unique_indices, inverse = np.unique(gt_indices_flat, return_inverse=True)
 
@@ -257,16 +226,13 @@ def compute_branching_factor_oracle(
         gt_vecs   = np.ascontiguousarray(base_mmap[unique_indices], dtype=np.float32)
         print(f"Gathered {len(unique_indices):,} unique GT vectors from base file")
 
-    # Route unique GT vectors; expand back to (Q*k,) via the inverse index.
+    # Route unique GT vectors; expand back via inverse index mapping
     gt_labels, _    = router.knn_query(gt_vecs, k=1)   # (num_unique, 1)
     unique_part_ids = partitions[gt_labels[:, 0]]       # (num_unique,)
     gt_part_ids     = unique_part_ids[inverse]           # (Q*k,)
     gt_part_matrix  = gt_part_ids.reshape(num_queries, k_neighbors)   # (Q, k)
 
-    # ── Per-query GT partition distributions ──────────────────────────────
-    # query_dist[q, p] = fraction of query q's GT neighbours in partition p.
-    # opt_order[q, :] = partitions sorted by descending GT density for query q.
-    # cumsum_gt[q, n-1] = recall achieved by the optimal top-n partitions.
+    # Compute per-query GT partition distributions and optimal partitions by density
     query_dist = np.zeros((num_queries, num_partitions), dtype=np.float64)
     for i in range(num_queries):
         counts        = np.bincount(gt_part_matrix[i], minlength=num_partitions)
@@ -276,13 +242,11 @@ def compute_branching_factor_oracle(
     sorted_dist = np.take_along_axis(query_dist, opt_order, axis=1)   # (Q, P)
     cumsum_gt   = np.cumsum(sorted_dist, axis=1)     # (Q, P)
 
-    # ── Query HNSW once at max_bf; slice per K ────────────────────────────
     k_query = min(max_bf, n_centers)
     print(f"\nQuerying router HNSW: {num_queries} queries × top-{k_query} centers …")
     query_labels, _ = router.knn_query(queries, k=k_query)   # (Q, k_query)
     query_pids      = partitions[query_labels]                # (Q, k_query)
 
-    # ── Evaluate per branching factor ─────────────────────────────────────
     rows = []
 
     print(f"\n{'K':>6} | {'Mean parts':>11} | {'Activation':>11} | "
@@ -293,24 +257,20 @@ def compute_branching_factor_oracle(
         k_eff    = min(bf, k_query)
         pids_k   = query_pids[:, :k_eff]   # (Q, k_eff)
 
-        # visited_bf[q, p] = True iff BF K visits partition p for query q.
+    # Mark visited partitions for BF K
         visited_bf = np.zeros((num_queries, num_partitions), dtype=bool)
         visited_bf[np.arange(num_queries)[:, None], pids_k] = True
 
-        # ── Actual BF K recall ────────────────────────────────────────────
-        # For each GT neighbour, check whether its partition was visited.
+        # GT visited: which of each query's GT neighbours' partitions were visited?
         gt_visited              = visited_bf[np.arange(num_queries)[:, None], gt_part_matrix]
         actual_recall_per_query = gt_visited.sum(axis=1) / k_neighbors   # (Q,)
 
-        # ── Per-query unique partition count ──────────────────────────────
-        n_q = visited_bf.sum(axis=1).astype(np.int32)   # (Q,)
+        # Partitions visited per query
 
-        # ── Matched-activation oracle recall ─────────────────────────────
-        # cumsum_gt[q, n_q[q]-1] is the recall of the optimal n_q[q] partitions.
+        # Oracle recall: optimal partitions matching per-query visit count
         idx_oracle              = np.clip(n_q - 1, 0, num_partitions - 1)
         oracle_recall_per_query = cumsum_gt[np.arange(num_queries), idx_oracle]   # (Q,)
 
-        # ── Aggregate ─────────────────────────────────────────────────────
         mean_parts  = float(n_q.mean())
         activation  = mean_parts / num_partitions
         actual_mean = float(actual_recall_per_query.mean())
@@ -337,7 +297,6 @@ def compute_branching_factor_oracle(
             "p95_oracle_recall":       p95_oracle,
         })
 
-    # ── Write CSV ─────────────────────────────────────────────────────────
     header = (
         "branching_factor,mean_partitions_visited,activation,"
         "actual_recall,oracle_recall,recall_gap,"
@@ -364,15 +323,10 @@ def compute_branching_factor_oracle(
     return rows
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description=(
-            "BranchingFactor matched-activation oracle: for each K, reports "
-            "the actual BF routing recall alongside the optimal recall "
-            "achievable given the same per-query partition count."
-        )
+        description=("BranchingFactor oracle: actual vs. optimal recall for each K.")
     )
     parser.add_argument("--router",            required=True,
                         help="Path to HNSW meta-index (.bin)")
@@ -398,8 +352,7 @@ if __name__ == "__main__":
                         help="HNSW ef parameter (default: 100)")
     parser.add_argument("--branching-factors", nargs="+", type=int, default=None,
                         dest="branching_factors",
-                        help="Branching factor values to evaluate "
-                             "(default: 1 2 5 10 15 20 25 30 35 40 50)")
+                        help="Branching factors to evaluate (default: 1 2 5 10 15 20 25 30 35 40 50)")
     parser.add_argument("--max-queries",       default=10000, type=int,
                         dest="max_queries",
                         help="Maximum number of queries to load (default: 10000)")
@@ -407,8 +360,7 @@ if __name__ == "__main__":
                         help="Dataset name for locating cached GT vectors")
     parser.add_argument("--out-file",          default="branching_factor_oracle_results.csv",
                         dest="out_csv",
-                        help="Output CSV path "
-                             "(default: branching_factor_oracle_results.csv)")
+                        help="Output CSV file (default: branching_factor_oracle_results.csv)")
     args = parser.parse_args()
 
     compute_branching_factor_oracle(

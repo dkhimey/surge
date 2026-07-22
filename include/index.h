@@ -40,19 +40,9 @@ public:
     void load(const std::string& dir_path, int ef_search);
     void save(const std::string& output_dir);
 
-    // Load the coordinator's routing state from the output of
-    // runbook_centers.cpp step <step> plus a precomputed partition
-    // assignment file (center → shard).  Used to start an experiment from a
-    // cluster-analysis-produced starting state instead of building from scratch.
-    //
-    // Reads, for prefix = <state_dir>/step_<step zero-padded to 6>:
-    //   <prefix>_hnsw.bin           → meta_HNSW_     (HNSW over centroids; label == centroid id)
-    //   <prefix>_centers.csv        → centers_       (k rows × dim, comma-sep, scientific notation)
-    //   <prefix>_center_counts.csv  → center_counts_ (one plain integer per line)
-    //   <prefix>_labels.csv         → label_to_center_ (one centroid id per line;
-    //                                                    global label = init_start + line index)
-    //   <partitions_file>           → partitions     (one shard id per line; an optional
-    //                                                  trailing moved-nodes count is ignored)
+    // Load coordinator state from cluster analysis output
+    // Reads step_<step>_hnsw.bin, _centers.csv, _center_counts.csv, _labels.csv,
+    // and partitions file (center -> shard mapping)
     void loadFromClusterAnalysis(
         const std::string& state_dir,
         int                step,
@@ -61,54 +51,32 @@ public:
         int                ef_search,
         int                init_start);
 
-    // ── Accessors for shared_batch_experiment ──────────────────────────────
-    // Expose routing state so the experiment can replicate it on all ranks.
+    // Expose routing state for replication across ranks
     hnswlib::HierarchicalNSW<float>* getMetaHNSW() { return meta_HNSW_; }
     const std::vector<int>& getPartitions() const { return partitions; }
     const std::unordered_map<int,int>& getLabelToCenter() const { return label_to_center_; }
     const std::vector<int>& getCenterCounts() const { return center_counts_; }
 
-    // Two-phase, lock-minimal center updates for batch insert/delete steps.
-    // Phase 1 accumulates per-center sums in parallel; Phase 2 applies all
-    // updates under a single write lock.  Called by coordinator after the
-    // Allgatherv that populates label_to_center on all ranks.
+    // Batch updates with two-phase locking: accumulate in parallel, apply under write lock
     void updateCentersForInsertBatch(const std::vector<float>& vecs,
                                       const std::vector<int>& center_ids);
 
     void updateCentersForDeleteBatch(const std::vector<float>& vecs, 
                                      const std::vector<int>& closest_center_labels);
-    // Check whether a rebuild is needed without executing it.  Runs
-    // rePartition, caches the result (new meta-HNSW, new partitions,
-    // serialised buffer).  Returns 0 = no rebuild, 1 = full, 2 = partial.
-    // Must be followed by doRebuildSimple() if the return value is non-zero.
+    // Check if rebuild needed without executing; caches result (returns 0/1/2)
     int checkNeedRebuild(int full_threshold, int partial_threshold,
                          int ef_construction, int M_meta);
 
-    // Execute the cached rebuild prepared by checkNeedRebuild().  Sends
-    // FULL/PARTIAL_REBUILD_REQUEST + meta-HNSW + partitions to every
-    // executor, waits for REBUILD_SUCCESS from each, then swaps the new
-    // meta-HNSW and partitions into the Coordinator's internal state.
-    // Safe to call only in serial (non-concurrent) rebuild scenarios.
+    // Execute cached rebuild from checkNeedRebuild; serial only
     void doRebuildSimple(int world_size);
 
-    // Delta-rebuild variant: sends INPLACE_REBUILD_REQUEST so executors
-    // mark-delete departing elements and insert arriving ones without
-    // reconstructing the graph from scratch.  Same protocol and caching
-    // contract as doRebuildSimple().
+    // Delta rebuild: mark-delete departing elements, insert arriving without reconstructing
     void doRebuildDelta(int world_size);
 
-    // Force a full rebuild now, independently of checkNeedRebuild() and the
-    // center-movement thresholds.  Used when an external condition (e.g. a
-    // shard's tombstone/free-slot ratio) demands a rebuild even though the
-    // center-movement threshold was not met.  Recomputes the partitioning,
-    // caches it as a FULL rebuild, and dispatches via the same protocol as
-    // doRebuildSimple() (executors receive a FULL_REBUILD_REQUEST).  Populates
-    // the cached_* statistics so the caller can report them afterwards.
+    // Force full rebuild independent of thresholds; used for external conditions like tombstone ratio
     void doForceFullRebuild(int world_size, int ef_construction, int M_meta);
 
-    // Returns statistics from the most recent checkNeedRebuild() call that
-    // returned non-zero.  All return 0 when no rebuild was needed or before
-    // checkNeedRebuild() is first called.
+    // Returns statistics from most recent checkNeedRebuild (all zero before first call)
     int    getCachedElementsMoved()  const { return cached_elements_moved_; }
     int    getCachedCentersMoved()   const { return cached_centers_moved_; }
     double getCachedRepartHnswS()    const { return cached_repart_hnsw_s_; }
@@ -313,53 +281,38 @@ public:
     void insert_batch(size_t num_vecs, int tag);
     void delete_vector(size_t label, int tag);
 
-    // ── Direct (MPI-free) operations for shared_batch_experiment ──────────
-    // Insert a batch of vectors received via AllToAllV without going through
-    // the MPI message protocol.  Acquires an exclusive lock for the full batch.
+    // Direct (MPI-free) batch operations for distributed experiments
+    // Insert vectors received via AllToAllV; exclusive lock for full batch
     void insertLocalBatch(const std::vector<float>& vecs,
                           const std::vector<int>&   labels);
 
-    // Mark a single vector as deleted.  Silently ignores labels not present
-    // in this shard.  Uses an exclusive lock.
+    // Mark single vector deleted; silently ignores missing labels
     void markDeleteLocal(int label);
 
-    // Mark a batch of vectors deleted in parallel.  hnswlib markDelete is
-    // internally thread-safe for distinct labels (per-element label_op_locks_,
-    // atomic num_deleted_, deleted_elements_lock), so only a shared lock is
-    // needed here.  Labels not present in this shard are silently skipped.
+    // Batch delete with shared lock (thread-safe per-element in hnswlib)
     void markDeleteLocalBatch(const std::vector<int>& labels);
 
-    // Search a batch of query vectors received via AllToAllV.  Returns one
-    // result vector per query; each result is sorted nearest-first.
+    // Search batch of queries; returns sorted results (nearest-first)
     std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>
     searchLocalBatch(const std::vector<float>& queries,
                      size_t                     num_queries,
                      size_t                     k);
 
-    // Returns the number of active (non-deleted) elements in the sub-HNSW.
+    // Return active (non-deleted) elements in sub-HNSW
     size_t getElementCount() const;
 
-    // Returns the fraction of allocated HNSW slots that are tombstones:
-    //   num_deleted_ / getCurrentElementCount()
-    // Returns 0.0 when the graph is empty.
+    // Return fraction of deleted slots: num_deleted / getCurrentElementCount
     double getTombstoneRatio() const;
 
-    // Per-phase wall-clock times from the most recent reBuild() call.
-    // These are set before REBUILD_SUCCESS is sent, so they are valid
-    // as soon as reBuild() returns.  All return 0.0 before the first rebuild.
+    // Per-phase timing from most recent rebuild (zero before first call)
     double getLastRebuildIterateS()  const { return last_rebuild_iterate_s_; }
     double getLastRebuildExchangeS() const { return last_rebuild_exchange_s_; }
     double getLastRebuildGraphS()    const { return last_rebuild_graph_s_; }
 
-    // Number of deleted slots that were not yet reused by incoming insertions
-    // after the most recent reBuildDelta() call.  Equal to
-    // sub_HNSW_->deleted_elements.size() immediately after the call.
-    // Returns 0 before the first delta rebuild.
+    // Count of deleted slots not yet reused after most recent delta rebuild
     size_t getLastRebuildRemainingDeleted() const { return last_rebuild_remaining_deleted_; }
 
-    // Labels of vectors that arrived at this executor during the most recent
-    // reBuild() / reBuildDelta() exchange.  Populated before REBUILD_SUCCESS is
-    // sent so the accessor is valid as soon as the rebuild call returns.
+    // Labels of vectors that arrived during most recent rebuild (for label_to_shard sync)
     const std::vector<int>& getLastRebuildMovedLabels() const { return last_rebuild_moved_labels_; }
 
     void batch_search(size_t num_queries, size_t k, int tag);
@@ -381,11 +334,8 @@ public:
         int num_building_threads = -1
     );
 
-    // Delta rebuild: mark-delete elements that migrated away, receive and
-    // insert elements that migrated in.  Uses replace_deleted=true so
-    // incoming insertions preferentially reuse the freed slots.
-    // Does NOT rebuild the graph from scratch; the existing graph topology
-    // is retained for staying elements.
+    // Delta rebuild: mark-delete migrated-out elements, insert migrated-in with replace_deleted=true
+    // Graph topology retained; not reconstructed from scratch
     void reBuildDelta(
         int meta_size,
         int ncenters,
@@ -423,17 +373,15 @@ private:
     int* indices_;
     size_t data_count_ = 0;
 
-    // Per-phase timing from the most recent reBuild() / reBuildDelta() call.
-    double last_rebuild_iterate_s_  = 0.0; // routing existing elements to new partitions
-    double last_rebuild_exchange_s_ = 0.0; // MPI point-to-point vector exchange
-    double last_rebuild_graph_s_    = 0.0; // inserting received vectors into new sub-HNSW
+    // Per-phase timing from most recent rebuild
+    double last_rebuild_iterate_s_  = 0.0; // route existing elements
+    double last_rebuild_exchange_s_ = 0.0; // MPI exchange
+    double last_rebuild_graph_s_    = 0.0; // insert into new sub-HNSW
 
-    // Count of deleted slots still unreplaced after the most recent reBuildDelta().
-    // With allow_replace_deleted=true, this equals sub_HNSW_->deleted_elements.size()
-    // immediately after all insertions complete.
+    // Deleted slots unreplaced after most recent delta rebuild
+    // Equals sub_HNSW_->deleted_elements.size() after insertions complete
     size_t last_rebuild_remaining_deleted_ = 0;
 
-    // Arrived labels from the most recent rebuild exchange, for sweep-side
-    // label_to_shard synchronisation via Allgatherv after each rebuild.
+    // Arrived labels for label_to_shard sync via Allgatherv after rebuild
     std::vector<int> last_rebuild_moved_labels_;
 };
