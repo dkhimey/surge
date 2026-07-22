@@ -526,4 +526,4 @@ inline std::string trim(const std::string& s) {
 }
 }
 
-std::vector<RunbookStep> load_runbook(const std::string& path, const std::string& dataset_key);
+inline std::vector<RunbookStep> load_runbook(const std::string& path, const std::string& dataset_key);
