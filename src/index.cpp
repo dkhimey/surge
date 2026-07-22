@@ -1,3 +1,10 @@
+// index.cpp
+//
+// Core SURGE index. Implements the Coordinator (routing layer over k-means
+// centroids, partitioning, and drift-triggered maintenance) and the Executor
+// (each worker's local HNSW shard), along with the routing modes and the online
+// insert / delete / rebuild operations.
+
 #include "index.h"
 #include "checkpoint_io.h"
 

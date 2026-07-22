@@ -1,53 +1,21 @@
 // dynamic_runbook_experiment.cpp
 //
-// Main end-to-end distributed dynamic experiment.  Replays a streaming runbook
-// of interleaved insert / delete / search steps against the SURGE index, keeping
-// the routing layer and local graphs current via online maintenance, and reports
-// per-step recall and throughput.  Insert, delete, and rebuild steps run once as
-// normal; each search step is swept over all three routing modes and their full
-// parameter grids, recording throughput + recall separately for each (mode, param).
+// Main end-to-end distributed dynamic experiment. Replays a streaming runbook of
+// interleaved insert / delete / search steps against the SURGE index, keeping the
+// routing layer and local graphs current via online maintenance, and reports
+// per-step recall and throughput. Each search step is swept over all three routing
+// modes and their parameter grids, recording throughput + recall per (mode, param).
 //
-// ─── Usage ───────────────────────────────────────────────────────────────────
-//  mpirun -np <P+1> ./dynamic_runbook_experiment \
-//      <dataset> <num_partitions> <full_threshold> <k> <gt_prefix> <output_file>
+// Usage:  mpirun -np <P+1> ./dynamic_runbook_experiment \
+//             <dataset> <num_partitions> <full_threshold> <k> <gt_prefix> <output_file>
 //
-//  Rebuild policy: delta always — shadow-delete departing elements and insert
-//  arriving ones using replace_deleted=true (keeps existing graph topology).
-//  Falls back to a full reconstruction if any shard's tombstone ratio exceeds
-//  TOMBSTONE_RATIO_THRESHOLD (currently 0.50 = 50% unused slots).  This check
-//  fires independently of the center-movement rebuild threshold: a shard
-//  exceeding the ratio forces a full rebuild even when checkNeedRebuild() would
-//  otherwise report that no rebuild is needed.
+// Rebuild policy: delta rebuilds (shadow-delete + replace_deleted) keep graph
+// topology; a shard falls back to a full rebuild once its tombstone ratio exceeds
+// TOMBSTONE_RATIO_THRESHOLD (0.50), independent of the center-movement threshold.
 //
-// ─── Sweep parameter grids ───────────────────────────────────────────────────
-//  BranchingFactor : {20, 25, 30, 40, 50, 60, 80}
-//  NProbe          : {5, 6, 7, 8, 9}
-//  RecallTarget    : {0.85, 0.90, 0.95, 0.97, 0.98, 0.99}
-//
-// ─── Output CSV columns ──────────────────────────────────────────────────────
-//  All rows:
-//    step, operation, mode, param,
-//    range_start, range_end, time_s, throughput,
-//    recall@<k>, theoretical_recall@<k>, avg_parts_searched
-//
-//  theoretical_recall@<k> is computed during the sweep (search rows only;
-//  -1 elsewhere).  For each query it equals
-//    | gt_partitions(q) ∩ visited_partitions(q, mode, param) | / | gt_partitions(q) |
-//  where gt_partitions(q) is the multiset of partitions physically holding
-//  q's top-K GT neighbours, resolved via the exact label_to_shard ownership
-//  map (the online method, matching gp-ann's label_to_shard lookup) rather
-//  than a meta-HNSW re-route.  Computed outside the timed search window so
-//  throughput is unaffected.
-//  Rebuild rows (operation="rebuild") additionally populate:
-//    centers_moved, elements_moved,
-//    repart_hnsw_s, repart_bottom_s, repart_kaffpa_s, repart_relabel_s,
-//    exec_iterate_s, exec_exchange_s, exec_graph_s, dorebuild_wall_s
-//  (non-rebuild rows carry -1 in those rebuild-specific columns)
-//  All rows end with shard_0_size, …, shard_<P-1>_size
-//  Rebuild rows additionally populate remaining_deleted_slots
-//  (-1 for full rebuilds; 0+ for delta rebuilds).
-//
-//  For non-search rows, mode="" and param=-1.
+// Output: one CSV row per step — step, operation, mode, param, timing, throughput,
+// recall@k, theoretical_recall@k, avg_parts_searched, and per-shard sizes, with
+// extra rebuild-timing columns on rebuild rows (-1 where not applicable).
 
 #include <algorithm>
 #include <atomic>
@@ -81,23 +49,10 @@
 #include "index.h"
 #include "checkpoint_io.h"
 
-// Name of the per-checkpoint commit marker. A checkpoint directory is only
-// considered valid/resumable once this file exists. It is written *last*, by
-// rank 0, after every rank has fsynced and verified its own files, so a torn
-// or partially-written checkpoint is invisible to resume. Migration note: a
-// known-good checkpoint produced before this change can be blessed manually
-// with `touch <ckpt_dir>/COMMITTED`.
+
 static constexpr const char* CKPT_COMMIT_MARKER = "COMMITTED";
 
-// ─── mmap helper for sparse GT vector reads ─────────────────────────────────
-//
-// Mirrors compute_theoretical_recall_updated.py's mmap_fbin / mmap_u8bin:
-// open base_file, mmap it read-only, and copy individual vectors out at
-// arbitrary indices into a float buffer.  Supports FBIN (float32) and
-// U8BIN (uint8 → float32 widen).  Throws on other formats.
-//
-// Used only for theoretical-recall setup (once per search step, outside
-// the timed query window), so per-vector copy cost is irrelevant.
+// mmap helper for sparse GT vector reads 
 class BaseMmap {
 public:
     BaseMmap(const std::string& path, FileFormat format)
@@ -168,36 +123,15 @@ static constexpr int    M_META               = 16;
 static constexpr int    M_SUB                = 16;
 static constexpr int    NUM_BUILDING_THREADS = 32;
 static constexpr int    EF_SEARCH            = 200;
-// Meta-HNSW (routing) search ef.  Kept separate from EF_SEARCH (the executor
-// sub-index search ef) so routing effort can be tuned without touching local
-// search quality.  Set to 100 to match compute_theoretical_recall_updated.py's
-// router.set_ef(max(100, k_rt)), so the theoretical-recall column produced here
-// is computed with the same routing accuracy as the offline theoretical pipeline.
 static constexpr int    EF_ROUTING           = 100;
 static constexpr size_t SAMPLE_SIZE          = 100000;
-// If the maximum tombstone ratio across all executor shards meets or exceeds
-// this threshold during a delta-rebuild event, a full rebuild is used instead.
 static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.50;
-// Write a checkpoint every this many runbook steps.  The new checkpoint is
-// fully written and fsync'd (via close()) before the previous one is removed,
-// so disk space is never exhausted by holding two copies simultaneously in the
-// typical case (unless a single checkpoint exceeds half the available space).
 static constexpr size_t CHECKPOINT_INTERVAL       = 50;
-// Evaluate the rebuild check (center-movement threshold + tombstone-ratio MAX
-// reduce) only once every this many runbook steps, rather than on every
-// insert/delete step.  The cadence is keyed off the streaming-loop index s,
-// which advances in lockstep on every rank, so the gated MPI collectives stay
-// matched between the coordinator and the executors.  On steps where the check
-// is skipped no rebuild can be triggered (do_rebuild is broadcast as 0).
 static constexpr size_t REBUILD_CHECK_INTERVAL     = 6;
 
-// ─── Sweep parameter grids (visible to all ranks so loop counts agree) ───────
-static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {};
-static const std::vector<int>   NPROBE_PARAMS           = {3, 5};
-static const std::vector<float> TARGET_PARAMS           = {.90f, .95f, .99f};
-
-// Build the ordered (mode, param) list once.  Both coordinator and executor
-// iterate this same list so their MPI collective calls stay in lockstep.
+static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {20, 25, 30, 40, 50, 60, 80};
+static const std::vector<int>   NPROBE_PARAMS           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+static const std::vector<float> TARGET_PARAMS           = {0.85f, 0.90f, 0.95f, 0.97f, 0.98f, 0.99f};
 static std::vector<std::pair<RoutingMode, float>> build_sweep_combos()
 {
     std::vector<std::pair<RoutingMode, float>> combos;
@@ -446,10 +380,6 @@ static void bcastRoutingState(
     }
 }
 
-// ─── find_latest_checkpoint ──────────────────────────────────────────────────
-// Scan <ckpt_base> for subdirectories named "ckpt_s<N>" and return the path of
-// the one with the highest N.  Returns "" if the base directory does not exist
-// or contains no valid checkpoint subdirectories.
 static std::string find_latest_checkpoint(const std::string& ckpt_base)
 {
     std::error_code ec;
@@ -592,26 +522,14 @@ int main(int argc, char** argv)
         std::cerr << "ERROR: --init-state-dir and --init-partitions must be used together\n";
         return 1;
     }
-    // Checkpoint base directory: strip the output file extension, append
-    // Checkpoint base directory: stable across runs so that a restarted run
-    // automatically resumes from the previous run's checkpoint even when the
-    // output file path changes (e.g. due to a new timestamp in results/).
-    // Path: checkpoints/<dataset_name>_t<full_threshold>/
-    // E.g.  checkpoints/msturing-100M-clustered_t6000/
     const std::string ckpt_base =
         "checkpoints/" + dataset_name + "_t" + std::to_string(full_threshold);
-    // Rebuild policy: always attempt delta (shadow-delete + replace_deleted insert).
-    // Falls back to full if the tombstone ratio check fires (see TOMBSTONE_RATIO_THRESHOLD).
     const bool        use_delta_rebuild = true;
 
-    // Maintenance is disabled entirely when the rebuild threshold is at least the
-    // number of centers.  In that mode NO rebuild of any kind happens — neither
-    // the center-movement threshold nor the tombstone-ratio check may trigger one
-    // — so the rebuild machinery (including the tombstone-ratio reduce) is skipped.
-    // Computed identically on every rank since full_threshold is parsed by all.
+
     const bool        maintenance_enabled = (full_threshold < NCENTERS);
 
-    // Build the sweep list — identical on all ranks so collective counts match.
+    
     const auto sweep_combos = build_sweep_combos();
     const int  n_combos     = static_cast<int>(sweep_combos.size());
 
@@ -653,19 +571,6 @@ int main(int argc, char** argv)
     }
 
     // ── Resolve search variants (scale + fraction label) ─────────────────────
-    // Each variant is one (scale, fraction) pair.  Every search step is run once
-    // per variant (× the existing mode/param sweep), and the fraction is recorded
-    // in the "search_fraction" CSV column.  Variants are derived purely from the
-    // runbook + query-file header (identical on every rank), so the variant list
-    // — and therefore the per-search MPI collective counts — stay in lockstep
-    // across ranks without any broadcast.
-    //
-    //   --search-fraction p1,p2,… : updates  = total insert+delete vectors (fixed)
-    //                               base_vol = n_search_steps * nq_orig
-    //                               target_i = p_i/(1-p_i) * updates,
-    //                               scale_i  = target_i / base_vol.
-    //   --search-scale f          : single variant, scale = f, fraction = -1.
-    //   (neither)                 : single variant, scale = 1, fraction = -1.
     struct SearchVariant { double scale; double fraction; }; // fraction < 0 = not fraction-based
     std::vector<SearchVariant> search_variants;
     {
@@ -745,13 +650,6 @@ int main(int argc, char** argv)
     hnswlib::HierarchicalNSW<float>*  routing_hnsw = nullptr;
 
     // ── Checkpoint detection ──────────────────────────────────────────────────
-    // Rank 0 scans the checkpoint base directory for the highest "ckpt_s<N>"
-    // subdirectory that has a valid metadata.bin.  The loop index of the first
-    // step to execute on resume (next_s = s_of_checkpoint + 1) is broadcast
-    // to all ranks so both coordinator and executor enter the same code path.
-    //
-    // resume_s == 1  →  no checkpoint found, fresh start.
-    // resume_s >  1  →  resume from checkpoint ckpt_base/ckpt_s<resume_s-1>.
     long long ckpt_resume_s_ll = 1LL;
     if (rank == 0) {
         const std::string found = find_latest_checkpoint(ckpt_base);
@@ -794,11 +692,6 @@ int main(int argc, char** argv)
         Coordinator metaIndex(dim, &comm, &logger);
 
         if (!resuming && use_init_state) {
-            // ── Phase 1: load starting state from cluster analysis ────────────
-            // Load meta-HNSW, centroids, counts, label→center, and partitions
-            // produced by runbook_centers.cpp step <init_state_step>,
-            // then distribute the initial batch to executors using that exact
-            // assignment (so the physical shard layout matches the loaded state).
             std::cout << "[Sweep] Loading starting state from cluster analysis: "
                       << init_state_dir << " (step " << init_state_step << "),"
                       << " partitions=" << init_partitions_file << "\n";
@@ -806,10 +699,7 @@ int main(int argc, char** argv)
                                               init_partitions_file, num_partitions,
                                               EF_SEARCH, init_start);
 
-            // Build per-vector preassigned shard list from the loaded
-            // label→center map and partition assignment.  distribute_vectors
-            // indexes preassigned_partitions by absolute global id, so the
-            // vector must span [0, init_start + init_n).
+
             const auto& l2c   = metaIndex.getLabelToCenter();
             const auto& parts = metaIndex.getPartitions();
             std::vector<int> preassigned(static_cast<size_t>(init_start) + init_n, 0);
@@ -841,7 +731,6 @@ int main(int argc, char** argv)
             std::cout << "[Sweep] Initial build complete (from loaded state)\n";
             comm.broadcast_ef_search(EF_SEARCH, world_size);
         } else if (!resuming) {
-            // ── Phase 1: fresh build ──────────────────────────────────────────
             const size_t ss = std::min(static_cast<size_t>(init_n), SAMPLE_SIZE);
             std::vector<float> sample = getSample(base_file, init_n, dim, ss, init_start);
             metaIndex.setSampleData(sample.data(), ss);
@@ -853,9 +742,6 @@ int main(int argc, char** argv)
             std::cout << "[Sweep] Initial build complete\n";
             comm.broadcast_ef_search(EF_SEARCH, world_size);
         } else {
-            // ── Phase 1: resume from checkpoint ──────────────────────────────
-            // Loads metaHNSW, partitions, center pos/counts, and the
-            // authoritative labels_to_centers.bin written during checkpointing.
             std::cout << "[Sweep] Loading coordinator state from "
                       << resume_ckpt << "/coordinator\n";
             metaIndex.load(resume_ckpt + "/coordinator", EF_SEARCH);
@@ -864,7 +750,6 @@ int main(int argc, char** argv)
         routing_hnsw = metaIndex.getMetaHNSW();
 
         // Broadcast routing state to all executors (fresh or resume — same call).
-        // include_ltc=true so label_to_center is also synced on every rank.
         bcastRoutingState(rank, dim,
                           metaIndex.getMetaHNSW(),
                           &metaIndex.getPartitions(),
@@ -874,7 +759,6 @@ int main(int argc, char** argv)
 
         // ── Populate label_to_shard ───────────────────────────────────────────
         // label_to_shard[label] = executor_rank tracks exact ownership so deletes
-        // can be routed without throwing exceptions in hnswlib.
         if (!resuming) {
             // Fresh start: label_to_center is accurate — derive label_to_shard.
             for (auto& [lbl, cid] : label_to_center)
@@ -925,9 +809,6 @@ int main(int argc, char** argv)
         }
 
         // ── Open CSV ─────────────────────────────────────────────────────────
-        // Fresh start: overwrite and write the header.
-        // Always open in append mode: safe for both fresh starts (empty file)
-        // and resumes (header already present from previous run).
         std::ofstream csv(output_file, std::ios::out | std::ios::app);
         if (!csv.is_open()) {
             std::cerr << "ERROR: cannot open output file: " << output_file << "\n";
@@ -935,23 +816,14 @@ int main(int argc, char** argv)
         }
         if (!resuming) {
             csv << "step,operation,mode,param"
-                // search variant's target fraction (-1 for non-search rows and for
-                // search rows produced by --search-scale or no scaling)
                 << ",search_fraction"
-                // num_queries: scaled query count actually run in the timed window
-                // (= nq); -1 for non-search rows.  range_end stays the original
-                // (distinct) query count nq_orig.
                 << ",range_start,range_end,num_queries,time_s,throughput,recall@" << k
                 << ",theoretical_recall@" << k
                 << ",avg_parts_searched"
                 << ",centers_moved,elements_moved"
                 << ",repart_hnsw_s,repart_bottom_s,repart_kaffpa_s,repart_relabel_s"
                 << ",exec_iterate_s,exec_exchange_s,exec_graph_s,dorebuild_wall_s"
-                // actual rebuild variant used ("full" or "delta"); empty for non-rebuild rows.
-                // may differ from the run-level rebuild_mode if tombstone ratio forced full.
                 << ",rebuild_type"
-                // delta-rebuild specific: total unreplaced tombstone slots across shards
-                // (-1 for full rebuilds; 0+ for delta rebuilds)
                 << ",remaining_deleted_slots";
             for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_size";
             csv << "\n";
@@ -969,22 +841,11 @@ int main(int argc, char** argv)
             double      exec_exchange_s           = -1.0;
             double      exec_graph_s              = -1.0;
             double      dorebuild_wall_s          = -1.0;
-            // Sum of remaining unreplaced deleted slots across all shards.
-            // Populated only for delta rebuilds; -1 for full rebuilds.
             long long   remaining_deleted_slots   = -1;
-            // Actual rebuild variant used: "full", "delta", or "" for non-rebuild rows.
-            // May differ from the run-level rebuild_mode when the tombstone ratio
-            // check overrides a delta rebuild to full.
             std::string rebuild_type              = "";
         };
         static const RebuildStats kNoRebuild{};
 
-        // ── Helper: write one CSV row ─────────────────────────────────────────
-        // search_fraction and num_queries default to -1 so non-search callers
-        // (insert/delete/rebuild/initial) need no change; the search caller passes
-        // both.  They are trailing defaulted parameters (must be last) but are
-        // emitted in their header positions (search_fraction after param,
-        // num_queries after range_end).
         auto write_row = [&](int step_num, const std::string& op,
                              const std::string& mode_str, float param_val,
                              int rs, int re,
@@ -1044,11 +905,6 @@ int main(int argc, char** argv)
         };
 
         // ── Helper: sync label_to_shard after rebuild (coordinator side) ──────
-        // Each executor reports labels of vectors that arrived during the rebuild
-        // exchange via Allgatherv.  The coordinator contributes 0 labels and
-        // updates its label_to_shard from the received data.
-        // Must be called on ALL ranks (matching the executor-side lambda below)
-        // after every rebuild + bcastRoutingState sequence.
         auto sync_label_to_shard_after_rebuild_coord = [&]() {
             int my_n = 0;
             std::vector<int> all_ns(world_size);
@@ -1078,18 +934,12 @@ int main(int argc, char** argv)
         // ══════════════════════════════════════════════════════════════════════
         //                    COORDINATOR STREAMING LOOP
         // ══════════════════════════════════════════════════════════════════════
-        // On resume, last_ckpt_dir is initialised to the checkpoint we loaded so
-        // it is removed after the next checkpoint is successfully written.
-        // On a fresh start it remains empty until the first checkpoint is taken.
         std::string last_ckpt_dir = resume_ckpt;
         int my_ckpt_write_ok = 1;  // set in checkpoint block; used by Allreduce
 
         for (size_t s = resume_s; s < steps.size(); s++) {
             const RunbookStep& step = steps[s];
 
-            // Run the rebuild check only once every REBUILD_CHECK_INTERVAL steps.
-            // Computed from the loop index s (identical on every rank), so the
-            // gated tombstone-ratio MPI_Reduce stays in lockstep with the executors.
             const bool rebuild_check_due = (s % REBUILD_CHECK_INTERVAL == 0);
 
             int bcast_buf[3] = { step.step_num, step.start, step.end };
@@ -1196,19 +1046,12 @@ int main(int argc, char** argv)
                     metaIndex.updateCentersForInsertBatch(batch, cids);
                 }
 
-                // Rebuild check.  When maintenance is disabled (full_threshold >=
-                // NCENTERS) no rebuild of any kind may occur, so the whole check —
-                // including the tombstone-ratio reduce — is skipped.  Otherwise
-                // checkNeedRebuild() reports whether the center-movement threshold
-                // is met, and the tombstone-ratio check below can independently
-                // force a full rebuild even when it is not.
                 int    rb_type   = 0;
                 double max_ratio = 0.0;
                 if (maintenance_enabled && rebuild_check_due) {
                     rb_type = metaIndex.checkNeedRebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     // Collect the max tombstone ratio across all executor shards
-                    // (coordinator contributes 0.0).  Symmetric with executor side.
                     double coord_ratio = 0.0;
                     MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
                                MPI_MAX, 0, MPI_COMM_WORLD);
@@ -1232,12 +1075,7 @@ int main(int argc, char** argv)
                                   << (rb_type > 0 ? "\n"
                                                   : " (center-movement threshold not met)\n");
 
-                    // Dispatch.  When checkNeedRebuild() reported a rebuild it has
-                    // cached the repartition, so use the normal delta/full path.
-                    // When the rebuild is forced purely by the tombstone ratio
-                    // (rb_type == 0) there is no cached repartition, so compute and
-                    // dispatch a full rebuild explicitly (same on-wire protocol as
-                    // doRebuildSimple, so executors see a FULL_REBUILD_REQUEST).
+                    // Dispatch  
                     const double t_rb0 = MPI_Wtime();
                     if (rb_type > 0) {
                         if (actual_delta) metaIndex.doRebuildDelta(world_size);
@@ -1268,9 +1106,6 @@ int main(int argc, char** argv)
                     rb_stats.exec_graph_s    = exec_recv[2];
 
                     // Delta rebuild only: collect total remaining deleted slots.
-                    // The executor side gates the matching reduce on hdr.type ==
-                    // INPLACE_REBUILD_REQUEST, sent only for delta rebuilds, so a
-                    // full rebuild (forced or threshold-driven) skips it on both sides.
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
@@ -1356,9 +1191,6 @@ int main(int argc, char** argv)
                         metaIndex.updateCentersForDeleteBatch(valid_vecs, valid_cids);
                 }
 
-                // When maintenance is disabled (full_threshold >= NCENTERS) no
-                // rebuild of any kind may occur, so skip the whole check including
-                // the tombstone-ratio reduce.  Symmetric with the executor side.
                 int    rb_type   = 0;
                 double max_ratio = 0.0;
                 if (maintenance_enabled && rebuild_check_due) {
@@ -1384,10 +1216,7 @@ int main(int argc, char** argv)
                                   << (rb_type > 0 ? "\n"
                                                   : " (center-movement threshold not met)\n");
 
-                    // Dispatch.  Threshold-driven rebuilds reuse the repartition
-                    // cached by checkNeedRebuild(); a purely tombstone-forced
-                    // rebuild (rb_type == 0) has no cache, so compute and dispatch
-                    // a full rebuild explicitly.
+                    // Dispatch
                     const double t_rb0 = MPI_Wtime();
                     if (rb_type > 0) {
                         if (actual_delta) metaIndex.doRebuildDelta(world_size);
@@ -1416,9 +1245,7 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
-                    // Delta rebuild only: collect total remaining deleted slots.
-                    // The executor side gates the matching reduce on hdr.type ==
-                    // INPLACE_REBUILD_REQUEST, so a full rebuild skips it on both sides.
+                    // Delta rebuild only
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
@@ -1468,9 +1295,6 @@ int main(int argc, char** argv)
                 std::vector<float> queries = readVecs(query_file, dim);
                 // nq_orig = distinct queries present in the file.  Each search
                 // variant below scales this to nq = round(nq_orig * variant.scale)
-                // for its TIMED window; the batch is tiled (query q reuses original
-                // q % nq_orig).  Recall/theoretical recall are computed once per
-                // variant over the first tile (q < nq_orig) — the original set + GT.
                 const size_t nq_orig = queries.size() / dim;
 
                 // Load GT once for the whole sweep over this search step.
@@ -1495,16 +1319,8 @@ int main(int argc, char** argv)
                     MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
                 }
 
-                // Pin the routing meta-HNSW search ef for this step.  Done at
-                // search time on every rank because rebuilds and bcastRoutingState
-                // reset routing_hnsw's ef to EF_SEARCH; this guarantees both the
-                // GT->partition lookup and routeQuery use EF_ROUTING (matching the
-                // Python theoretical pipeline's router ef).
                 routing_hnsw->setEf(EF_ROUTING);
 
-                // ── Combo + result buffers (shared across all search variants) ──
-                // ComboResult now carries the variant's search_fraction so each row
-                // is labelled.  combo_results accumulates n_combos * |variants| rows.
                 struct ComboResult {
                     std::string mode_str;
                     float       param;
@@ -1543,31 +1359,6 @@ int main(int argc, char** argv)
                     const size_t my_qe = std::min(my_qs + chunk, nq);
 
                 // ── Theoretical-recall setup ─────────────────────────────
-                // For each query in this rank's slice, resolve its top-K GT
-                // neighbours to the partition that *physically owns* each
-                // neighbour via the exact label_to_shard map (the online
-                // method, matching gp-ann's distributed_insert_bench_sweep.cpp
-                // label_to_shard lookup).  This is the partition the vector was
-                // actually distributed to — kept accurate across delta rebuilds
-                // — rather than the partition a fresh meta-HNSW kNN(1) re-route
-                // would assign it to.  The paper defines theoretical recall over
-                // the partitions that *hold* a query's true neighbours, so the
-                // physical owner is the correct mapping; the re-route was only
-                // an approximation inherited from the offline Python pipeline,
-                // which has no per-vector ownership map.
-                //
-                // label_to_shard is replicated on every rank (derived from
-                // label_to_center / broadcast on resume), so each rank resolves
-                // its own slice with no extra communication.  Deleted/tombstoned
-                // GT ids are absent from the map and stay -1 (counted as misses,
-                // matching gp-ann).  Runs outside the per-combo timing window.
-                //
-                // gt_partitions[q-my_qs] is a per-neighbour vector (length kk,
-                // -1 for unresolved ids) — NOT a set.  This gives the
-                // neighbor-frequency theoretical recall used by the Python
-                // _recall(), which is a strict upper bound on actual recall.
-                // Stores raw partition ids (label_to_shard value − 1), since the
-                // visited set `targets` is keyed by partition_id + 1.
                 std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
                 if (have_gt) {
                     #pragma omp parallel for schedule(static)
@@ -1611,9 +1402,6 @@ int main(int argc, char** argv)
 
                         #pragma omp for nowait schedule(static)
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            // Tiled fetch: scaled query q reuses original query
-                            // (q % nq_orig).  ALL nq scaled queries are routed and
-                            // scattered so the timed window does the full work.
                             float* Q = queries.data() + (q % nq_orig) * dim;
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
@@ -1625,13 +1413,6 @@ int main(int argc, char** argv)
                                 local_qvecs[tgt].insert(local_qvecs[tgt].end(), Q, Q + dim);
                             }
 
-                            // Theoretical recall — computed once, over the first
-                            // tile only (q < nq_orig).  Tile copies carry an empty
-                            // glist, but the explicit gate makes the intent clear.
-                            // Neighbor-frequency form (upper-bounds actual recall):
-                            // for each top-K GT neighbour, check whether its owning
-                            // partition is in the visited set; divide by k.  targets
-                            // stores partition_id + 1; subtract 1 to recover.
                             if (q >= nq_orig) continue;
                             const auto& glist = gt_partitions[q - my_qs];
                             if (!glist.empty()) {
@@ -1686,9 +1467,6 @@ int main(int argc, char** argv)
                         MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                     }
 
-                    // Fused SUM reduce: (total_parts, theo_sum, theo_counted).
-                    // Encoded as double[3] — long long counts fit exactly up
-                    // to 2^53, far above any realistic nq * world_size.
                     double local_sum[3]  = {
                         static_cast<double>(my_total_parts),
                         my_theo_sum,
@@ -1733,10 +1511,6 @@ int main(int argc, char** argv)
                     uint64_t my_hits = 0;
                     if (have_gt) {
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            // Recall over the original query set only (first tile);
-                            // tile copies have no retained neighbours.  Use continue,
-                            // not break, since first-tile queries can be interleaved
-                            // with tile copies within this rank's slice.
                             if (q >= nq_orig || q >= gt.size()) continue;
                             const auto& gt_q  = gt[q];
                             const auto& res_q = neighbors[q - my_qs];
@@ -1751,14 +1525,6 @@ int main(int argc, char** argv)
                     MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
                                MPI_SUM, 0, MPI_COMM_WORLD);
 
-                    // Recall denominator = number of ORIGINAL queries actually
-                    // evaluated = min(nq, nq_orig).  When upscaling (nq >= nq_orig)
-                    // this is the full original set; when downscaling (nq < nq_orig)
-                    // only the first nq queries are searched, so recall is over that
-                    // subset.  Hits were counted only on the first tile (q < nq_orig),
-                    // and the loop bound q < nq makes the evaluated count exactly
-                    // min(nq, nq_orig).  Throughput (qps) uses the SCALED count nq —
-                    // the timed window routed/scattered/searched/returned all nq.
                     const size_t nq_recall = std::min(nq, nq_orig);
                     const double recall = (have_gt && nq_recall > 0)
                         ? static_cast<double>(total_hits) / (static_cast<double>(nq_recall) * k)
@@ -1811,15 +1577,6 @@ int main(int argc, char** argv)
             }
 
             // ── CHECKPOINT ────────────────────────────────────────────────────
-            // Taken at the end of every CHECKPOINT_INTERVAL-th step so the
-            // binary can be restarted from a recent point after a failure.
-            // Protocol:
-            //   1. Write new checkpoint files (coordinator + executor sides).
-            //   2. MPI_Barrier — all ranks finish writing before any deletion.
-            //   3. Rank 0 removes the *previous* checkpoint directory.
-            //
-            // The new checkpoint is completely on disk before the old one is
-            // touched, so the system always has at least one valid checkpoint.
             if (s % CHECKPOINT_INTERVAL == 0) {
                 const std::string ckpt_dir =
                     ckpt_base + "/ckpt_s" + std::to_string(s);
@@ -1828,23 +1585,14 @@ int main(int argc, char** argv)
                 std::cout << "[Sweep] Step " << step.step_num
                           << "  checkpoint -> " << ckpt_dir << "\n";
 
-                // ── 1a. Write coordinator state ───────────────────────────────
-                // coord_write_ok stays 1 only if every coordinator-side write
-                // and fsync below succeeds; it feeds my_ckpt_write_ok so a
-                // partial coordinator write aborts the commit (old checkpoint
-                // kept).
+                // ── Write coordinator state ───────────────────────────────
                 int coord_write_ok = 1;
                 std::filesystem::create_directories(coord_dir);
 
                 // Save meta-HNSW, partitions, center positions, center counts.
-                // (Coordinator::save() also writes labels_to_centers.bin but
-                // that file is stale — it is only populated at build time and
-                // never updated during streaming.  We overwrite it below.)
                 metaIndex.save(coord_dir);
 
-                // fsync every file metaIndex.save() produced. close() alone only
-                // reaches the OS page cache; without fsync a later crash/kill can
-                // lose these bytes even though the program saw a clean return.
+                // fsync every file 
                 {
                     std::error_code ec;
                     for (const auto& e :
@@ -1856,8 +1604,7 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // Overwrite labels_to_centers.bin with the authoritative map
-                // that is kept live via Allgatherv on every INSERT/DELETE step.
+                // Overwrite labels_to_centers.bin
                 {
                     const std::string p = coord_dir + "/labels_to_centers.bin";
                     std::ofstream ltc(p, std::ios::binary | std::ios::trunc);
@@ -1873,8 +1620,6 @@ int main(int argc, char** argv)
                         }
                         ltc.flush();
                         ltc.close();
-                        // Detect short writes (e.g. ENOSPC) that std::ofstream
-                        // swallows, then force the bytes to disk.
                         if (!ltc || !surge::fsync_file(p)) {
                             std::cerr << "[Sweep] ERROR: write/fsync failed for "
                                       << p << "\n";
@@ -1883,10 +1628,7 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // Save label_to_shard for accurate resume.
-                // Mirrors labels_to_centers.bin but stores executor ranks instead
-                // of center IDs, so resume does not depend on deriving ownership
-                // from a potentially stale label_to_center.
+                // Save label_to_shard for accurate resume
                 {
                     const std::string p = coord_dir + "/labels_to_shards.bin";
                     std::ofstream lts(p, std::ios::binary | std::ios::trunc);
@@ -1910,10 +1652,7 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // Write metadata: loop index of the next step to execute on
-                // resume, and the corresponding runbook step_num for sanity.
-                // Written atomically + fsynced via a temp-then-rename so a torn
-                // metadata.bin can never be observed on resume.
+                // Write metadata
                 try {
                     const size_t next_s     = s + 1;
                     const int    step_num_v = step.step_num;
@@ -1928,36 +1667,24 @@ int main(int argc, char** argv)
                     coord_write_ok = 0;
                 }
 
-                // Persist the coordinator + checkpoint directory entries so the
-                // files created above survive a crash (best-effort).
+                // Persist the coordinator + checkpoint directory entries
                 surge::fsync_dir(coord_dir);
                 surge::fsync_dir(ckpt_dir);
 
-                // ── 1b. Executors write their shards (happens concurrently) ──
-                // (Executor side mirrors this block; see executor streaming loop.)
+                // Executors write their shards
 
                 my_ckpt_write_ok = coord_write_ok;
                 if (!my_ckpt_write_ok)
                     std::cerr << "[Sweep] WARNING: coordinator checkpoint write failed "
                               << "at " << ckpt_dir << "\n";
 
-                // ── 2. Barrier + all-ranks write validation ───────────────────
-                // Each rank reports whether its own write succeeded (1/0).
-                // MPI_Allreduce(MIN) gives 1 only if ALL ranks (coordinator and
-                // every executor) durably wrote AND verified their files. If any
-                // rank failed (disk full, fsync error, shard verification), the
-                // checkpoint is NOT committed and the previous one is kept.
+                // ── barrier + all-ranks write validation ───────────────────
                 MPI_Barrier(MPI_COMM_WORLD);
                 int all_ckpt_writes_ok = 0;
                 MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
                               1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
-                // ── 3. Commit (rank 0 writes the marker LAST) ────────────────
-                // Only once every rank confirmed a durable, verified write do we
-                // publish the COMMITTED marker. find_latest_checkpoint() requires
-                // this marker, so a checkpoint is never resumable until all of
-                // its files are guaranteed on disk. The marker write is itself
-                // atomic + fsynced.
+                // ── commit (rank 0 writes the marker LAST) ────────────────
                 if (all_ckpt_writes_ok) {
                     try {
                         surge::atomic_durable_write(
@@ -1973,14 +1700,11 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // ── 4. Barrier so the marker is durable before anyone deletes ─
-                // Executors must not remove their previous shards until the new
-                // checkpoint is committed, otherwise a crash here could leave
-                // neither checkpoint resumable.
+                // ── barrier so the marker is durable before anyone deletes ─
                 MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 MPI_Barrier(MPI_COMM_WORLD);
 
-                // ── 5. Remove the previous checkpoint (rank 0 only) ──────────
+                // ── remove the previous checkpoint ──────────
                 if (all_ckpt_writes_ok) {
                     if (!last_ckpt_dir.empty() &&
                             std::filesystem::exists(last_ckpt_dir)) {
@@ -1995,12 +1719,7 @@ int main(int argc, char** argv)
                     }
                     last_ckpt_dir = ckpt_dir;
                 } else {
-                    // Discard the uncommitted (partial) checkpoint so failed
-                    // attempts don't accumulate and exhaust disk — freeing it
-                    // may also let the next checkpoint succeed. Safe here: every
-                    // rank has passed the barrier above, so nobody is still
-                    // writing into ckpt_dir. last_ckpt_dir still points at the
-                    // previous *committed* checkpoint, which we keep as fallback.
+                    // Discard the uncommitted checkpoint
                     std::error_code ec;
                     std::filesystem::remove_all(ckpt_dir, ec);
                     std::cout << "[Sweep] WARNING: new checkpoint incomplete "
@@ -2069,18 +1788,13 @@ int main(int argc, char** argv)
             label_to_shard.reserve(n_lts);
             for (int j = 0; j < n_lts; j++) label_to_shard[lts_keys[j]] = lts_vals[j];
         }
-
-        // Participate in initial-row size gather (fresh start only; on resume
-        // the gather was already done in the original run).
         if (!resuming) {
             unsigned long long my_size = subIndex.getElementCount();
             MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                        nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
         }
 
-        // ── Helper: sync label_to_shard after rebuild (executor side) ───────────
-        // Contributes this executor's arrived labels via Allgatherv so all ranks
-        // update label_to_shard correctly.  Must match the coordinator-side lambda.
+        // ── Helper: sync label_to_shard after rebuild ───────────
         auto sync_label_to_shard_after_rebuild_exec = [&]() {
             const auto& arrived = subIndex.getLastRebuildMovedLabels();
             const int my_n = static_cast<int>(arrived.size());
@@ -2106,9 +1820,6 @@ int main(int argc, char** argv)
         std::string last_ckpt_dir = resume_ckpt;
 
         for (size_t s = resume_s; s < steps.size(); s++) {
-            // Mirror the coordinator's rebuild-check cadence (see coordinator loop):
-            // gate the tombstone-ratio MPI_Reduce on the same once-every-
-            // REBUILD_CHECK_INTERVAL-steps predicate so the collectives stay matched.
             const bool rebuild_check_due = (s % REBUILD_CHECK_INTERVAL == 0);
 
             int op_code, bcast_buf[3];
@@ -2203,7 +1914,7 @@ int main(int argc, char** argv)
                                    MPI_INT, MPI_COMM_WORLD);
                     for (int i = 0; i < total; i++)
                         label_to_center[all_labels[i]] = all_centers[i];
-                    // Mirror into label_to_shard (routing_partitions is valid here).
+
                     for (int i = 0; i < total; i++) {
                         const int cid = all_centers[i];
                         if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
@@ -2217,11 +1928,7 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                // Tombstone ratio check — contribute this shard's ratio to the
-                // MAX reduce that may trigger a forced full rebuild.  Skipped
-                // entirely when maintenance is disabled (full_threshold >=
-                // NCENTERS), symmetric with the coordinator.  Must be ordered
-                // before the do_rebuild broadcast.
+                // Tombstone ratio check
                 if (maintenance_enabled && rebuild_check_due) {
                     double my_ratio = subIndex.getTombstoneRatio();
                     double dummy_max = 0.0;
@@ -2300,8 +2007,6 @@ int main(int argc, char** argv)
                             my_delete_labels.push_back(label);
                         label_to_shard.erase(it);
                     } else {
-                        // Fallback: label_to_shard entry missing (shouldn't happen
-                        // in steady state; could occur with a pre-fix checkpoint).
                         my_delete_labels.push_back(label);
                     }
                 }
@@ -2313,11 +2018,7 @@ int main(int argc, char** argv)
                     MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
                 }
 
-                // Tombstone ratio check — contribute this shard's ratio to the
-                // MAX reduce that may trigger a forced full rebuild.  Skipped
-                // entirely when maintenance is disabled (full_threshold >=
-                // NCENTERS), symmetric with the coordinator.  Must be ordered
-                // before the do_rebuild broadcast.
+                // Tombstone ratio check
                 if (maintenance_enabled && rebuild_check_due) {
                     double my_ratio = subIndex.getTombstoneRatio();
                     double dummy_max = 0.0;
@@ -2372,10 +2073,6 @@ int main(int argc, char** argv)
             // ── SEARCH (executor side of sweep loop) ──────────────────────────
             } else if (op_code == 2) {
                 std::vector<float> queries = readVecs(query_file, dim);
-                // Mirror coordinator: nq_orig is the distinct query count; each
-                // variant scales it to nq for the timed work.  search_variants,
-                // nq_orig, and the combo list are identical on every rank, so the
-                // per-search collective counts stay in lockstep with the coordinator.
                 const size_t nq_orig = queries.size() / dim;
 
                 // Load GT for recall computation (matches coordinator's load).
@@ -2398,20 +2095,12 @@ int main(int argc, char** argv)
                     routing_center_counts.resize(n);
                     MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
                 }
-
-                // Pin the routing meta-HNSW search ef for this step (mirrors
-                // coordinator).  Reset on every rebuild/bcastRoutingState, so it
-                // must be set here each search step on every rank.
                 routing_hnsw->setEf(EF_ROUTING);
 
-                // Precompute once: routing centers per partition (scale-independent;
-                // mirrors coordinator).
                 std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
                 for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
 
-                // ── Search-variant loop (mirrors coordinator exactly) ─────────────
-                // Same (scale, fraction) list, same order, so the MPI-collective
-                // sequence matches the coordinator and all ranks stay in lockstep.
+                // ── Search-variant loop ─────────────
                 for (const auto& variant : search_variants) {
                     const double search_scale = variant.scale;
                     const size_t nq = (nq_orig == 0) ? 0
@@ -2422,17 +2111,10 @@ int main(int argc, char** argv)
                     const size_t my_qe = std::min(my_qs + chunk, nq);
 
                 // ── Theoretical-recall setup (mirrors coordinator) ───────
-                // Exact GT→partition mapping via the replicated label_to_shard
-                // map (online method, matching gp-ann).  Per-neighbour partition
-                // list (length kk, -1 for unresolved/deleted); neighbor-frequency
-                // recall, divides by k.  Stores raw partition ids
-                // (label_to_shard value − 1); visited set is keyed by id + 1.
                 std::vector<std::vector<int>> gt_partitions(my_qe - my_qs);
                 if (have_gt) {
                     #pragma omp parallel for schedule(static)
                     for (size_t q = my_qs; q < my_qe; q++) {
-                        // First tile only: tile copies (q >= nq_orig) reuse the
-                        // same GT, so resolving them again would be redundant.
                         if (q >= nq_orig || q >= gt.size()) continue;
                         const auto& gt_q = gt[q];
                         const int   kk   = std::min(static_cast<int>(gt_q.size()), k);
@@ -2470,9 +2152,6 @@ int main(int argc, char** argv)
 
                         #pragma omp for nowait schedule(static)
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            // Tiled fetch (mirrors coordinator): scaled query q
-                            // reuses original query (q % nq_orig); all nq queries
-                            // are routed/scattered for the timed window.
                             float* Q = queries.data() + (q % nq_orig) * dim;
                             std::set<int> targets = routeQuery(
                                 Q, routing_hnsw, routing_partitions,
@@ -2584,8 +2263,6 @@ int main(int argc, char** argv)
                         const size_t nres = rcv_rqids[src].size();
                         for (size_t j = 0; j < nres; j++) {
                             const uint32_t qid    = rcv_rqids[src][j];
-                            // First tile only (mirrors coordinator): tile copies are
-                            // searched for timing but their results are not retained.
                             if (qid >= static_cast<uint32_t>(nq_orig)) continue;
                             const size_t q_local  = qid - my_qs;
                             if (q_local >= neighbors.size()) continue;
@@ -2608,10 +2285,6 @@ int main(int argc, char** argv)
                     uint64_t my_hits = 0;
                     if (have_gt) {
                         for (size_t q = my_qs; q < my_qe; q++) {
-                            // Recall over the original query set only (first tile);
-                            // tile copies have no retained neighbours.  Use continue,
-                            // not break, since first-tile queries can be interleaved
-                            // with tile copies within this rank's slice.
                             if (q >= nq_orig || q >= gt.size()) continue;
                             const auto& gt_q  = gt[q];
                             const auto& res_q = neighbors[q - my_qs];
@@ -2649,28 +2322,15 @@ int main(int argc, char** argv)
             }
 
             // ── CHECKPOINT ────────────────────────────────────────────────────
-            // Symmetric with the coordinator block above.  Every executor saves
-            // its sub-HNSW shard, then joins the barrier so rank 0 knows all
-            // writes are complete before it removes the previous checkpoint.
             if (s % CHECKPOINT_INTERVAL == 0) {
                 const std::string ckpt_dir =
                     ckpt_base + "/ckpt_s" + std::to_string(s);
-
-                // Ensure the checkpoint directory exists (create_directories is
-                // idempotent; the coordinator may have created it first via NFS,
-                // or we may arrive first — either way is fine).
                 std::filesystem::create_directories(ckpt_dir);
 
                 // Save this executor's sub-HNSW shard.
-                // Executor::save(prefix) appends "_<rank>.bin" to prefix and
-                // returns the full path written. It now writes to a temp file,
-                // fsyncs, verifies the serialized index is structurally complete,
-                // then atomically renames into place — throwing on any failure.
                 int my_ckpt_write_ok = 1;
                 try {
                     const std::string shard_path = subIndex.save(ckpt_dir + "/shard");
-                    // Defensive belt-and-suspenders: confirm the published file
-                    // is non-empty (save() already verified its integrity).
                     std::error_code shard_ec;
                     const auto shard_sz = std::filesystem::file_size(shard_path, shard_ec);
                     if (shard_ec || shard_sz == 0) my_ckpt_write_ok = 0;
@@ -2682,25 +2342,16 @@ int main(int argc, char** argv)
                 }
 
                 // ── Barrier + all-ranks write validation ──────────────────────
-                // Matches the coordinator's collective sequence exactly:
-                // Barrier -> Allreduce -> Bcast -> Barrier.
                 MPI_Barrier(MPI_COMM_WORLD);
                 int all_ckpt_writes_ok = 0;
                 MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
                               1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
-                // Rank 0 writes the COMMITTED marker between the Allreduce and the
-                // Bcast/Barrier below; it may also clear all_ckpt_writes_ok if the
-                // marker write fails. Receive its authoritative verdict, then wait
-                // at the barrier so the marker is durable before we delete shards.
+                // Rank 0 writes the COMMITTED marker between the Allreduce and the Bcast/Barrier below
                 MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 MPI_Barrier(MPI_COMM_WORLD);
 
                 // ── Delete old checkpoint (this rank's local copy) ────────────
-                // Only delete once the new checkpoint is COMMITTED (all ranks OK
-                // and rank 0's marker written). ~/surge may be local to each node
-                // rather than NFS-shared, so every rank removes its own old copy.
-                // remove_all on a missing path is a no-op (idempotent on NFS).
                 if (all_ckpt_writes_ok) {
                     if (!last_ckpt_dir.empty()) {
                         std::error_code ec;
@@ -2708,10 +2359,7 @@ int main(int argc, char** argv)
                     }
                     last_ckpt_dir = ckpt_dir;
                 } else {
-                    // Uncommitted checkpoint: remove this rank's partial copy so
-                    // it doesn't pile up and consume disk. last_ckpt_dir still
-                    // points at the previous committed checkpoint (kept as
-                    // fallback). Safe: past the barrier, nobody is still writing.
+                    // remove uncommitted checkpoint
                     std::error_code ec;
                     std::filesystem::remove_all(ckpt_dir, ec);
                 }

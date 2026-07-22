@@ -1,41 +1,17 @@
-// =============================================================================
 // runbook_centers.cpp
 //
-// Per-step routing-state generator.  Replays a Big-ANN streaming runbook and,
-// for every update step, produces the coordinator's routing state used by the
-// theoretical-recall pipeline and by dynamic_runbook_experiment's
-// --init-state-dir starting state.
-//
-// KaHIP partitioning of the emitted base layer is handled separately by
+// Per-step routing-state generator. Replays a Big-ANN streaming runbook and, for
+// every update step, produces the coordinator's routing state used by the
+// theoretical-recall pipeline and by dynamic_runbook_experiment's --init-state-dir
+// starting state. KaHIP partitioning of the emitted base layer is handled by
 // runbook_partitions_parallel.cpp.
 //
-// Output per update step:
-//   step_NNNNNN_centers.csv        - k x dim float32 centroids
-//   step_NNNNNN_center_counts.csv  - k int32 cluster sizes (plain decimal)
-//   step_NNNNNN_hnsw.bin           - hnswlib routing index (for recall eval)
-//   step_NNNNNN_base_layer.csv     - base-layer edge list (input to partitioner)
+// Output per step: step_NNNNNN_{centers.csv, center_counts.csv, hnsw.bin,
+// base_layer.csv}. KMeans and HNSW assignment are seeded (mt19937(42), hnswlib
+// seed 100) so runs are reproducible; see --help for the full flag list.
 //
-// Build:   make experiments        (produces bin/runbook_centers)
-//
-// Run (example):
-//   ./bin/runbook_centers \
-//       --dataset  msturing-100M-clustered \
-//       --centers  10000 \
-//       --out-dir  cluster_history_msturing-100M-clustered_10000
-//
-// KMeans and HNSW assignment are seeded (mt19937(42), hnswlib seed 100) so runs
-// are reproducible.
-//
-// Optional flags:
-//   --initial-centers <centers.csv>
-//   --load-state-assignments <point_to_centroid.csv>
-//       Start from a fixed centroid set and point->centroid assignment instead
-//       of running the first-batch KMeans + HNSW assignment.  Use both together
-//       to resume from a previously generated step-1 state.
-//   --ignore-zero-counts      Build HNSW over all k nodes but drop edges
-//                             incident to empty (zero-count) centroids.
-//   --skip-zero-count-inserts Do not insert empty centroids into the HNSW at all.
-// =============================================================================
+// Usage:  ./bin/runbook_centers --dataset <dataset> --centers 10000 \
+//             --out-dir cluster_history_<dataset>_10000
 #include <algorithm>
 #include <cassert>
 #include <cmath>

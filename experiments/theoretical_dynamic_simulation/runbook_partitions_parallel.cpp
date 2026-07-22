@@ -1,3 +1,12 @@
+// runbook_partitions_parallel.cpp
+//
+// KaHIP partitioner for the theoretical-recall simulation. For each
+// step_NNNNNN_base_layer.csv produced by runbook_centers, partitions the base
+// layer into <num_partitions> blocks and writes step_NNNNNN_partitions.csv,
+// matching each step to the previous one to minimize relabeling (drift phi).
+//
+// Usage:  ./bin/runbook_partitions_parallel <input_dir> [output_dir] <num_partitions>
+
 #include <algorithm>
 #include <cmath>
 #include <csignal>

@@ -1,3 +1,8 @@
+// utils.cpp
+//
+// Dataset registry (DATASETS) and shared I/O helpers: file-format detection,
+// vector and ground-truth readers, and sampling.
+
 #include "utils.h"
 
 // ─────────────────────────────────────────────────────────────────────────────

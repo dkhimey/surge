@@ -1,29 +1,12 @@
 // static_qps.cpp
 //
-// Static-index throughput benchmark.
+// Distributed static recall-vs-QPS benchmark. Loads a pre-built static index
+// (from static_partitioning) and sweeps all three routing modes
+// (BranchingFactor / NProbe / RecallTarget) over their parameter grids; no
+// inserts, deletes, or rebuilds.
 //
-// Design notes:
-//  - All MPI ranks hold a local copy of the routing state (meta-HNSW +
-//    partitions) and participate in query dispatch via AllToAllV, matching the
-//    setup of dynamic_runbook_experiment.cpp and gp-ann's distributed bench.
-//    This avoids a coordinator dispatch bottleneck and keeps executors busy.
-//  - Timing follows gp-ann's distributed_bench.cpp: every rank measures its
-//    own wall time, then MPI_Reduce(MAX) gives the true end-to-end time.
-//  - Sweeps all three routing modes and their full parameter grids, identical
-//    to the grids in dynamic_runbook_experiment.cpp.
-//  - Loads a pre-built static index; no insert / delete / rebuild logic.
-//
-// ─── Usage ───────────────────────────────────────────────────────────────────
-//   mpirun -np <P+1> ./static_qps \
-//       <dataset> <num_partitions> <k> <output_file>
-//
-// ─── Sweep parameter grids ───────────────────────────────────────────────────
-//   BranchingFactor : {1, 2, 5, 10, 15, 20, 25, 30}
-//   NProbe          : {1, 2, 3, 4, 5, 6, 7, 8, 9}
-//   RecallTarget    : {0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.97, 0.98, 0.99}
-//
-// ─── Output CSV columns ──────────────────────────────────────────────────────
-//   mode, param, recall@<k>, qps, avg_parts_searched
+// Usage:  mpirun -np <P+1> ./static_qps <dataset> <num_partitions> <k> <output_file>
+// Output: CSV with columns mode, param, recall@<k>, qps, avg_parts_searched
 
 #include <algorithm>
 #include <cassert>

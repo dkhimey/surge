@@ -1,3 +1,12 @@
+// static_partitioning.cpp
+//
+// Builds the static distributed index: a k-means routing layer partitioned with
+// KaHIP, then distributes the vectors and builds each worker's local HNSW shard.
+// Saves the coordinator and per-worker indices to <dataset>_<num_partitions>/,
+// which static_qps then loads.
+//
+// Usage:  mpirun -np <P+1> ./static_partitioning <dataset> <num_partitions>
+
 #include <iostream>
 #include <mpi.h>
 #include <omp.h>
