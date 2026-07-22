@@ -109,36 +109,26 @@ static std::set<int> routeQuery(
     } else { // RecallTarget
         float recall_target = std::clamp(param, 0.0f, 1.0f);
         const size_t ncenters = hnsw->getCurrentElementCount();
-        // knn scales as recall_target^13 * 113.9574: 0.60->1, 0.90->29, 0.99->100.
-        const double rt = static_cast<double>(recall_target);
-        const double rt2 = rt * rt;
-        const double rt4 = rt2 * rt2;
-        const double rt8 = rt4 * rt4;
-        size_t knn = std::min(
-            ncenters,
-            static_cast<size_t>(std::ceil(rt8 * rt4 * rt * 113.9574)));
+        size_t knn = std::min<size_t>(50, ncenters);
         auto centers = hnsw->searchKnnCloserFirst(vec, knn);
         if (centers.empty()) return target_ranks;
 
-        const double d0_raw   = static_cast<double>(centers[0].first);
-        const double dmax_raw = static_cast<double>(centers.back().first);
-        // Normalise by spread: [d_0, d_max] -> [0, 1]
-        const double d_spread = (dmax_raw - d0_raw) + 1e-10;
+        // Per-partition size prior: number of centers assigned to each partition.
+        std::vector<int> part_size(static_cast<size_t>(num_partitions), 0);
+        for (int p : partitions) ++part_size[static_cast<size_t>(p)];
 
-        // Accumulate per-partition scores: |rho(c)| * exp(-(d_r - d_0) / d_spread)
+        // Accumulate per-partition scores: size(pid) * exp(-d_r / d_0),
+        // distances normalised against the nearest center.
+        const double d0 = static_cast<double>(centers[0].first) + 1e-10;
         std::vector<double> part_probs(static_cast<size_t>(num_partitions), 0.0);
         for (size_t r = 0; r < centers.size(); r++) {
-            const double rel_d = (static_cast<double>(centers[r].first) - d0_raw)
-                                 / d_spread;
-            const int    pid   = partitions[static_cast<int>(centers[r].second)];
-            const double wt    = static_cast<double>(
-                                     center_counts[static_cast<int>(centers[r].second)])
-                                 * std::exp(-rel_d);
-            part_probs[static_cast<size_t>(pid)] += wt;
+            const double rel_d   = static_cast<double>(centers[r].first) / d0;
+            const int    pid     = partitions[static_cast<int>(centers[r].second)];
+            const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
+            part_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-rel_d);
         }
 
-        double prob_sum = 0.0;
-        for (double p : part_probs) prob_sum += p;
+        double prob_sum = std::accumulate(part_probs.begin(), part_probs.end(), 0.0);
         if (prob_sum <= 0.0) {
             target_ranks.insert(partitions[static_cast<int>(centers[0].second)] + 1);
             return target_ranks;

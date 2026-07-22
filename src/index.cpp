@@ -58,6 +58,16 @@ Coordinator::Coordinator(
     std::cout << "[Coordinator]: Instantiated.\n";
 }
 
+Coordinator::~Coordinator() {
+    // Destroy the HNSW graphs before the space they were built from.
+    delete meta_HNSW_;
+    delete cached_new_meta_HNSW_;
+    delete space_;
+    // Free any inserts still buffered from an interrupted rebuild. Each entry
+    // owns a new float[dim_] buffer (see handle_insert / handle_inserts).
+    for (auto& entry : insert_log_) delete[] entry.first;
+}
+
 void Coordinator::setSampleData(float* data, size_t count) {
     sample_data_ = data;
     sample_count_ = count;
@@ -72,7 +82,10 @@ std::pair<std::vector<int>, std::vector<int>> Coordinator::getBottomLayer_(hnswl
 
 
     {
-        if (graph == meta_HNSW_) std::shared_lock lock(graph_mutex_);
+        // Hold the shared lock for the whole traversal when reading the live
+        // meta-HNSW (defer_lock + conditional lock keeps it scoped to this block).
+        std::shared_lock<std::shared_mutex> lock(graph_mutex_, std::defer_lock);
+        if (graph == meta_HNSW_) lock.lock();
         for (int i = 0; i < ncenters_; i++) {
             auto bottom = graph->get_linklist_at_level(i, 0);
             int nlinks = graph->getListCount(bottom);
@@ -191,6 +204,7 @@ std::vector<std::pair<float, hnswlib::labeltype>> Coordinator::findClosestCenter
     std::vector<std::pair<float, hnswlib::labeltype>> centers;
     if (meta_HNSW_ == nullptr) {
         std::cerr << "[Coordinator] HNSW not initialized.\n";
+        return centers;
     }
 
     centers = meta_HNSW_->searchKnnCloserFirst(vec, n);
@@ -283,12 +297,16 @@ void Coordinator::updateCentersForDelete_(std::vector<float>& vec, int closest_c
     {
         std::unique_lock lock(center_mutex_);
         int count = center_counts_[closest_center_label];
-        for (int i = 0; i < dim_; i++) {
-            float orig_center_i = centers_[closest_center_idx + i];
+        if (count > 1) {
+            for (int i = 0; i < dim_; i++) {
+                float orig_center_i = centers_[closest_center_idx + i];
 
-            centers_[closest_center_idx + i] = (orig_center_i * count - vec[i]) / (count - 1);
+                centers_[closest_center_idx + i] = (orig_center_i * count - vec[i]) / (count - 1);
+            }
         }
-        center_counts_[closest_center_label]--;
+        // If count <= 1 the center becomes empty; leave coordinates as-is to
+        // avoid a divide-by-zero (matches updateCentersForDeleteBatch).
+        center_counts_[closest_center_label] = std::max(count - 1, 0);
     }
 }
 
@@ -391,12 +409,11 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int 
 }
 
 std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, float recall_target, float* dist) {
-    // knn scales as recall_target^13 * 113.9574: 0.60->1, 0.90->29, 0.99->100.
-    const double rt_ = static_cast<double>(std::clamp(recall_target, 0.0f, 1.0f));
-    const double rt2_ = rt_ * rt_; const double rt4_ = rt2_ * rt2_;
-    const double rt8_ = rt4_ * rt4_;
-    size_t knn = std::min(ncenters_,
-        static_cast<size_t>(std::ceil(rt8_ * rt4_ * rt_ * 113.9574)));
+    recall_target = std::clamp(recall_target, 0.0f, 1.0f);
+
+    // Fetch a fixed candidate set of the nearest centers, then weight each
+    // partition by its size and the query's proximity to its centers.
+    const size_t knn = std::min<size_t>(50, ncenters_);
     std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, knn);
 
     if (centers.empty()) {
@@ -407,33 +424,19 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
         *dist = centers[0].first;
     }
 
-    // Spread-normalised weights: map [d_0, d_max] -> [0,1] so the nearest
-    // centroid always gets exp(0)=1 and the farthest exp(-1)~=0.37.
-    const double d0_raw_   = static_cast<double>(centers.front().first);
-    const double dmax_raw_ = static_cast<double>(centers.back().first);
-    const double d_spread_ = (dmax_raw_ - d0_raw_) + 1e-10;
+    // Per-partition size prior: number of centers assigned to each partition.
+    // Derived from partitions[] so it is valid even before any vectors are
+    // routed (e.g. theoretical_partitioning_quality).
+    std::vector<int> part_size(num_partitions_, 0);
+    for (int p : partitions) ++part_size[static_cast<size_t>(p)];
 
-    // Choose the size prior: if any center_counts_ entry is nonzero the
-    // index has seen real vectors and we use per-center membership counts.
-    // Otherwise (e.g. build() was called but no vectors were ever routed,
-    // as in theoretical_partitioning_quality) fall back to the number of
-    // centers assigned to each partition — always derivable from partitions[].
-    bool counts_live = false;
-    for (int c : center_counts_) { if (c > 0) { counts_live = true; break; } }
-
-    std::vector<int> part_size;
-    if (!counts_live) {
-        part_size.assign(num_partitions_, 0);
-        for (int p : partitions) ++part_size[static_cast<size_t>(p)];
-    }
-
+    // Distances normalised against the nearest center (d / d0).
+    const double d0 = static_cast<double>(centers[0].first) + 1e-10;
     std::vector<double> partition_probs(num_partitions_, 0.0);
     for (const auto& [d, center_id] : centers) {
         const int    pid     = partitions[center_id];
-        const double rel_d   = (static_cast<double>(d) - d0_raw_) / d_spread_;
-        const double size_wt = counts_live
-            ? static_cast<double>(center_counts_[center_id])
-            : static_cast<double>(part_size[static_cast<size_t>(pid)]);
+        const double rel_d   = static_cast<double>(d) / d0;
+        const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
         partition_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-rel_d);
     }
 
@@ -448,8 +451,6 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
     std::sort(ordered_pids.begin(), ordered_pids.end(), [&](size_t a, size_t b) {
         return partition_probs[a] > partition_probs[b];
     });
-
-    recall_target = std::clamp(recall_target, 0.0f, 1.0f);
 
     std::vector<size_t> visited_partitions;
     double recall_estimate = 0.0;
@@ -478,8 +479,9 @@ std::vector<size_t> Coordinator::getPartitionsForInsert_(float* vec, size_t labe
     return convertCentersToPartitions_(centers, dist);
 }
 std::vector<size_t> Coordinator::getPartitionsForDelete_(size_t label) {
-    // std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, 1);
-    int center_idx = label_to_center_[label];
+    auto it = label_to_center_.find(label);
+    if (it == label_to_center_.end()) return {};
+    int center_idx = it->second;
     size_t partition = partitions[center_idx];
     return std::vector<size_t>{partition};
 }
@@ -771,7 +773,7 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
         int label = entry.second;
         handle_insert(insert_vector, label, label, dummy_distances, dummy_completed);
 
-        free(insert_vector); // allocated persistent copies when logging
+        delete[] insert_vector; // matches new float[dim_] used when logging
     }
 
     for (int label : local_deletes) {
@@ -807,7 +809,7 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
     // }
 
     if (rebuild_pending_.exchange(false)) {
-        return reBuild(world_size, full_threshold, partial_threshold);
+        return reBuild(world_size, ef_construction, M_meta, full_threshold, partial_threshold);
     }
 
     if (rebuild_type == FULL_REBUILD_REQUEST)
@@ -1519,10 +1521,13 @@ void Coordinator::handle_inserts(std::vector<float>& insert_vectors, std::vector
 
     if (cur == REBUILDING) {
         std::lock_guard<std::mutex> lock(insert_log_mutex_);
-        float* persistent_vecs = new float[insert_vectors.size()];
-        memcpy(persistent_vecs, insert_vectors.data(), sizeof(float) * insert_vectors.size());
+        // Allocate one owning buffer per entry so the drain path can free each
+        // with a matching delete[] (see reBuild). A single block with interior
+        // pointers cannot be freed element-by-element.
         for (size_t i = 0; i < labels.size(); i++) {
-            insert_log_.push_back({persistent_vecs + i * dim_, labels[i]});
+            float* persistent_vec = new float[dim_];
+            memcpy(persistent_vec, insert_vectors.data() + i * dim_, sizeof(float) * dim_);
+            insert_log_.push_back({persistent_vec, labels[i]});
         }
         return;
     }
@@ -1590,7 +1595,9 @@ bool Coordinator::handle_delete(int label, int world_size) {
 
     bool success = false;
     std::vector<float> vec(dim_);
-    int center_idx = label_to_center_[label];
+    auto it = label_to_center_.find(label);
+    if (it == label_to_center_.end()) return false;
+    int center_idx = it->second;
     int partition = partitions[center_idx];
     comm_->send_delete(label, partition + 1, tag);
     if (comm_->recv_ack(DELETE_SUCCESS, partition + 1, tag)) {
@@ -1621,7 +1628,9 @@ void Coordinator::handle_deletes(const std::vector<int>& labels, int world_size)
     #pragma omp parallel for
     for (size_t i = 0; i < labels.size(); i++) {
         int label = labels[i];
-        int center = label_to_center_[label];
+        auto it = label_to_center_.find(label);
+        if (it == label_to_center_.end()) continue;
+        int center = it->second;
         size_t partition = partitions[center];
         #pragma omp critical
         {
@@ -1696,6 +1705,12 @@ Executor::Executor(int node_id, int dim, Communicator& comm, Log* logger)
     if (logger) logger_ = logger;
     space_ = new hnswlib::L2Space(dim_);
     computeDistance_ = [this](float* a, float* b) { return computeEuclideanDistance(a, b, dim_); };
+}
+
+Executor::~Executor() {
+    // Destroy the HNSW before the space it was built from.
+    delete sub_HNSW_;
+    delete space_;
 }
 
 void Executor::setData(float* data, int* indices, size_t count) {
@@ -1800,12 +1815,16 @@ void Executor::partialReBuild(
     MPI_Recv(buffer.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     // std::cout << "[Executor " << node_id_ << "] RECEIVED meta HNSW\n";
 
-    std::ofstream outfile("tmp_hnsw_received.bin", std::ios::binary);
+    // Node-unique temp path so executors sharing a working directory
+    // (e.g. single-node mpirun) don't clobber each other's meta-HNSW.
+    const std::string meta_tmp_path =
+        "tmp_hnsw_received_r" + std::to_string(node_id_) + ".bin";
+    std::ofstream outfile(meta_tmp_path, std::ios::binary);
     outfile.write(buffer.data(), meta_size);
     outfile.close();
 
     hnswlib::HierarchicalNSW<float>* metaHNSW =
-        new hnswlib::HierarchicalNSW<float>(space_, "tmp_hnsw_received.bin");
+        new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
 
     // Step 3: Receive partition mapping
     std::vector<int> partitions(ncenters);
@@ -1947,12 +1966,15 @@ void Executor::reBuild(
     std::vector<char> buffer(meta_size);
     MPI_Recv(buffer.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    // Wrap buffer in stream and load
-    std::ofstream outfile("tmp_hnsw_received.bin", std::ios::binary);
+    // Wrap buffer in stream and load (node-unique path to avoid cross-executor
+    // collisions when a working directory is shared).
+    const std::string meta_tmp_path =
+        "tmp_hnsw_received_r" + std::to_string(node_id_) + ".bin";
+    std::ofstream outfile(meta_tmp_path, std::ios::binary);
     outfile.write(buffer.data(), meta_size);
     outfile.close();
 
-    hnswlib::HierarchicalNSW<float>* metaHNSW = new hnswlib::HierarchicalNSW<float>(space_, "tmp_hnsw_received.bin");
+    hnswlib::HierarchicalNSW<float>* metaHNSW = new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
 
     std::vector<int> partitions(ncenters);
     MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1966,7 +1988,7 @@ void Executor::reBuild(
     // check which elements stay and move
     bool first_inserted = false;
     int idx = 0;
-    int num_kept;
+    int num_kept = 0;
     while (!first_inserted && idx < active_count) { // first insert into HNSW must be sequential
         float* vec = active_vectors[idx];
         //  data_+ (idx * dim_);
@@ -2269,19 +2291,13 @@ void Executor::reBuildDelta(
     std::cout << "[Executor " << node_id_ << "] delta rebuild exchange: arrived="
               << total_recv << "\n";
 
-    // After the mark-delete pass, sub_HNSW_->num_deleted_ counts every slot
-    // currently available for reuse (including any prior stream-deleted elements
-    // that were never replaced).  Incoming insertions with replace_deleted=true
-    // fill those slots first; only the excess needs new capacity.
+    // Reserve capacity conservatively
     {
-        const size_t total_freed = sub_HNSW_->num_deleted_.load();
-        if (static_cast<size_t>(total_recv) > total_freed) {
-            const size_t net_new = static_cast<size_t>(total_recv) - total_freed;
-            std::unique_lock<std::shared_mutex> lk(graph_mutex_);
-            const size_t needed = sub_HNSW_->getCurrentElementCount() + net_new;
-            if (needed > sub_HNSW_->getMaxElements())
-                sub_HNSW_->resizeIndex(needed);
-        }
+        std::unique_lock<std::shared_mutex> lk(graph_mutex_);
+        const size_t needed = sub_HNSW_->getCurrentElementCount()
+                            + static_cast<size_t>(total_recv);
+        if (needed > sub_HNSW_->getMaxElements())
+            sub_HNSW_->resizeIndex(needed);
     }
 
     double start_hnsw = MPI_Wtime();
@@ -2364,12 +2380,15 @@ void Executor::reBuildReplace(
     std::vector<char> buffer(meta_size);
     MPI_Recv(buffer.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    std::ofstream outfile("tmp_hnsw_received.bin", std::ios::binary);
+    // Node-unique temp path to avoid cross-executor collisions on a shared cwd.
+    const std::string meta_tmp_path =
+        "tmp_hnsw_received_r" + std::to_string(node_id_) + ".bin";
+    std::ofstream outfile(meta_tmp_path, std::ios::binary);
     outfile.write(buffer.data(), meta_size);
     outfile.close();
 
     hnswlib::HierarchicalNSW<float>* metaHNSW =
-        new hnswlib::HierarchicalNSW<float>(space_, "tmp_hnsw_received.bin");
+        new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
 
     std::vector<int> partitions(ncenters);
     MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -2545,23 +2564,11 @@ void Executor::insertLocalBatch(const std::vector<float>& vecs,
 
     // Phase 1: capacity check and resize under exclusive lock.
     //
-    // With replace_deleted=true (used in Phase 2), each addPoint reuses a
-    // tombstone slot before claiming a fresh one.  The number of new internal
-    // IDs actually needed is therefore:
-    //
-    //   net_new = incoming - min(num_deleted_, incoming)
-    //
-    // getCurrentElementCount() is the high-water mark of ever-allocated
-    // internal IDs (live + tombstones, but NOT counting reused slots twice),
-    // so the true needed capacity is current + net_new.
-    // num_deleted_ is atomic so it is safe to read under the exclusive lock.
+    // Reserve conservatively
     {
         std::unique_lock<std::shared_mutex> lk(graph_mutex_);
-        const size_t current  = sub_HNSW_->getCurrentElementCount();
-        const size_t deleted  = sub_HNSW_->num_deleted_.load();
-        const size_t reusable = std::min(deleted, incoming);
-        const size_t net_new  = incoming - reusable;
-        const size_t needed   = current + net_new;
+        const size_t current = sub_HNSW_->getCurrentElementCount();
+        const size_t needed  = current + incoming;
         if (needed > sub_HNSW_->getMaxElements()) {
             const size_t new_max = std::max(
                 needed,

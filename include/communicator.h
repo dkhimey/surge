@@ -204,11 +204,15 @@ public:
         std::vector<char> buffer(meta_size);
         MPI_Recv(buffer.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-        std::ofstream outfile("tmp_hnsw_received.bin", std::ios::binary);
+        // Rank-unique temp path so ranks sharing a working directory don't
+        // overwrite each other's received meta-HNSW.
+        const std::string recv_path =
+            "tmp_hnsw_received_r" + std::to_string(rank) + ".bin";
+        std::ofstream outfile(recv_path, std::ios::binary);
         outfile.write(buffer.data(), meta_size);
         outfile.close();
 
-        metaHNSW = new hnswlib::HierarchicalNSW<float>(space, "tmp_hnsw_received.bin");
+        metaHNSW = new hnswlib::HierarchicalNSW<float>(space, recv_path);
     }
 
     void recv_partitions(std::vector<int>& partitions, int kmeans_centers) {

@@ -28,6 +28,13 @@ public:
         Log* logger
     );
 
+    ~Coordinator();
+
+    // Owns raw pointers (space_, meta_HNSW_, cached rebuild graph); non-copyable
+    // to avoid double-free. Only ever constructed in place / on the heap.
+    Coordinator(const Coordinator&)            = delete;
+    Coordinator& operator=(const Coordinator&) = delete;
+
     void setSampleData(float* data, size_t count);
     void build(
         int ncenters,
@@ -207,7 +214,7 @@ private:
 
     hnswlib::SpaceInterface<float>* space_;
     std::function<float(float*, float*)> computeDistance_;
-    hnswlib::HierarchicalNSW<float>* meta_HNSW_;
+    hnswlib::HierarchicalNSW<float>* meta_HNSW_ = nullptr;
 
     std::mt19937 gen_;
 
@@ -263,6 +270,12 @@ private:
 class Executor {
 public:
     Executor(int node_id, int dim, Communicator& comm, Log* logger = nullptr);
+
+    ~Executor();
+
+    // Owns raw pointers (space_, sub_HNSW_); non-copyable to avoid double-free.
+    Executor(const Executor&)            = delete;
+    Executor& operator=(const Executor&) = delete;
 
     void receiveData(size_t nrecv_vecs);
     void setData(float* data, int* indices, size_t count);
@@ -354,7 +367,7 @@ public:
 private:
     Communicator& comm_;
 
-    hnswlib::HierarchicalNSW<float>* sub_HNSW_;
+    hnswlib::HierarchicalNSW<float>* sub_HNSW_ = nullptr;
 
     mutable std::shared_mutex graph_mutex_;
     // when inserting, each thread holds the shared lock, when swapping hnsw in final step, get exclusive lock
