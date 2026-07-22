@@ -72,22 +72,6 @@ constexpr int    QUERY_BATCH_SIZE = 100000;
 // Format is detected from the file extension; use --vector-type to override.
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum class VecType { f32, u8, i8 };
-
-static VecType vec_type_from_path(const std::string& path) {
-    if (path.size() >= 6 && path.substr(path.size() - 6) == ".u8bin") return VecType::u8;
-    if (path.size() >= 6 && path.substr(path.size() - 6) == ".i8bin") return VecType::i8;
-    return VecType::f32;  // .fbin or anything else
-}
-
-static std::string vec_type_name(VecType vt) {
-    switch (vt) {
-        case VecType::u8:  return "uint8";
-        case VecType::i8:  return "int8";
-        default:           return "float32";
-    }
-}
-
 // Returns {num_points, dim}  – header format is identical for all three types
 static std::pair<uint32_t, uint32_t> fbin_header(const std::string& filename) {
     std::ifstream f(filename, std::ios::binary);
@@ -99,59 +83,17 @@ static std::pair<uint32_t, uint32_t> fbin_header(const std::string& filename) {
     return {n, d};
 }
 
-// Read vectors [start, end) and return them as float32.
-// bytes_per_elem: 4 for float32, 1 for uint8/int8.
+
 static std::vector<float> read_vec_slice(const std::string& filename,
-                                          uint32_t start, uint32_t end,
-                                          VecType vtype)
+                                          uint32_t start, uint32_t end)
 {
-    std::ifstream f(filename, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open: " + filename);
-
-    uint32_t num_points, dim;
-    f.read(reinterpret_cast<char*>(&num_points), sizeof num_points);
-    f.read(reinterpret_cast<char*>(&dim),        sizeof dim);
-
+    auto [num_points, dim] = fbin_header(filename);
+    uint32_t count = end - start;
     if (end > num_points)
         throw std::runtime_error(
             "read_vec_slice: [" + std::to_string(start) + "," +
             std::to_string(end) + ") exceeds " + std::to_string(num_points));
-
-    const uint32_t count  = end - start;
-    const size_t   n_elem = static_cast<size_t>(count) * dim;
-
-    std::vector<float> data(n_elem);
-
-    if (vtype == VecType::f32) {
-        f.seekg(8 + static_cast<uint64_t>(start) * dim * sizeof(float), std::ios::beg);
-        f.read(reinterpret_cast<char*>(data.data()),
-               static_cast<std::streamsize>(n_elem * sizeof(float)));
-        if (!f)
-            throw std::runtime_error("read_vec_slice(f32): short read for [" +
-                                      std::to_string(start) + "," + std::to_string(end) + ")");
-    } else if (vtype == VecType::u8) {
-        f.seekg(8 + static_cast<uint64_t>(start) * dim * sizeof(uint8_t), std::ios::beg);
-        std::vector<uint8_t> raw(n_elem);
-        f.read(reinterpret_cast<char*>(raw.data()),
-               static_cast<std::streamsize>(n_elem));
-        if (!f)
-            throw std::runtime_error("read_vec_slice(u8): short read for [" +
-                                      std::to_string(start) + "," + std::to_string(end) + ")");
-        for (size_t i = 0; i < n_elem; ++i)
-            data[i] = static_cast<float>(raw[i]);
-    } else {  // i8
-        f.seekg(8 + static_cast<uint64_t>(start) * dim * sizeof(int8_t), std::ios::beg);
-        std::vector<int8_t> raw(n_elem);
-        f.read(reinterpret_cast<char*>(raw.data()),
-               static_cast<std::streamsize>(n_elem));
-        if (!f)
-            throw std::runtime_error("read_vec_slice(i8): short read for [" +
-                                      std::to_string(start) + "," + std::to_string(end) + ")");
-        for (size_t i = 0; i < n_elem; ++i)
-            data[i] = static_cast<float>(raw[i]);
-    }
-
-    return data;
+    return readVecs(filename, dim, static_cast<int>(count), static_cast<int>(start));
 }
 
 
@@ -710,7 +652,6 @@ int main(int argc, char* argv[]) {
     std::string runbook_path, dataset_key, vector_path, out_dir;
     std::string initial_centers_file;
     std::string load_state_assignments_file;
-    std::string vector_type_override;
     int  k           = 1000;
     int  kmeans_ninit = 1;         // match sklearn>=1.2 default for k-means++
     int  ef_search   = HNSW_EF_SEARCH;
@@ -726,7 +667,6 @@ int main(int argc, char* argv[]) {
         else if (a == "--initial-centers"          && i + 1 < argc) initial_centers_file        = argv[++i];
         else if (a == "--load-state-assignments"   && i + 1 < argc) load_state_assignments_file = argv[++i];
         else if (a == "--ef-search"                && i + 1 < argc) ef_search                   = std::stoi(argv[++i]);
-        else if (a == "--vector-type"              && i + 1 < argc) vector_type_override        = argv[++i];
         else if (a == "--ignore-zero-counts"       || a == "--ignore-zero-count")  mode = 1;
         else if (a == "--skip-zero-count-inserts"  || a == "--skip-zero-count-insert") mode = 2;
         else if (a == "--verbose")  verbose = true;
@@ -760,23 +700,10 @@ int main(int argc, char* argv[]) {
     if (out_dir.empty())
         out_dir = "cluster_history_" + dataset_key + "_" + std::to_string(k);
 
-    // ── Vector element type ───────────────────────────────────────────────────
-    if (!vector_type_override.empty()) {
-        if      (vector_type_override == "f32")  vtype = VecType::f32;
-        else if (vector_type_override == "u8")   vtype = VecType::u8;
-        else if (vector_type_override == "i8")   vtype = VecType::i8;
-        else {
-            std::cerr << "Error: unknown --vector-type '" << vector_type_override
-                      << "' (expected f32, u8, or i8)\n";
-            return 1;
-        }
-    }
-
     // ── Dataset info ─────────────────────────────────────────────────────────
     auto [total_pts, dim_u] = fbin_header(vector_path);
     const int dim = static_cast<int>(dim_u);
-    std::cout << "Dataset : " << total_pts << " points, dim=" << dim
-              << "  type=" << vec_type_name(vtype) << "\n";
+    std::cout << "Dataset : " << total_pts << " points, dim=" << dim << "\n";
 
     // ── Runbook ───────────────────────────────────────────────────────────────
     auto steps = load_runbook(runbook_path, dataset_key);
@@ -842,8 +769,7 @@ int main(int argc, char* argv[]) {
         // Read vectors for this step
         auto vecs = read_vec_slice(vector_path,
                                     static_cast<uint32_t>(step.start),
-                                    static_cast<uint32_t>(step.end),
-                                    vtype);
+                                    static_cast<uint32_t>(step.end));
         const int n_vecs = step.end - step.start;
 
         // ── INSERT ───────────────────────────────────────────────────────────

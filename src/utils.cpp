@@ -209,8 +209,7 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
 
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "Failed to open file for sampling: " << filename << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        throw std::runtime_error("Failed to open file for sampling: " + filename);
     }
 
     std::vector<float> sample;
@@ -235,8 +234,8 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
                 int d;
                 file.read(reinterpret_cast<char*>(&d), sizeof(int));
                 if (d != static_cast<int>(dim)) {
-                    std::cerr << "Fvecs dim mismatch at index " << idx << ": " << d << " != " << dim << "\n";
-                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    throw std::runtime_error(
+                        "Fvecs dim mismatch at index " + std::to_string(idx) + ": " + std::to_string(d) + " != " + std::to_string(dim));
                 }
 
                 std::vector<float> vec(dim);
@@ -251,8 +250,8 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
                 int d;
                 file.read(reinterpret_cast<char*>(&d), sizeof(int));
                 if (d != static_cast<int>(dim)) {
-                    std::cerr << "Bvecs dim mismatch at index " << idx << ": " << d << " != " << dim << "\n";
-                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    throw std::runtime_error(
+                        "Bvecs dim mismatch at index " + std::to_string(idx) + ": " + std::to_string(d) + " != " + std::to_string(dim));
                 }
 
                 std::vector<uint8_t> vec(dim);
@@ -285,16 +284,14 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
                 std::vector<float> vec(dim);
                 file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(float));
                 if (!file) {
-                    std::cerr << "Failed to read float vector at index " << idx << "\n";
-                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    throw std::runtime_error("Failed to read float vector at index " + std::to_string(idx));
                 }
 
                 sample.insert(sample.end(), vec.begin(), vec.end());
                 break;
             }
             default:
-                std::cerr << "Unsupported file format " << filename << "\n";
-                MPI_Abort(MPI_COMM_WORLD, 1);
+                throw std::runtime_error("Unsupported file format: " + filename);
         }
     }
 
@@ -304,9 +301,7 @@ std::vector<float> getSample(const std::string& filename, size_t max_elements, s
 std::vector<float> readFvecs(const std::string& filename, size_t vector_dim, int n, int offset) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[Coordinator]: Unable to open Fvecs file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return std::vector<float>();
+        throw std::runtime_error("Unable to open Fvecs file: " + filename);
     }
 
     size_t bytes_per_vector = 4 + vector_dim * 4;
@@ -314,9 +309,7 @@ std::vector<float> readFvecs(const std::string& filename, size_t vector_dim, int
 
     file.seekg(byte_offset, std::ios::beg);
     if (!file.good()) {
-        std::cerr << "[Coordinator]: Failed to seek to offset in fvecs file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return std::vector<float>();
+        throw std::runtime_error("Failed to seek to offset in fvecs file: " + filename);
     }
 
     std::vector<float> vectors;
@@ -329,17 +322,17 @@ std::vector<float> readFvecs(const std::string& filename, size_t vector_dim, int
         if (file.eof()) break;
 
         if (dim != static_cast<int>(vector_dim)) {
-            std::cerr << "[Coordinator]: Dimension mismatch at vector " << offset + counter
-                      << ": file " << filename << " says " << dim << ", expected " << vector_dim << "\n";
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return std::vector<float>();
+            throw std::runtime_error(
+                "Dimension mismatch at vector " + std::to_string(offset + counter) +
+                ": file " + filename + " says " + std::to_string(dim) +
+                ", expected " + std::to_string(vector_dim));
         }
 
         std::vector<float> temp(vector_dim);
         file.read(reinterpret_cast<char*>(temp.data()), vector_dim * sizeof(float));
         if (file.gcount() != static_cast<std::streamsize>(vector_dim * sizeof(float))) {
-            std::cerr << "[Coordinator]: Error reading vector data at position " << offset + counter << "\n";
-            break;
+            throw std::runtime_error(
+                "Error reading vector data at position " + std::to_string(offset + counter));
         }
 
         vectors.insert(vectors.end(), temp.begin(), temp.end());
@@ -351,9 +344,7 @@ std::vector<float> readFvecs(const std::string& filename, size_t vector_dim, int
 std::vector<float> readBvecs(const std::string& filename, size_t vector_dim, int n, int offset) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[Coordinator]: Unable to open Bvecs file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return std::vector<float>();
+        throw std::runtime_error("Unable to open Bvecs file: " + filename);
     }
 
     size_t bytes_per_vector = sizeof(int) + vector_dim * sizeof(uint8_t);
@@ -361,9 +352,7 @@ std::vector<float> readBvecs(const std::string& filename, size_t vector_dim, int
 
     file.seekg(byte_offset, std::ios::beg);
     if (!file.good()) {
-        std::cerr << "[Coordinator]: Failed to seek to offset in bvecs file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return std::vector<float>();
+        throw std::runtime_error("Failed to seek to offset in bvecs file: " + filename);
     }
 
     std::vector<float> vectors;
@@ -376,17 +365,17 @@ std::vector<float> readBvecs(const std::string& filename, size_t vector_dim, int
         if (file.eof()) break;
 
         if (dim != static_cast<int>(vector_dim)) {
-            std::cerr << "[Coordinator]: Dimension mismatch at vector " << offset + counter
-                      << ": file says " << dim << ", expected " << vector_dim << "\n";
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return std::vector<float>();
+            throw std::runtime_error(
+                "Dimension mismatch at vector " + std::to_string(offset + counter) +
+                ": file says " + std::to_string(dim) +
+                ", expected " + std::to_string(vector_dim));
         }
 
         std::vector<uint8_t> temp_bytes(vector_dim);
         file.read(reinterpret_cast<char*>(temp_bytes.data()), vector_dim * sizeof(uint8_t));
         if (file.gcount() != static_cast<std::streamsize>(vector_dim * sizeof(uint8_t))) {
-            std::cerr << "[Coordinator]: Error reading vector data at position " << offset + counter << "\n";
-            break;
+            throw std::runtime_error(
+                "Error reading vector data at position " + std::to_string(offset + counter));
         }
 
         for (uint8_t val : temp_bytes) {
@@ -400,9 +389,7 @@ std::vector<float> readBvecs(const std::string& filename, size_t vector_dim, int
 std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int n, int offset) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[Coordinator]: Unable to open i8bin file " << filename << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Unable to open i8bin file: " + filename);
     }
 
     uint32_t num_points, dim_in_file;
@@ -410,16 +397,14 @@ std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file "<< filename << " says " << dim_in_file
-                  << ", expected " << vector_dim << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error(
+            "Dimension mismatch: file " + filename + " says " + std::to_string(dim_in_file) +
+            ", expected " + std::to_string(vector_dim));
     }
 
     if (offset < 0 || static_cast<size_t>(offset) >= num_points) {
-        std::cerr << "[Coordinator]: Invalid offset\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error(
+            "Invalid offset " + std::to_string(offset) + " (file has " + std::to_string(num_points) + " vectors)");
     }
 
     size_t max_readable = num_points - static_cast<size_t>(offset);
@@ -431,9 +416,7 @@ std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int
 
     file.read(reinterpret_cast<char*>(buffer.data()), buffer.size() * sizeof(int8_t));
     if (file.gcount() != static_cast<std::streamsize>(buffer.size() * sizeof(int8_t))) {
-        std::cerr << "[Coordinator]: Failed to read the full data block\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Failed to read the full data block from i8bin file: " + filename);
     }
 
     std::vector<float> vectors;
@@ -448,9 +431,7 @@ std::vector<float> readI8bin(const std::string& filename, size_t vector_dim, int
 std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int n, int offset) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[Coordinator]: Unable to open u8bin file " << filename << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Unable to open u8bin file: " + filename);
     }
 
     uint32_t num_points, dim_in_file;
@@ -458,16 +439,14 @@ std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file " << filename << " says " << dim_in_file
-                  << ", expected " << vector_dim << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error(
+            "Dimension mismatch: file " + filename + " says " + std::to_string(dim_in_file) +
+            ", expected " + std::to_string(vector_dim));
     }
 
     if (offset < 0 || static_cast<size_t>(offset) >= num_points) {
-        std::cerr << "[Coordinator]: Invalid offset\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error(
+            "Invalid offset " + std::to_string(offset) + " (file has " + std::to_string(num_points) + " vectors)");
     }
 
     size_t max_readable = num_points - static_cast<size_t>(offset);
@@ -479,9 +458,7 @@ std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int
 
     file.read(reinterpret_cast<char*>(buffer.data()), buffer.size() * sizeof(uint8_t));
     if (file.gcount() != static_cast<std::streamsize>(buffer.size() * sizeof(uint8_t))) {
-        std::cerr << "[Coordinator]: Failed to read the full data block\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Failed to read the full data block from u8bin file: " + filename);
     }
 
     std::vector<float> vectors;
@@ -496,9 +473,7 @@ std::vector<float> readU8bin(const std::string& filename, size_t vector_dim, int
 std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int n, int offset) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[Coordinator]: Unable to open fbin file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Unable to open fbin file: " + filename);
     }
 
     uint32_t num_points, dim_in_file;
@@ -506,16 +481,14 @@ std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int 
     file.read(reinterpret_cast<char*>(&dim_in_file), sizeof(uint32_t));
 
     if (dim_in_file != vector_dim) {
-        std::cerr << "[Coordinator]: Dimension mismatch: file " << filename << " says " << dim_in_file
-                  << ", expected " << vector_dim << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error(
+            "Dimension mismatch: file " + filename + " says " + std::to_string(dim_in_file) +
+            ", expected " + std::to_string(vector_dim));
     }
 
     if (offset < 0 || static_cast<size_t>(offset) >= num_points) {
-        std::cerr << "[Coordinator]: Invalid offset\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error(
+            "Invalid offset " + std::to_string(offset) + " (file has " + std::to_string(num_points) + " vectors)");
     }
 
     size_t max_readable = num_points - static_cast<size_t>(offset);
@@ -527,9 +500,7 @@ std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int 
 
     file.read(reinterpret_cast<char*>(buffer.data()), buffer.size() * sizeof(float));
     if (file.gcount() != static_cast<std::streamsize>(buffer.size() * sizeof(float))) {
-        std::cerr << "[Coordinator]: Failed to read full data block from fbin\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Failed to read full data block from fbin file: " + filename);
     }
 
     return buffer;
@@ -604,28 +575,20 @@ std::vector<std::vector<int>> readGTBin(const std::string& filename) {
 
 std::vector<float> readVecs(const std::string& filename, size_t vector_dim, int n, int offset) {
     FileFormat format = getFileFormat(filename);
-    std::vector<float> result;
     switch (format) {
         case BVECS:
-            result = readBvecs(filename, vector_dim, n, offset);
-            break;
+            return readBvecs(filename, vector_dim, n, offset);
         case FVECS:
-            result = readFvecs(filename, vector_dim, n, offset);
-            break;
+            return readFvecs(filename, vector_dim, n, offset);
         case I8BIN:
-            result = readI8bin(filename, vector_dim, n, offset);
-            break;
+            return readI8bin(filename, vector_dim, n, offset);
         case U8BIN:
-            result = readU8bin(filename, vector_dim, n, offset);
-            break;
+            return readU8bin(filename, vector_dim, n, offset);
         case FBIN:
-            result = readFbin(filename, vector_dim, n, offset);
-            break;
+            return readFbin(filename, vector_dim, n, offset);
         default:
-            std::cerr << "Unsupported file format " << filename << "\n";
-            exit(1);
+            throw std::runtime_error("Unsupported file format: " + filename);
     }
-    return result;
 }
 
 std::vector<std::vector<int>> readGT(const std::string& filename, FileFormat format) {
