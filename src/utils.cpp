@@ -836,8 +836,8 @@ int kmeans(
     return num_iterations;
 }
 
-inline std::vector<RunbookStep> load_runbook(const std::string& path,
-                                             const std::string& dataset_key) {
+std::vector<RunbookStep> load_runbook(const std::string& path,
+                                      const std::string& dataset_key) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("Cannot open runbook: " + path);
 
