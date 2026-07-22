@@ -835,3 +835,59 @@ int kmeans(
 
     return num_iterations;
 }
+
+inline std::vector<RunbookStep> load_runbook(const std::string& path,
+                                             const std::string& dataset_key) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("Cannot open runbook: " + path);
+
+    std::map<int, RunbookStep> step_map;
+    bool        in_dataset = false;
+    int         cur_step   = -1;
+    RunbookStep cur;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+
+        int indent = 0;
+        while (indent < (int)line.size() && line[indent] == ' ') ++indent;
+        const std::string content = line.substr(indent);
+
+        if (indent == 0) {
+            // Top-level key line (e.g. "msturing-100M-clustered:")
+            if (cur_step >= 0) { step_map[cur_step] = cur; cur_step = -1; }
+            size_t colon = content.find(':');
+            std::string key = runbook_detail::trim(
+                colon != std::string::npos ? content.substr(0, colon) : content);
+            in_dataset = (key == dataset_key);
+
+        } else if (in_dataset && indent == 2) {
+            // Step number ("1:") or metadata ("max_pts:")
+            if (cur_step >= 0) { step_map[cur_step] = cur; cur_step = -1; }
+            size_t colon = content.find(':');
+            if (colon == std::string::npos) continue;
+            std::string key = runbook_detail::trim(content.substr(0, colon));
+            bool all_digits = !key.empty() &&
+                std::all_of(key.begin(), key.end(),
+                            [](unsigned char c){ return std::isdigit(c); });
+            if (all_digits) { cur_step = std::stoi(key); cur = RunbookStep{}; cur.step_num = cur_step; }
+
+        } else if (in_dataset && indent == 4 && cur_step >= 0) {
+            // Step field ("operation:", "start:", "end:")
+            size_t colon = content.find(':');
+            if (colon == std::string::npos) continue;
+            std::string key = runbook_detail::trim(content.substr(0, colon));
+            std::string val = runbook_detail::trim(content.substr(colon + 1));
+            if      (key == "operation") cur.operation = val;
+            else if (key == "start")     cur.start     = std::stoi(val);
+            else if (key == "end")       cur.end       = std::stoi(val);
+        }
+    }
+    if (cur_step >= 0) step_map[cur_step] = cur;
+
+    std::vector<RunbookStep> result;
+    result.reserve(step_map.size());
+    for (auto& [k, v] : step_map) result.push_back(v);
+    return result;
+}

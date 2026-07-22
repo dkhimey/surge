@@ -28,7 +28,7 @@ submodule needed. hnswlib contains a small local patch for deleted label handlin
 - Linux, a C++17 compiler (`g++`), and OpenMP.
 - **Open MPI** (`mpic++` / `mpirun`) — the distributed experiments run one
   coordinator plus one process per worker.
-- **CMake** — used to build the KaHIP and yaml-cpp libraries.
+- **CMake** — used to build the KaHIP library.
 - If running oracle python scripts, Python 3 with `numpy`, `pyyaml`, `matplotlib`, and `hnswlib`.
 
 ```bash

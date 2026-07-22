@@ -2,7 +2,6 @@
 build/
 bin/
 external/KaHIP/build/*
-external/yaml-cpp/build/*
 
 # Experiment artifacts
 theoretical_partitioning_quality*

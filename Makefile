@@ -9,16 +9,11 @@ LDFLAGS := -fopenmp
 # === Include Paths ===
 INCLUDES := -Iexternal/hnswlib/hnswlib \
             -Iexternal/KaHIP/interface \
-            -Iexternal/nlohmann/ \
-            -Iexternal/yaml-cpp/include
+            -Iexternal/nlohmann/
 
 # === KaHIP Settings ===
 KAHIP_DIR := external/KaHIP
 KAHIP_LIB := $(KAHIP_DIR)/lib/libKaHIP.a
-
-# === YAML Settings ===
-YAML_CPP_DIR := external/yaml-cpp
-YAML_CPP_LIB := $(YAML_CPP_DIR)/build/libyaml-cpp.a
 
 # === Directories ===
 SRC_DIR := src
@@ -66,11 +61,11 @@ $(OBJ_DIR)/old_%.o: $(OLD_DIR)/%.cpp
 	$(MPICXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # === Link rules ===
-bin/%: $(OBJ_DIR)/exp_%.o $(CORE_OBJS) $(KAHIP_LIB) $(YAML_CPP_LIB)
+bin/%: $(OBJ_DIR)/exp_%.o $(CORE_OBJS) $(KAHIP_LIB)
 	@mkdir -p bin
 	$(MPICXX) $(LDFLAGS) $^ -o $@ -L$(KAHIP_DIR)/lib -lKaHIP
 
-bin/old_%: $(OBJ_DIR)/old_%.o $(CORE_OBJS) $(KAHIP_LIB) $(YAML_CPP_LIB)
+bin/old_%: $(OBJ_DIR)/old_%.o $(CORE_OBJS) $(KAHIP_LIB)
 	@mkdir -p bin
 	$(MPICXX) $(LDFLAGS) $^ -o $@ -L$(KAHIP_DIR)/lib -lKaHIP
 
@@ -79,14 +74,9 @@ $(KAHIP_LIB):
 	cd $(KAHIP_DIR) && mkdir -p build && cd build && cmake .. -DNOMPI=ON && make
 	cp $(KAHIP_DIR)/build/libkahip_static.a $(KAHIP_LIB)
 
-# === YAML Build ===
-$(YAML_CPP_LIB):
-	cd $(YAML_CPP_DIR) && mkdir -p build && cd build && cmake .. -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON && make
-
 # === Clean ===
 clean:
 	rm -rf build bin
 	rm -rf $(KAHIP_DIR)/build $(KAHIP_LIB)
-	rm -rf $(YAML_CPP_DIR)/build
 
 .PHONY: all clean experiments old_experiments

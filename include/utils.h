@@ -9,6 +9,11 @@
 #include <climits>
 #include <filesystem>
 #include <atomic>
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <vector>
+#include <stdexcept>
 #include "json.hpp"
 #include "vector_utils.h"
 
@@ -502,3 +507,23 @@ std::vector<std::vector<int>> readGT(const std::string& filename, FileFormat for
 int maximum_matching(const std::vector<std::vector<int>>& cost, std::vector<int>& assignment);
 int kmeans(float* sample, size_t n_points, size_t dim, size_t n_centers, float* centers, int* counts,
            float EPSILON = 1e-4f, int EPOCHS = 100, bool verbose = true);
+
+struct RunbookStep {
+    int         step_num = -1;
+    std::string operation;         // "insert" | "delete" | "search"
+    int         start    = -1;
+    int         end      = -1;     // exclusive upper bound (Python slice convention)
+};
+
+namespace runbook_detail {
+// Trim leading/trailing whitespace and quotes.
+inline std::string trim(const std::string& s) {
+    const std::string ws = " \t\r\n'\"";
+    size_t a = s.find_first_not_of(ws);
+    if (a == std::string::npos) return {};
+    size_t b = s.find_last_not_of(ws);
+    return s.substr(a, b - a + 1);
+}
+}
+
+std::vector<RunbookStep> load_runbook(const std::string& path, const std::string& dataset_key);

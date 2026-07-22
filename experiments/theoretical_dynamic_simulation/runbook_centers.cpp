@@ -33,6 +33,7 @@
 #include "hnswlib.h"
 #include "vector_utils.h"
 #include "utils.h"
+#include "runbook.h" // shared streaming-runbook parser (RunbookStep, load_runbook)
 
 namespace fs = std::filesystem;
 
@@ -59,97 +60,6 @@ constexpr int    HNSW_EF_SEARCH       = 200;
 constexpr int    QUERY_BATCH_SIZE = 100000;
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Runbook types and parser
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct RunbookStep {
-    std::string operation;   // "insert" | "delete" | "search"
-    int start = -1;
-    int end   = -1;          // exclusive upper bound (Python slice convention)
-};
-
-// Trim leading/trailing whitespace and single-quotes from a string
-static std::string trim(const std::string& s) {
-    const std::string ws = " \t\r\n'\"";
-    size_t a = s.find_first_not_of(ws);
-    if (a == std::string::npos) return {};
-    size_t b = s.find_last_not_of(ws);
-    return s.substr(a, b - a + 1);
-}
-
-// Parse the NeurIPS runbook YAML format:
-//
-//   msturing-30M-clustered:
-//     max_pts: 10292043
-//     1:
-//       operation: 'insert'
-//       start: 0
-//       end: 38806
-//     2:
-//       operation: 'search'
-//     ...
-//
-// Returns steps sorted by their integer key, search steps included (caller skips).
-static std::vector<RunbookStep> load_runbook(const std::string& path,
-                                              const std::string& dataset_key)
-{
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("Cannot open runbook: " + path);
-
-    std::map<int, RunbookStep> step_map;
-    bool       in_dataset = false;
-    int        cur_step   = -1;
-    RunbookStep cur;
-
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.empty() || line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-
-        // Count leading spaces to determine indent level
-        int indent = 0;
-        while (indent < (int)line.size() && line[indent] == ' ') ++indent;
-        const std::string content = line.substr(indent);
-
-        if (indent == 0) {
-            // Top-level key line (e.g. "msturing-30M-clustered:")
-            if (cur_step >= 0) { step_map[cur_step] = cur; cur_step = -1; }
-            size_t colon = content.find(':');
-            std::string key = trim(colon != std::string::npos ? content.substr(0, colon) : content);
-            in_dataset = (key == dataset_key);
-
-        } else if (in_dataset && indent == 2) {
-            // Second-level key: either a step number ("1:") or metadata ("max_pts:")
-            if (cur_step >= 0) { step_map[cur_step] = cur; cur_step = -1; }
-            size_t colon = content.find(':');
-            if (colon == std::string::npos) continue;
-            std::string key = trim(content.substr(0, colon));
-            bool all_digits = !key.empty() &&
-                              std::all_of(key.begin(), key.end(),
-                                          [](unsigned char c){ return std::isdigit(c); });
-            if (all_digits) {
-                cur_step = std::stoi(key);
-                cur = RunbookStep{};
-            }
-
-        } else if (in_dataset && indent == 4 && cur_step >= 0) {
-            // Step field ("operation:", "start:", "end:")
-            size_t colon = content.find(':');
-            if (colon == std::string::npos) continue;
-            std::string key = trim(content.substr(0, colon));
-            std::string val = trim(content.substr(colon + 1));
-            if      (key == "operation") cur.operation = val;
-            else if (key == "start")     cur.start     = std::stoi(val);
-            else if (key == "end")       cur.end       = std::stoi(val);
-        }
-    }
-    if (cur_step >= 0) step_map[cur_step] = cur;
-
-    std::vector<RunbookStep> result;
-    result.reserve(step_map.size());
-    for (auto& [k, v] : step_map) result.push_back(v);
-    return result;
-}
 
 
 // ─────────────────────────────────────────────────────────────────────────────

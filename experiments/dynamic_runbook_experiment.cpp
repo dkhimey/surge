@@ -33,7 +33,7 @@
 
 #include <mpi.h>
 #include <omp.h>
-#include <yaml-cpp/yaml.h>
+#include "runbook.h"
 
 // POSIX mmap headers — used by BaseMmap below to sparse-read GT vectors
 // from base_file for theoretical-recall computation (matches the offline
@@ -154,43 +154,6 @@ static std::string mode_to_string(RoutingMode m)
     return "Unknown";
 }
 
-// ─── Runbook ──────────────────────────────────────────────────────────────────
-struct RunbookStep {
-    int         step_num  = -1;
-    std::string operation;
-    int         start     = -1;
-    int         end       = -1;
-};
-
-static std::vector<RunbookStep> parse_runbook(const std::string& path,
-                                               const std::string& dataset_key)
-{
-    YAML::Node root    = YAML::LoadFile(path);
-    YAML::Node dataset = root[dataset_key];
-    if (!dataset)
-        throw std::runtime_error("Key '" + dataset_key + "' not found in runbook: " + path);
-
-    std::map<int, RunbookStep> step_map;
-    for (auto it = dataset.begin(); it != dataset.end(); ++it) {
-        const std::string key = it->first.as<std::string>();
-        bool all_digits = !key.empty() &&
-            std::all_of(key.begin(), key.end(),
-                        [](unsigned char c){ return std::isdigit(c); });
-        if (!all_digits) continue;
-        YAML::Node node = it->second;
-        if (!node.IsMap()) continue;
-        RunbookStep rs;
-        rs.step_num  = std::stoi(key);
-        rs.operation = node["operation"].as<std::string>();
-        if (node["start"]) rs.start = node["start"].as<int>();
-        if (node["end"])   rs.end   = node["end"].as<int>();
-        step_map[rs.step_num] = rs;
-    }
-    std::vector<RunbookStep> result;
-    result.reserve(step_map.size());
-    for (auto& [k, v] : step_map) result.push_back(v);
-    return result;
-}
 
 // ─── routeQuery: local routing without Coordinator object ────────────────────
 static std::set<int> routeQuery(
@@ -564,7 +527,7 @@ int main(int argc, char** argv)
 
     // ── Runbook ──────────────────────────────────────────────────────────────
     const std::string runbook_path = DATASETS[dataset_name]["runbook"];
-    std::vector<RunbookStep> steps = parse_runbook(runbook_path, dataset_name);
+    std::vector<RunbookStep> steps = load_runbook(runbook_path, dataset_name);
     if (steps.empty() || steps[0].operation != "insert") {
         if (rank == 0) std::cerr << "ERROR: runbook must begin with an insert step\n";
         MPI_Finalize(); return 1;
