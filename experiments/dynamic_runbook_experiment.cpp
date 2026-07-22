@@ -33,7 +33,6 @@
 
 #include <mpi.h>
 #include <omp.h>
-#include "runbook.h"
 
 // POSIX mmap headers — used by BaseMmap below to sparse-read GT vectors
 // from base_file for theoretical-recall computation (matches the offline

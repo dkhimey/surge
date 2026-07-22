@@ -33,7 +33,6 @@
 #include "hnswlib.h"
 #include "vector_utils.h"
 #include "utils.h"
-#include "runbook.h" // shared streaming-runbook parser (RunbookStep, load_runbook)
 
 namespace fs = std::filesystem;
 
