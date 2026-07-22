@@ -159,16 +159,14 @@ FileFormat getFileFormat(const std::string& filename) {
     } else if (filename.size() >= 5 && filename.substr(filename.size() - 5) == ".fbin") {
         return FBIN;
     } else {
-        std::cerr << "Unsupported file format for file: " << filename << "\n";
-        exit(1);
+        throw std::runtime_error("Unsupported file format for file: " + filename);
     }
 }
 
 std::pair<int, int> get_dataset_info(const std::string& base_file) {
     std::ifstream file(base_file, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "FATAL: cannot open dataset file: " << base_file << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        throw std::runtime_error("cannot open dataset file: " + base_file);
     }
 
     FileFormat format = getFileFormat(base_file);
@@ -189,8 +187,7 @@ std::pair<int, int> get_dataset_info(const std::string& base_file) {
             return {num_vectors, dim};
         }
         default:
-            std::cerr << "Unsupported file format " << base_file << "\n";
-            exit(1);
+            throw std::runtime_error("Unsupported file format: " + base_file);
     }
 }
 
@@ -507,9 +504,7 @@ std::vector<float> readFbin(const std::string& filename, size_t vector_dim, int 
 std::vector<std::vector<int>> readGTIvecs(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[Coordinator]: Unable to open Ivecs file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return std::vector<std::vector<int>>();
+        throw std::runtime_error("Unable to open Ivecs file: " + filename);
     }
 
     std::vector<std::vector<int>> vectors;
@@ -523,9 +518,7 @@ std::vector<std::vector<int>> readGTIvecs(const std::string& filename) {
         file.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(int));
 
         if (!file) {
-            std::cerr << "[Coordinator]: Error reading ground truth data from file.\n";
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return {};
+            throw std::runtime_error("Error reading ground truth data from file: " + filename);
         }
 
         vectors.push_back(std::move(vec));
@@ -537,9 +530,7 @@ std::vector<std::vector<int>> readGTIvecs(const std::string& filename) {
 std::vector<std::vector<int>> readGTBin(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[Coordinator]: Unable to open ground truth .bin file\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Unable to open ground truth .bin file: " + filename);
     }
 
     uint32_t num_queries, K;
@@ -551,9 +542,7 @@ std::vector<std::vector<int>> readGTBin(const std::string& filename) {
     std::vector<uint32_t> all_ids(total_elements);
     file.read(reinterpret_cast<char*>(all_ids.data()), total_elements * sizeof(uint32_t));
     if (!file) {
-        std::cerr << "[Coordinator]: Failed to read neighbor IDs\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return {};
+        throw std::runtime_error("Failed to read neighbor IDs from: " + filename);
     }
 
     file.seekg(total_elements * sizeof(float), std::ios::cur);
@@ -602,8 +591,7 @@ std::vector<std::vector<int>> readGT(const std::string& filename, FileFormat for
             gt = readGTBin(filename);
             break;
         default:
-            std::cerr << "Unsupported file format " << filename << "\n";
-            exit(1);
+            throw std::runtime_error("Unsupported file format: " + filename);
     }
     return gt;
 }

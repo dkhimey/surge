@@ -469,6 +469,7 @@ int main(int argc, char** argv)
     // Initialize MPI with thread support
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    install_mpi_terminate_handler();
     if (provided < MPI_THREAD_MULTIPLE) {
         std::cerr << "ERROR: MPI does not support MPI_THREAD_MULTIPLE\n";
         MPI_Abort(MPI_COMM_WORLD, 1);

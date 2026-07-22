@@ -14,6 +14,7 @@
 #include <map>
 #include <vector>
 #include <stdexcept>
+#include <exception>
 #include "json.hpp"
 #include "vector_utils.h"
 
@@ -527,3 +528,22 @@ inline std::string trim(const std::string& s) {
 }
 
 std::vector<RunbookStep> load_runbook(const std::string& path, const std::string& dataset_key);
+
+// a std::terminate handler that turns an uncaught exception into a
+// clean, rank-tagged MPI_Abort. Without it, an exception escaping main() calls
+// abort() on a single rank, leaving peers deadlocked in MPI calls. Call once,
+// immediately after MPI_Init, in every MPI driver's main().
+inline void install_mpi_terminate_handler() {
+    std::set_terminate([]() {
+        int rank = -1;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        try {
+            if (auto e = std::current_exception()) std::rethrow_exception(e);
+        } catch (const std::exception& ex) {
+            std::cerr << "[rank " << rank << "] FATAL: " << ex.what() << "\n";
+        } catch (...) {
+            std::cerr << "[rank " << rank << "] FATAL: unknown exception\n";
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    });
+}

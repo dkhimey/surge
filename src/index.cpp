@@ -137,8 +137,7 @@ void Coordinator::build(
     this->ncenters_ = ncenters;
 
     if (sample_count_ == 0) {
-        std::cerr << "[Coordinator]: set sample data before building\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        throw std::runtime_error("[Coordinator] set sample data before building");
     }
 
     // 2. run k-means with m centers
@@ -1041,8 +1040,7 @@ void Coordinator::load_gp(const std::string& prefix, int ef_search) {
     meta_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path);
 
     if (meta_HNSW_ == nullptr) {
-        std::cerr << "[Coordinator] ERROR LOADING metaHNSW\n";
-        return;
+        throw std::runtime_error("[Coordinator] failed to load meta-HNSW");
     }
 
     meta_HNSW_->setEf(ef_search);
@@ -1068,8 +1066,7 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
     meta_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path);
 
     if (meta_HNSW_ == nullptr) {
-        std::cerr << "[Coordinator] ERROR LOADING metaHNSW\n";
-        return;
+        throw std::runtime_error("[Coordinator] failed to load meta-HNSW");
     }
 
     meta_HNSW_->setEf(ef_search);
@@ -1130,8 +1127,7 @@ void Coordinator::loadFromClusterAnalysis(
     const std::string labels_path  = base + "_labels.csv";
 
     auto fail = [](const std::string& msg) {
-        std::cerr << "[Coordinator] loadFromClusterAnalysis ERROR: " << msg << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        throw std::runtime_error("[Coordinator] loadFromClusterAnalysis: " + msg);
     };
 
     // 1. meta-HNSW over the centroids (hnswlib label == centroid id, 0..k-1).
@@ -1758,8 +1754,7 @@ void Executor::build(
     int num_building_threads
 ) {
     if (data_ == nullptr) {
-        std::cerr << "[Executor " <<  node_id_ << "]: set data before building\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        throw std::runtime_error("[Executor " + std::to_string(node_id_) + "] set data before building");
     }
 
     if (num_building_threads == -1)

@@ -28,6 +28,7 @@ int main(int argc, char **argv) {
 
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    install_mpi_terminate_handler();
 
     if (provided < MPI_THREAD_MULTIPLE) {
         std::cerr << "Error: MPI does not provide required threading level (MPI_THREAD_MULTIPLE)\n";
