@@ -1,175 +1,145 @@
 #include "utils.h"
 
-// DATASETS definition (declared extern in utils.h)
+// ─────────────────────────────────────────────────────────────────────────────
+// DATASETS registry (declared extern in utils.h)
+//
+// Two kinds of entries:
+//   • Streaming (dynamic) datasets — fields: base_file, runbook, query_file,
+//     ground_truth_dir.  One per (family, scale, workload).
+//   • Static (base) datasets       — fields: base_file, query_file, gt_file.
+//
+// Families: bigann/sift (u8, 128-dim) and msturing (f32, 100-dim).
+// Edit the paths below to point at your local copies of the data.
+// ─────────────────────────────────────────────────────────────────────────────
 std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
+
+    // ── Streaming datasets: BIGANN ───────────────────────────────────────────
     {"bigann-100M-clustered",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-clustered/bigann-100M-clustered.u8bin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-clustered/runbook-bigann-100M.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-clustered/query.public.10K.u8bin"},
+            {"base_file",        "/dataset/big-ann-benchmarks/data/bigann-clustered/bigann-100M-clustered.u8bin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/bigann-clustered/runbook-bigann-100M.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/bigann-clustered/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-clustered/100000000/runbook-bigann-100M.yaml"},
         }
     },
-
     {"bigann-100M-random",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-random/bigann-100M-random.u8bin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-random/runbook-bigann-100M-random.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-random/query.public.10K.u8bin"},
+            {"base_file",        "/dataset/big-ann-benchmarks/data/bigann-random/bigann-100M-random.u8bin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/bigann-random/runbook-bigann-100M-random.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/bigann-random/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-random/100000000/runbook-bigann-100M-random.yaml"},
         }
     },
-
     {"bigann-100M-shift",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-shift/100M-bigann-shift.u8bin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-shift/bigann-100M-shift_runbookfinal.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-shift/query.public.10K.u8bin"},
+            {"base_file",        "/dataset/big-ann-benchmarks/data/bigann-shift/100M-bigann-shift.u8bin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/bigann-shift/bigann-100M-shift_runbookfinal.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/bigann-shift/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-shift/100000000/bigann-100M-shift_runbookfinal.yaml"},
         }
     },
-
-    {"msturing-100M-clustered",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100M-msturing-clustered.fbin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/msturing-100M-clustered_runbookfinal.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/testQuery10K.fbin"},
-            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100000000/msturing-100M-clustered_runbookfinal.yaml"},
-        }
-    },
-
-    {"msturing-100M-random",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/msturing-100M-random.fbin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/runbook-msturing-100M-random.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/testQuery10K.fbin"},
-            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/100000000/runbook-msturing-100M-random.yaml"},
-        }
-    },
-
-    {"msturing-100M-shift",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100M-msturing-shift.fbin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/msturing-100M-shift_runbookfinal.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/testQuery10K.fbin"},
-            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100000000/msturing-100M-shift_runbookfinal.yaml"},
-        }
-    },
-
-    {"msturing-500M-shift",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/500M_msturingshift64.fbin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/runbook_msturing500Mshift.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/testQuery10K.fbin"},
-            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/500000000/runbook_msturing500Mshift.yaml"},
-        }
-    },
-
-    {"msturing-500M-clustered",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500M-msturingclustered64.fbin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/runbook_msturing500Mclustered.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/testQuery10K.fbin"},
-            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500000000/runbook_msturing500Mclustered.yaml"},
-        }
-    },
-
     {"bigann-500M-clustered",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500M-bigann64clustered.u8bin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/query.public.10K.u8bin"},
+            {"base_file",        "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500M-bigann64clustered.u8bin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/runbook_bigann-500M-clustered.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-clustered/500000000/runbook_bigann-500M-clustered.yaml/"},
         }
     },
-
     {"bigann-500M-shift",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/500M_bigann500shift64.u8bin"},
-            {"runbook", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/runbook_bigann500Mshift.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/query.public.10K.u8bin"},
+            {"base_file",        "/dataset/big-ann-benchmarks/data/bigann-500M-shift/500M_bigann500shift64.u8bin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/bigann-500M-shift/runbook_bigann500Mshift.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/bigann-500M-shift/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/500000000/runbook_bigann500Mshift.yaml/"},
         }
     },
 
-    {"sift-500M",
+    // ── Streaming datasets: MSTuring ─────────────────────────────────────────
+    {"msturing-100M-clustered",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_500000000.u8bin"},
-            {"runbook", "TODO"},
+            {"base_file",        "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100M-msturing-clustered.fbin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/msturing-100M-clustered_runbookfinal.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-clustered/100000000/msturing-100M-clustered_runbookfinal.yaml"},
+        }
+    },
+    {"msturing-100M-random",
+        {
+            {"base_file",        "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/msturing-100M-random.fbin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/runbook-msturing-100M-random.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-random/100000000/runbook-msturing-100M-random.yaml"},
+        }
+    },
+    {"msturing-100M-shift",
+        {
+            {"base_file",        "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100M-msturing-shift.fbin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/msturing-100M-shift_runbookfinal.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-100M-shift/100000000/msturing-100M-shift_runbookfinal.yaml"},
+        }
+    },
+    {"msturing-500M-clustered",
+        {
+            {"base_file",        "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500M-msturingclustered64.fbin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/runbook_msturing500Mclustered.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-500M-clustered/500000000/runbook_msturing500Mclustered.yaml"},
+        }
+    },
+    {"msturing-500M-shift",
+        {
+            {"base_file",        "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/500M_msturingshift64.fbin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/runbook_msturing500Mshift.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/testQuery10K.fbin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-500M-shift/500000000/runbook_msturing500Mshift.yaml"},
+        }
+    },
+
+    // ── Static datasets: SIFT / BIGANN ───────────────────────────────────────
+    {"bigann-100M",
+        {
+            {"base_file",  "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_100000000.u8bin"},
             {"query_file", "/dataset/big-ann-benchmarks/data/bigann/query.public.10K.u8bin"},
-            {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/bigann/gt_computed.10.crop500M.ibin"}
+            {"gt_file",    "/dataset/big-ann-benchmarks/data/bigann/bigann-100M.ibin"},
         }
     },
-
-    {"msturing-500M",
+    {"bigann-500M",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_500000000.fbin"},
-            {"runbook", "TODO"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
-            {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt_computed.10.crop_500M.ibin"}
-        }
-    },
-
-    {"sift-100M",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_100000000.u8bin"},
-            {"runbook", "TODO"},
+            {"base_file",  "/dataset/big-ann-benchmarks/data/bigann/base.1B.crop_nb_500000000.u8bin"},
             {"query_file", "/dataset/big-ann-benchmarks/data/bigann/query.public.10K.u8bin"},
-            {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/bigann/bigann-100M.ibin"}
+            {"gt_file",    "/dataset/big-ann-benchmarks/data/bigann/gt_computed.10.crop500M.ibin"},
+        }
+    },
+    {"bigann-1B",
+        {
+            {"base_file",  "/dataset/big-ann-benchmarks/data/bigann/base.1B.u8bin"},
+            {"query_file", "/dataset/big-ann-benchmarks/data/bigann/query.public.10K.u8bin"},
+            {"gt_file",    "/dataset/big-ann-benchmarks/data/bigann/GT.public.1B.ibin"},
         }
     },
 
+    // ── Static datasets: MSTuring ────────────────────────────────────────────
     {"msturing-100M",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_100000000.fbin"},
-            {"runbook", "TODO"},
+            {"base_file",  "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_100000000.fbin"},
             {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/query10K.fbin"},
-            {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-100M.query10K.bin"}
+            {"gt_file",    "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-100M.query10K.bin"},
         }
     },
-
-    {"msturing-30M-clustered",
+    {"msturing-500M",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuring-30M-clustered/30M-clustered64.fbin"},
-            {"runbook", "/dataset/big-ann-benchmarks/neurips23/runbooks/final_runbook.yaml"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/MSTuring-30M-clustered/testQuery10K.fbin"},
-            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/MSTuring-30M-clustered/29998994/final_runbook.yaml"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuring-30M-clustered/clu_msturing30M_gt100"},
-        }
-    },
-
-    {"msturing-1M",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_1000000.fbin"},
-            {"runbook", "TODO"},
+            {"base_file",  "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.crop_nb_500000000.fbin"},
             {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
-            {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/msturing-gt-1M.ibin"}
-        }
-
-    },
-
-    {"sift-1B",
-        {
-            {"base_file", "/dataset/big-ann-benchmarks/data/bigann/base.1B.u8bin"},
-            {"runbook", "TODO"},
-            {"query_file", "/dataset/big-ann-benchmarks/data/bigann/query.public.10K.u8bin"},
-            {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/bigann/GT.public.1B.ibin"}
+            {"gt_file",    "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt_computed.10.crop_500M.ibin"},
         }
     },
-
     {"msturing-1B",
         {
-            {"base_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.fbin"},
-            {"runbook", "TODO"},
+            {"base_file",  "/dataset/big-ann-benchmarks/data/MSTuringANNS/base1b.fbin"},
             {"query_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/testQuery10K.fbin"},
-            {"ground_truth_dir", "TODO"},
-            {"gt_file", "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt_computed.10.full_1B.ibin"}
+            {"gt_file",    "/dataset/big-ann-benchmarks/data/MSTuringANNS/gt_computed.10.full_1B.ibin"},
         }
     },
 };

@@ -19,10 +19,9 @@
 //
 // Run (example):
 //   ./bin/runbook_centers \
-//       --runbook     final_runbook.yaml \
-//       --dataset-key msturing-30M-clustered \
-//       --vector-path 30M-clustered64.fbin \
-//       --centers     10000
+//       --dataset  msturing-100M-clustered \
+//       --centers  10000 \
+//       --out-dir  cluster_history_msturing-100M-clustered_10000
 //
 // KMeans and HNSW assignment are seeded (mt19937(42), hnswlib seed 100) so runs
 // are reproducible.
@@ -55,11 +54,9 @@
 #include <unordered_map>
 #include <vector>
 
-// hnswlib is header-only – adjust the include path for your environment
 #include "hnswlib.h"
-
-// vector_utils.h supplies computeEuclideanDistance (returns *squared* L2)
 #include "vector_utils.h"
+#include "utils.h"
 
 namespace fs = std::filesystem;
 
@@ -785,9 +782,8 @@ static void save_base_layer_csv(
 static void usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << "\n"
-        << "  --runbook              <path>  runbook YAML\n"
-        << "  --dataset-key          <key>   top-level key in the YAML\n"
-        << "  --vector-path          <path>  .fbin vector file\n"
+        << "  --dataset              <key>   dataset key; base_file and runbook are read from\n"
+        << "                                 the DATASETS registry in src/utils.cpp\n"
         << "  --centers              <k>     number of clusters (default: 1000)\n"
         << "  [--out-dir             <dir>]  output directory\n"
         << "  [--kmeans-n-init       <n>]    KMeans restarts, keep best inertia (default: 1)\n"
@@ -838,9 +834,7 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
-        if      (a == "--runbook"                  && i + 1 < argc) runbook_path                = argv[++i];
-        else if (a == "--dataset-key"              && i + 1 < argc) dataset_key                 = argv[++i];
-        else if (a == "--vector-path"              && i + 1 < argc) vector_path                 = argv[++i];
+        if      (a == "--dataset"                  && i + 1 < argc) dataset_key                 = argv[++i];
         else if (a == "--centers"                  && i + 1 < argc) k                           = std::stoi(argv[++i]);
         else if (a == "--out-dir"                  && i + 1 < argc) out_dir                     = argv[++i];
         else if (a == "--kmeans-n-init"            && i + 1 < argc) kmeans_ninit                = std::stoi(argv[++i]);
@@ -860,8 +854,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (runbook_path.empty() || dataset_key.empty() || vector_path.empty()) {
-        std::cerr << "Error: --runbook, --dataset-key and --vector-path are required.\n";
+    if (dataset_key.empty()) {
+        std::cerr << "Error: --dataset is required.\n";
+        usage(argv[0]);
+    }
+
+    // Resolve the base vectors and runbook from the DATASETS registry (src/utils.cpp).
+    if (auto it = DATASETS.find(dataset_key); it != DATASETS.end()) {
+        const auto& cfg = it->second;
+        if (auto f = cfg.find("base_file"); f != cfg.end()) vector_path  = f->second;
+        if (auto f = cfg.find("runbook");   f != cfg.end()) runbook_path = f->second;
+    }
+
+    if (vector_path.empty() || runbook_path.empty()) {
+        std::cerr << "Error: dataset key '" << dataset_key << "' is not in the DATASETS "
+                     "registry (or is missing base_file/runbook). Add it to src/utils.cpp.\n";
         usage(argv[0]);
     }
 
@@ -869,7 +876,6 @@ int main(int argc, char* argv[]) {
         out_dir = "cluster_history_" + dataset_key + "_" + std::to_string(k);
 
     // ── Vector element type ───────────────────────────────────────────────────
-    VecType vtype = vec_type_from_path(vector_path);
     if (!vector_type_override.empty()) {
         if      (vector_type_override == "f32")  vtype = VecType::f32;
         else if (vector_type_override == "u8")   vtype = VecType::u8;

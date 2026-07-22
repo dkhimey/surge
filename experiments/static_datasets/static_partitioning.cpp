@@ -132,4 +132,4 @@ int main(int argc, char **argv) {
     MPI_Finalize();
 }
 
-// mpirun -np 11 --rankfile rankfile.txt bin/partitioning_quality sift-500M 10
+// mpirun -np 11 --rankfile rankfile.txt bin/static_partitioning bigann-500M 10

@@ -18,6 +18,7 @@ tools/
 docs/
 oracles/theoretical_dynamic_simulation/retroactive_nprobe_oracle.py
 oracles/theoretical_dynamic_simulation/compute_theoretical_recall_sweep.py
+scripts/
 
 # Python
 __pycache__/

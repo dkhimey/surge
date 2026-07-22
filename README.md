@@ -50,9 +50,9 @@ The resulting binaries are:
 | `bin/static_partitioning` | `experiments/static_datasets/static_partitioning.cpp` | Builds and saves the static distributed index (meta-HNSW + per-worker shards) to `<dataset>_<num_partitions>/`, consumed by `static_qps` (index build for Fig. 3). |
 | `bin/theoretical_partitioning_quality` | `experiments/static_datasets/theoretical_partitioning_quality.cpp` | Partitioning quality (theoretical recall vs. nprobe) — Fig. 2. |
 | `bin/static_qps` | `experiments/static_datasets/static_qps.cpp` | Distributed static recall-vs-QPS sweep over all routing modes — Fig. 3. |
-| `bin/dynamic_runbook_experiment` | `experiments/dynamic_runbook_experiment.cpp` | Distributed dynamic run that sweeps all routing modes/params per search step — Figs. 4, 6, 7. |
-| `bin/runbook_centers` | `experiments/theoretical_dynamic_simulation/runbook_centers.cpp` | Per-step routing-state generator (centroids, counts, routing HNSW, base layer); feeds the theoretical-recall / threshold-sweep pipeline — Fig. 5. |
-| `bin/runbook_partitions_parallel` | `experiments/theoretical_dynamic_simulation/runbook_partitions_parallel.cpp` | KaHIP partitioner over the generated base layer; feeds the theoretical-recall / threshold-sweep pipeline — Fig. 5. |
+| `bin/dynamic_runbook_experiment` | `experiments/dynamic_runbook_experiment.cpp` | End-to-end distributed dynamic run that sweeps all routing modes/params per search step — Figs. 6, 7. |
+| `bin/runbook_centers` | `experiments/theoretical_dynamic_simulation/runbook_centers.cpp` | Per-step routing-state generator (centroids, counts, routing HNSW, base layer) — Figs. 4–5. |
+| `bin/runbook_partitions_parallel` | `experiments/theoretical_dynamic_simulation/runbook_partitions_parallel.cpp` | Per-step partitioner over an existing base layer — Figs. 4–5. |
 
 ---
 
@@ -62,14 +62,12 @@ Experiments are selected by a **dataset key** passed on the command line. Keys a
 their file paths are defined in the `DATASETS` registry at the top of
 [`src/utils.cpp`](src/utils.cpp); either place your data at the same locations or 
 edit this table so each entry points at your
-local copy of the data. Each entry provides a `base_file`, `runbook` (streaming
-runbook YAML), `query_file`, and `ground_truth_dir`.
-
+local copy of the data.
 The paper evaluates two base datasets, using the standard
 [big-ann-benchmarks](https://big-ann-benchmarks.com/) file format:
 
-- **SIFT / BIGANN** — 128-dim, `L2` (registry keys `bigann-*`).
-- **MSTuring** — 100-dim, `L2` (registry keys `msturing-*`).
+- **SIFT / BIGANN** — 128-dim, `L2`.
+- **MSTuring** — 100-dim, `L2`.
 
 Both are used at 100M and 500M scale, each with three streaming workloads
 (`clustered`, `uniform`/`random`, `shift`), e.g. `msturing-100M-clustered`,
@@ -94,30 +92,81 @@ keys, thresholds, and paths used in the paper.
 
 ### Static quality and routing
 
-Partitioning/routing quality, no local search (**Fig. 2**):
+Partitioning & theoretical recall, no local graphs **(Figure 2)**:
 
 ```bash
-# Runs bin/theoretical_partitioning_quality, then the routing oracles.
-./scripts/run_theoretical_partition_quality.sh <dataset> <num_partitions> <sample_size>
+# build routing layer & compute theoretical recall
+./bin/theoretical_partitioning_quality <dataset> <num_partitions> <sample_size>
+# run oracles
+python oracles/static_datasets/nprobe_oracle.py         --router <run_dir>/metaHNSW.bin --partition-file <run_dir>/partitions.bin ...
+python oracles/static_datasets/recall_target_oracle.py  --router <run_dir>/metaHNSW.bin --partition-file <run_dir>/partitions.bin ...
+python oracles/static_datasets/branching_factor_oracle.py --router <run_dir>/metaHNSW.bin --partition-file <run_dir>/partitions.bin ...
 ```
 
-Static recall-vs-QPS, sweeping all routing modes on the cluster (**Fig. 3**). 
+Recall-vs-QPS **(Figure 3)**:
 
 ```bash
 # 1. Build the static index (meta-HNSW + per-worker shards).
 mpirun -np <num_workers+1> ./bin/static_partitioning \
     <dataset> <num_partitions>
 
-# 2. Sweep routing modes against the pre-built index.
+# 2. Run searches, sweep routing modes and params against the index.
 mpirun -np <num_workers+1> ./bin/static_qps \
     <dataset> <num_partitions> <k> <output_file>
 ```
 
-### Dynamic / streaming experiments
+### Dynamic theoretical recall (Figs. 4–5)
 
-The script sweeps the three routing modes at each search step of a streaming runbook:
+Figs. 4 and 5 come from *simulated* runs that isolate routing and partitioning
+from local search. Three stages:
 
-**Fig 6 & 7**
+**1. Per-step routing state.** Replay the runbook and, at every step, update the
+routing layer for the current active set:
+
+```bash
+./bin/runbook_centers \
+    --dataset <dataset> --centers 10000 \
+    --out-dir cluster_history_<dataset>_10000
+```
+
+The base vectors and runbook are read from the `DATASETS` registry for the key. Per
+step this writes `step_NNNNNN_centers.csv`, `_center_counts.csv`, `_hnsw.bin` (the
+routing HNSW), and `_base_layer.csv` (the proximity graph). Outputs are saved to the `cluster_history_<dataset>_10000` - the "base dir" used in step 3.
+
+**2. Per-step partitioning.** Partition each step's base layer into
+`num_partitions` blocks with KaHIP:
+
+```bash
+./bin/runbook_partitions_parallel \
+    cluster_history_<dataset>_10000 \
+    cluster_history_<dataset>_10000_<num_partitions> \
+    <num_partitions>
+```
+
+This writes `step_NNNNNN_partitions.csv` (centroid→worker) per step to `cluster_history_<dataset>_10000_<num_partitions>` — the "partitions dir" used in step 3.
+
+**3. Theoretical recall across steps.** For a routing mode, route the query set at
+each step using that step's HNSW + partitions and measure the fraction of true
+neighbors in the selected partitions:
+
+```bash
+python oracles/theoretical_dynamic_simulation/compute_theoretical_recall_updated.py \
+    --base-dir       cluster_history_<dataset>_10000 \
+    --partitions-dir cluster_history_<dataset>_10000_<num_partitions> \
+    --runbook-path <runbook.yaml> --query-file <query> --base-file <base> --gt-dir <gt> \
+    --mode {NProbe|RecallTarget|BranchingFactor} \
+    --threshold <τ>
+```
+
+`--threshold τ` simulates maintenance: the router/partitions switch to a fresh state only when drift exceeds τ.
+
+<!-- (The `run_branching_factor_sweep.sh` / `run_nprobe_sweep.sh` / `run_threshold_sweep.sh`
+scripts sweep steps and params with a fixed `--mode`.) -->
+
+### End-to-end dynamic performance (Figs. 6–7)
+
+Replay a streaming runbook end-to-end (insert/delete/search with local search and
+online maintenance), sweeping the three routing modes at each search step:
 
 ```bash
 mpirun -np <num_workers+1> ./bin/dynamic_runbook_experiment \
@@ -126,22 +175,16 @@ mpirun -np <num_workers+1> ./bin/dynamic_runbook_experiment \
     [--search-fraction <p1,p2,...>]
 ```
 
-- `full_threshold` — number of centroids that must migrate to trigger a routing
-  rebuild. With 10,000 centroids, the paper's maintenance threshold τ = 0.6
-  corresponds to `6000`; set it `>= 10000` (`NCENTERS`) to disable maintenance
-  (the "never maintain" baseline).
+- `full_threshold` — centroids that must migrate to trigger a routing rebuild.
+  With 10,000 centroids, τ = 0.6 corresponds to `6000`; set it `>= 10000`
+  (`NCENTERS`) to disable maintenance (the "never maintain" baseline).
 - `--init-state-dir` / `--init-partitions` — start from a pre-generated
-  `runbook_centers` state instead of building from scratch.
-- `--search-fraction` — run each search step at one or more target search:update
-  ratios in a single pass; used for the **Fig 7** time breakdown.
+  `runbook_centers` state (see below) instead of building from scratch.
+- `--search-fraction` — run each search step at one or more search:update ratios
+  in one pass; used for the **Fig. 7** time breakdown.
 
-For convenience:
-
-- `scripts/run_overnight.sh [rankfile]` — **Fig. 4** (index quality under updates):
-  builds from scratch and sweeps the 100M runbooks at different maintenance thresholds.
-- `scripts/run_overnight_500M.sh [rankfile]` — **Figs. 6–7** (end-to-end
-  performance and time breakdown): the 500M end-to-end runs.
-- `scripts/run_threshold_sweep.sh` — **Fig. 5**: sweeps the maintenance threshold.
+<!-- Fig. 6 uses the 500M datasets; `scripts/run_overnight_500M.sh` batches these runs
+across datasets and thresholds (`run_overnight.sh` is the 100M variant). -->
 
 ---
 

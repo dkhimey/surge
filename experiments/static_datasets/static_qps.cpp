@@ -1,4 +1,4 @@
-// shared_static_experiment.cpp
+// static_qps.cpp
 //
 // Static-index throughput benchmark.
 //
@@ -14,7 +14,7 @@
 //  - Loads a pre-built static index; no insert / delete / rebuild logic.
 //
 // ─── Usage ───────────────────────────────────────────────────────────────────
-//   mpirun -np <P+1> ./shared_static_experiment \
+//   mpirun -np <P+1> ./static_qps \
 //       <dataset> <num_partitions> <k> <output_file>
 //
 // ─── Sweep parameter grids ───────────────────────────────────────────────────

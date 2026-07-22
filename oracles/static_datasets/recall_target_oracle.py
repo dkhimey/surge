@@ -316,4 +316,4 @@ if __name__ == "__main__":
 # --format u8bin 
 # --ef 100 
 # --dataset-name
-# --out-file /dataset/surge/results/theoretical_partition_quality_sift-500M_10_20260519_130459/oracle_target_recall_results.csv
+# --out-file /dataset/surge/results/theoretical_partition_quality_bigann-500M_10/oracle_target_recall_results.csv
