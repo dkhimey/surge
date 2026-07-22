@@ -617,13 +617,13 @@ int main(int argc, char** argv)
             std::cout << "[Sweep] Loading starting state from cluster analysis: "
                       << init_state_dir << " (step " << init_state_step << "),"
                       << " partitions=" << init_partitions_file << "\n";
-            metaIndex.loadFromClusterAnalysis(init_state_dir, init_state_step,
+            metaIndex.load_from_cluster_analysis(init_state_dir, init_state_step,
                                               init_partitions_file, num_partitions,
                                               EF_SEARCH, init_start);
 
 
-            const auto& l2c   = metaIndex.getLabelToCenter();
-            const auto& parts = metaIndex.getPartitions();
+            const auto& l2c   = metaIndex.get_label_to_center();
+            const auto& parts = metaIndex.get_partitions();
             std::vector<int> preassigned(static_cast<size_t>(init_start) + init_n, 0);
             int missing = 0;
             for (int i = 0; i < init_n; i++) {
@@ -655,7 +655,7 @@ int main(int argc, char** argv)
         } else if (!resuming) {
             const size_t ss = std::min(static_cast<size_t>(init_n), SAMPLE_SIZE);
             std::vector<float> sample = getSample(base_file, init_n, dim, ss, init_start);
-            metaIndex.setSampleData(sample.data(), ss);
+            metaIndex.set_sample_data(sample.data(), ss);
             metaIndex.build(NCENTERS, num_partitions, EF_CONSTRUCTION, M_META);
             std::cout << "[Sweep] Distributing initial " << init_n << " vectors (offset " << init_start << ")\n";
             metaIndex.distribute_vectors(base_file, init_n, false, NUM_BUILDING_THREADS, nullptr, init_start);
@@ -669,13 +669,13 @@ int main(int argc, char** argv)
             metaIndex.load(resume_ckpt + "/coordinator", EF_SEARCH);
         }
 
-        routing_hnsw = metaIndex.getMetaHNSW();
+        routing_hnsw = metaIndex.get_meta_hnsw();
 
         // Broadcast routing state to executors
         bcastRoutingState(rank, dim,
-                          metaIndex.getMetaHNSW(),
-                          &metaIndex.getPartitions(),
-                          &metaIndex.getLabelToCenter(),
+                          metaIndex.get_meta_hnsw(),
+                          &metaIndex.get_partitions(),
+                          &metaIndex.get_label_to_center(),
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
@@ -811,11 +811,11 @@ int main(int argc, char** argv)
 
         // Update routing state after rebuild
         auto sync_routing_after_rebuild = [&]() {
-            routing_hnsw       = metaIndex.getMetaHNSW();
-            routing_partitions = metaIndex.getPartitions();
+            routing_hnsw       = metaIndex.get_meta_hnsw();
+            routing_partitions = metaIndex.get_partitions();
             bcastRoutingState(rank, dim,
-                              metaIndex.getMetaHNSW(),
-                              &metaIndex.getPartitions(),
+                              metaIndex.get_meta_hnsw(),
+                              &metaIndex.get_partitions(),
                               nullptr,
                               routing_hnsw, routing_partitions, label_to_center,
                               &meta_space, false);
@@ -956,13 +956,13 @@ int main(int argc, char** argv)
                     std::vector<int> cids(n_insert);
                     for (int i = 0; i < n_insert; i++)
                         cids[i] = label_to_center[step.start + i];
-                    metaIndex.updateCentersForInsertBatch(batch, cids);
+                    metaIndex.update_centers_for_insert_batch(batch, cids);
                 }
 
                 int    rb_type   = 0;
                 double max_ratio = 0.0;
                 if (maintenance_enabled && rebuild_check_due) {
-                    rb_type = metaIndex.checkNeedRebuild(
+                    rb_type = metaIndex.check_need_rebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     double coord_ratio = 0.0;
                     MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
@@ -986,20 +986,20 @@ int main(int argc, char** argv)
 
                     const double t_rb0 = MPI_Wtime();
                     if (rb_type > 0) {
-                        if (actual_delta) metaIndex.doRebuildDelta(world_size);
-                        else              metaIndex.doRebuildSimple(world_size);
+                        if (actual_delta) metaIndex.do_rebuild_delta(world_size);
+                        else              metaIndex.do_rebuild_simple(world_size);
                     } else {
-                        metaIndex.doForceFullRebuild(world_size, EF_CONSTRUCTION, M_META);
+                        metaIndex.do_force_full_rebuild(world_size, EF_CONSTRUCTION, M_META);
                     }
                     rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
                     rb_stats.rebuild_type     = actual_delta ? "delta" : "full";
-                    rb_stats.centers_moved    = metaIndex.getCachedCentersMoved();
-                    rb_stats.elements_moved   = metaIndex.getCachedElementsMoved();
-                    rb_stats.repart_hnsw_s    = metaIndex.getCachedRepartHnswS();
-                    rb_stats.repart_bottom_s  = metaIndex.getCachedRepartBottomS();
-                    rb_stats.repart_kaffpa_s  = metaIndex.getCachedRepartKaffpaS();
-                    rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
+                    rb_stats.centers_moved    = metaIndex.get_cached_centers_moved();
+                    rb_stats.elements_moved   = metaIndex.get_cached_elements_moved();
+                    rb_stats.repart_hnsw_s    = metaIndex.get_cached_repart_hnsw_s();
+                    rb_stats.repart_bottom_s  = metaIndex.get_cached_repart_bottom_s();
+                    rb_stats.repart_kaffpa_s  = metaIndex.get_cached_repart_kaffpa_s();
+                    rb_stats.repart_relabel_s = metaIndex.get_cached_repart_relabel_s();
 
                     sync_routing_after_rebuild();
 
@@ -1093,13 +1093,13 @@ int main(int argc, char** argv)
                         valid_cids.push_back(del_center_ids[i]);
                     }
                     if (!valid_cids.empty())
-                        metaIndex.updateCentersForDeleteBatch(valid_vecs, valid_cids);
+                        metaIndex.update_centers_for_delete_batch(valid_vecs, valid_cids);
                 }
 
                 int    rb_type   = 0;
                 double max_ratio = 0.0;
                 if (maintenance_enabled && rebuild_check_due) {
-                    rb_type = metaIndex.checkNeedRebuild(
+                    rb_type = metaIndex.check_need_rebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     double coord_ratio = 0.0;
                     MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
@@ -1123,20 +1123,20 @@ int main(int argc, char** argv)
 
                     const double t_rb0 = MPI_Wtime();
                     if (rb_type > 0) {
-                        if (actual_delta) metaIndex.doRebuildDelta(world_size);
-                        else              metaIndex.doRebuildSimple(world_size);
+                        if (actual_delta) metaIndex.do_rebuild_delta(world_size);
+                        else              metaIndex.do_rebuild_simple(world_size);
                     } else {
-                        metaIndex.doForceFullRebuild(world_size, EF_CONSTRUCTION, M_META);
+                        metaIndex.do_force_full_rebuild(world_size, EF_CONSTRUCTION, M_META);
                     }
                     rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
 
                     rb_stats.rebuild_type     = actual_delta ? "delta" : "full";
-                    rb_stats.centers_moved    = metaIndex.getCachedCentersMoved();
-                    rb_stats.elements_moved   = metaIndex.getCachedElementsMoved();
-                    rb_stats.repart_hnsw_s    = metaIndex.getCachedRepartHnswS();
-                    rb_stats.repart_bottom_s  = metaIndex.getCachedRepartBottomS();
-                    rb_stats.repart_kaffpa_s  = metaIndex.getCachedRepartKaffpaS();
-                    rb_stats.repart_relabel_s = metaIndex.getCachedRepartRelabelS();
+                    rb_stats.centers_moved    = metaIndex.get_cached_centers_moved();
+                    rb_stats.elements_moved   = metaIndex.get_cached_elements_moved();
+                    rb_stats.repart_hnsw_s    = metaIndex.get_cached_repart_hnsw_s();
+                    rb_stats.repart_bottom_s  = metaIndex.get_cached_repart_bottom_s();
+                    rb_stats.repart_kaffpa_s  = metaIndex.get_cached_repart_kaffpa_s();
+                    rb_stats.repart_relabel_s = metaIndex.get_cached_repart_relabel_s();
 
                     sync_routing_after_rebuild();
 
@@ -1209,7 +1209,7 @@ int main(int argc, char** argv)
                 if (!have_gt && have_static_gt) { gt = static_gt; have_gt = true; }
 
                 {
-                    routing_center_counts = metaIndex.getCenterCounts();
+                    routing_center_counts = metaIndex.get_center_counts();
                     int n = static_cast<int>(routing_center_counts.size());
                     MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
                     MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
@@ -1624,7 +1624,7 @@ int main(int argc, char** argv)
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
                     if (hdr.type == END_OF_COMMUNICATION) { done = true; }
-                    else { assert(hdr.type == VECTOR_SEND); subIndex.receiveData(hdr.size); }
+                    else { assert(hdr.type == VECTOR_SEND); subIndex.receive_data(hdr.size); }
                 }
             }
             subIndex.build(EF_CONSTRUCTION, M_SUB, NUM_BUILDING_THREADS);
@@ -1633,7 +1633,7 @@ int main(int argc, char** argv)
             {
                 MessageHeader hdr;
                 comm.recv_header(hdr, 0);
-                if (hdr.type == SET_EF_SEARCH) subIndex.setEfSearch(hdr.size);
+                if (hdr.type == SET_EF_SEARCH) subIndex.set_ef_search(hdr.size);
             }
         } else {
             std::cout << "[Sweep Executor " << rank
@@ -1661,14 +1661,14 @@ int main(int argc, char** argv)
             for (int j = 0; j < n_lts; j++) label_to_shard[lts_keys[j]] = lts_vals[j];
         }
         if (!resuming) {
-            unsigned long long my_size = subIndex.getElementCount();
+            unsigned long long my_size = subIndex.get_element_count();
             MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                        nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
         }
 
         // Helper: sync label_to_shard after rebuild
         auto sync_label_to_shard_after_rebuild_exec = [&]() {
-            const auto& arrived = subIndex.getLastRebuildMovedLabels();
+            const auto& arrived = subIndex.get_last_rebuild_moved_labels();
             const int my_n = static_cast<int>(arrived.size());
             std::vector<int> all_ns(world_size);
             MPI_Allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
@@ -1761,7 +1761,7 @@ int main(int argc, char** argv)
                         }
                     }
                     if (!flat_labels.empty())
-                        subIndex.insertLocalBatch(flat_vecs, flat_labels);
+                        subIndex.insert_local_batch(flat_vecs, flat_labels);
                 }
 
                 {
@@ -1801,7 +1801,7 @@ int main(int argc, char** argv)
 
                 // Tombstone ratio check
                 if (maintenance_enabled && rebuild_check_due) {
-                    double my_ratio = subIndex.getTombstoneRatio();
+                    double my_ratio = subIndex.get_tombstone_ratio();
                     double dummy_max = 0.0;
                     MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
                                MPI_MAX, 0, MPI_COMM_WORLD);
@@ -1812,10 +1812,10 @@ int main(int argc, char** argv)
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {
-                        subIndex.reBuildDelta(static_cast<int>(hdr.size), NCENTERS,
+                        subIndex.rebuild_delta(static_cast<int>(hdr.size), NCENTERS,
                                               world_size, NUM_BUILDING_THREADS);
                     } else {
-                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                        subIndex.rebuild(static_cast<int>(hdr.size), NCENTERS,
                                          world_size, EF_CONSTRUCTION, M_SUB,
                                          NUM_BUILDING_THREADS);
                     }
@@ -1825,9 +1825,9 @@ int main(int argc, char** argv)
                                       &meta_space, false);
                     // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
                     double exec_send[3] = {
-                        subIndex.getLastRebuildIterateS(),
-                        subIndex.getLastRebuildExchangeS(),
-                        subIndex.getLastRebuildGraphS()
+                        subIndex.get_last_rebuild_iterate_s(),
+                        subIndex.get_last_rebuild_exchange_s(),
+                        subIndex.get_last_rebuild_graph_s()
                     };
                     double exec_recv[3]; // unused on non-root ranks
                     MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
@@ -1836,7 +1836,7 @@ int main(int argc, char** argv)
                     // the coordinator's SUM reduce.
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {
                         long long del_send = static_cast<long long>(
-                            subIndex.getLastRebuildRemainingDeleted());
+                            subIndex.get_last_rebuild_remaining_deleted());
                         long long del_recv = 0LL; // unused on non-root ranks
                         MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0, MPI_COMM_WORLD);
@@ -1846,7 +1846,7 @@ int main(int argc, char** argv)
                 }
 
                 {
-                    unsigned long long my_size = subIndex.getElementCount();
+                    unsigned long long my_size = subIndex.get_element_count();
                     MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                                nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
                 }
@@ -1880,7 +1880,7 @@ int main(int argc, char** argv)
                         my_delete_labels.push_back(label);
                     }
                 }
-                subIndex.markDeleteLocalBatch(my_delete_labels);
+                subIndex.mark_delete_local_batch(my_delete_labels);
 
                 {
                     double elapsed = MPI_Wtime() - t0_del;
@@ -1890,7 +1890,7 @@ int main(int argc, char** argv)
 
                 // Tombstone ratio check
                 if (maintenance_enabled && rebuild_check_due) {
-                    double my_ratio = subIndex.getTombstoneRatio();
+                    double my_ratio = subIndex.get_tombstone_ratio();
                     double dummy_max = 0.0;
                     MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
                                MPI_MAX, 0, MPI_COMM_WORLD);
@@ -1901,10 +1901,10 @@ int main(int argc, char** argv)
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {
-                        subIndex.reBuildDelta(static_cast<int>(hdr.size), NCENTERS,
+                        subIndex.rebuild_delta(static_cast<int>(hdr.size), NCENTERS,
                                               world_size, NUM_BUILDING_THREADS);
                     } else {
-                        subIndex.reBuild(static_cast<int>(hdr.size), NCENTERS,
+                        subIndex.rebuild(static_cast<int>(hdr.size), NCENTERS,
                                          world_size, EF_CONSTRUCTION, M_SUB,
                                          NUM_BUILDING_THREADS);
                     }
@@ -1914,9 +1914,9 @@ int main(int argc, char** argv)
                                       &meta_space, false);
                     // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
                     double exec_send[3] = {
-                        subIndex.getLastRebuildIterateS(),
-                        subIndex.getLastRebuildExchangeS(),
-                        subIndex.getLastRebuildGraphS()
+                        subIndex.get_last_rebuild_iterate_s(),
+                        subIndex.get_last_rebuild_exchange_s(),
+                        subIndex.get_last_rebuild_graph_s()
                     };
                     double exec_recv[3]; // unused on non-root ranks
                     MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
@@ -1925,7 +1925,7 @@ int main(int argc, char** argv)
                     // the coordinator's SUM reduce.
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {
                         long long del_send = static_cast<long long>(
-                            subIndex.getLastRebuildRemainingDeleted());
+                            subIndex.get_last_rebuild_remaining_deleted());
                         long long del_recv = 0LL; // unused on non-root ranks
                         MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0, MPI_COMM_WORLD);
@@ -1935,7 +1935,7 @@ int main(int argc, char** argv)
                 }
 
                 {
-                    unsigned long long my_size = subIndex.getElementCount();
+                    unsigned long long my_size = subIndex.get_element_count();
                     MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                                nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
                 }
@@ -2076,7 +2076,7 @@ int main(int argc, char** argv)
                         if (recv_qids[src].empty()) continue;
                         const size_t nrecv     = recv_qids[src].size();
                         std::vector<float> flat_qvecs(recv_qvecs[src]);
-                        auto results = subIndex.searchLocalBatch(flat_qvecs, nrecv, k);
+                        auto results = subIndex.search_local_batch(flat_qvecs, nrecv, k);
 
                         for (size_t j = 0; j < nrecv; j++) {
                             const uint32_t qid   = recv_qids[src][j];
@@ -2175,7 +2175,7 @@ int main(int argc, char** argv)
 
                 // Participate in shard size gather.
                 {
-                    unsigned long long my_size = subIndex.getElementCount();
+                    unsigned long long my_size = subIndex.get_element_count();
                     MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                                nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
                 }
@@ -2183,7 +2183,7 @@ int main(int argc, char** argv)
             } else {
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
-                unsigned long long my_size = subIndex.getElementCount();
+                unsigned long long my_size = subIndex.get_element_count();
                 MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
                            nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             }

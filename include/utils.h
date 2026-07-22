@@ -81,172 +81,6 @@ typedef enum {
     DRAINING 
 } RebuildState;
 
-typedef struct BenchmarkParams {
-    FileFormat format; 
-    std::string base_file;
-    std::string query_file;
-    std::string ground_truth_file;
-    std::string insert_file;
-    std::string ground_truth_prefix;
-
-    size_t branching_factor;
-    size_t num_neighbors_request;
-    size_t num_closest_from_ground;
-    size_t num_to_insert;
-
-    BenchmarkParams() {}
-
-    BenchmarkParams(const std::string& file_format,
-                    const std::string& base_file, 
-                    const std::string& query_file, 
-                    const std::string& ground_truth_file,
-                    const std::string& insert_file,
-                    const std::string& ground_truth_prefix,
-                    size_t branching_factor,
-                    size_t num_neighbors_request,
-                    size_t num_closest_from_ground,
-                    size_t num_to_insert_) : 
-                base_file(base_file), 
-                query_file(query_file), 
-                ground_truth_file(ground_truth_file),
-                insert_file(insert_file),
-                ground_truth_prefix(ground_truth_prefix),
-                branching_factor(branching_factor),
-                num_neighbors_request(num_neighbors_request),
-                num_closest_from_ground(num_closest_from_ground) {
-                    num_to_insert = num_to_insert_;
-                    if (file_format == "bvecs") format = BVECS;
-                    if (file_format == "fvecs") format = FVECS;
-                    if (file_format == "i8bin") format = I8BIN;
-                    if (file_format == "u8bin") format = U8BIN;
-                    if (file_format == "fbin") format = FBIN;
-                }
-} BenchmarkParams;
-
-typedef struct IndexFiles {
-    std::string meta_dir;
-    std::string sub_prefix;
-
-    IndexFiles() {};
-    IndexFiles(const std::string& meta_dir,
-               const std::string& sub_prefix) : 
-            meta_dir(meta_dir), sub_prefix(sub_prefix) {}
-} IndexFiles;
-
-typedef struct ReIndexParams {
-    int full_threshold, partial_threshold;
-
-    ReIndexParams() {}
-    ReIndexParams(int full_threshold,
-                  int partial_threshold) : 
-                  full_threshold(full_threshold), 
-                  partial_threshold(partial_threshold) {
-                    assert(full_threshold >= partial_threshold);
-                  }
-
-} ReIndexParams;
-
-typedef struct Config {
-    size_t num_vectors;
-    size_t dim;
-    size_t sample_size;
-    size_t kmeans_centers;
-    size_t M_meta;
-    size_t M_sub;
-    size_t ef_construction;
-    size_t num_partitions;
-    size_t num_building_threads;
-    size_t VECTOR_BATCH_SIZE;
-    float kmeans_epsilon;
-    bool mips;
-    bool check_recalls;
-    bool check_logs = false;
-    std::string log_id;
-
-    json raw_data;
-
-    BenchmarkParams benchmark_params;
-    IndexFiles index_files;
-    ReIndexParams reindex_params;
-
-    Config() {
-        auto now = std::time(nullptr);
-        auto* tm = std::localtime(&now);
-        std::ostringstream oss;
-        oss << std::put_time(tm, "%Y%m%d_%H%M%S");
-        log_id = oss.str();
-        std::cout << "LOG ID " << log_id << "\n";
-    }
-
-    Config(const std::string& filename, bool build = true, std::string log_id_ = "") {
-        std::ifstream input(filename);
-        if (!input.is_open()) {
-            throw std::runtime_error("Cannot open config file: " + filename);
-        }
-
-        input >> raw_data;
-
-        num_vectors = raw_data["num_vectors"];
-        dim = raw_data["dim"];
-        sample_size = raw_data["sample_size"];
-        kmeans_centers= raw_data["kmeans_centers"];
-        kmeans_epsilon = raw_data["kmeans_EPSILON"];
-        M_meta = raw_data["M_meta"];
-        M_sub = raw_data["M_sub"];
-        ef_construction = raw_data["ef_construction"];
-        num_partitions = raw_data["num_partitions"];
-        num_building_threads = raw_data["num_building_threads"];
-        VECTOR_BATCH_SIZE = raw_data["VECTOR_BATCH_SIZE"];
-        mips = raw_data["mips"];
-        check_recalls = raw_data["check_recalls"];
-        check_logs = raw_data["check_logs"];
-
-        size_t num_to_insert = 0;
-        if (raw_data["benchmark_params"].contains("num_to_insert")) {
-            num_to_insert = raw_data["benchmark_params"]["num_to_insert"];
-        }
-
-        std::string ground_truth_prefix = "";
-        if (raw_data["benchmark_params"].contains("ground_truth_prefix")) {
-            ground_truth_prefix = raw_data["benchmark_params"]["ground_truth_prefix"];
-        }
-
-        benchmark_params = BenchmarkParams(raw_data["benchmark_params"]["file_format"],
-                                         raw_data["benchmark_params"]["base_file"],
-                                         raw_data["benchmark_params"]["query_file"],
-                                         raw_data["benchmark_params"]["ground_truth_file"],
-                                         raw_data["benchmark_params"]["base_file"],
-                                         ground_truth_prefix,
-                                         raw_data["benchmark_params"]["branching_factor"],
-                                         raw_data["benchmark_params"]["num_neighbors_request"],
-                                         raw_data["benchmark_params"]["num_closest_from_ground"],
-                                         num_to_insert);
-
-        index_files = IndexFiles(raw_data["index_files"]["meta_dir"],
-                                 raw_data["index_files"]["sub_prefix"]);
-
-        reindex_params = ReIndexParams(raw_data["reindex_params"]["full_threshold"],
-                                       raw_data["reindex_params"]["partial_threshold"]);
-
-        if (build) {
-            auto now = std::time(nullptr);
-            auto* tm = std::localtime(&now);
-            std::ostringstream oss;
-            oss << std::put_time(tm, "%Y%m%d_%H%M%S");
-            log_id = oss.str();
-
-            raw_data["last_build_id"] = log_id;
-            std::ofstream outputFile(filename);
-            outputFile << raw_data.dump(4);
-            outputFile.close();
-        } else if (log_id_ == "") {
-            log_id = raw_data["last_build_id"];
-        } else {
-            log_id = log_id_;
-        }
-    }
-} Config;
-
 typedef struct Log {
     size_t correct, total;
 
@@ -259,7 +93,6 @@ typedef struct Log {
     double search_time, send_time;
     double edge_cut_ratio;
 
-    json config_data;
     std::string log_dir;
     std::string run_id;
     std::string meta_index_path;  // set explicitly when not using a config file
@@ -275,25 +108,6 @@ typedef struct Log {
     }
 
 
-    Log(std::string& log_id, json raw_data) {
-        config_data = raw_data;
-        log_dir = "logs/run_" + log_id;
-        if (!std::filesystem::exists(log_dir)) {
-            std::filesystem::create_directories(log_dir);
-        }
-
-        auto now = std::time(nullptr);
-        auto* tm = std::localtime(&now);
-        std::ostringstream oss;
-        oss << std::put_time(tm, "%Y%m%d_%H%M%S");
-        run_id = oss.str();
-
-        std::string config_out = log_dir + "/config.json";
-        std::ofstream outputFile(config_out);
-        outputFile << raw_data.dump(4);
-        outputFile.close();
-    }
-
     void saveControllerLog(std::vector<int> per_partition_counts) {
         std::string filename = log_dir + "/controller_build.json";
         json data;
@@ -303,10 +117,6 @@ typedef struct Log {
         std::string index_path;
         if (!meta_index_path.empty()) {
             index_path = meta_index_path;
-        } else if (config_data.contains("index_files") &&
-                   config_data["index_files"].contains("meta_dir") &&
-                   config_data["index_files"]["meta_dir"].is_string()) {
-            index_path = std::string(config_data["index_files"]["meta_dir"]) + "/metaHNSW.bin";
         }
         if (!index_path.empty() && std::filesystem::exists(index_path)) {
             data["index_size"] = std::filesystem::file_size(index_path);
@@ -337,12 +147,6 @@ typedef struct Log {
         std::string index_path;
         if (!sub_index_path.empty()) {
             index_path = sub_index_path;
-        } else if (config_data.contains("index_files") &&
-                   config_data["index_files"].contains("sub_prefix") &&
-                   config_data["index_files"]["sub_prefix"].is_string()) {
-            char suffix[10];
-            snprintf(suffix, 10, "_%lu.bin", node);
-            index_path = std::string(config_data["index_files"]["sub_prefix"]) + suffix;
         }
         if (!index_path.empty() && std::filesystem::exists(index_path)) {
             data["index_size"] = std::filesystem::file_size(index_path);
@@ -352,31 +156,6 @@ typedef struct Log {
 
         std::ofstream outputFile(filename);
         outputFile << data.dump(4);
-        outputFile.close();
-    }
-
-    void saveResult(size_t correct, size_t total, double query_time) {
-        config_data["result"]["correct"] = correct;
-        config_data["result"]["total"] = total;
-        config_data["result"]["query_total_time"] = query_time;
-        config_data["result"]["qps"] = total / query_time;
-
-        std::string config_out = log_dir + "/config_" + run_id + ".json";
-        std::ofstream outputFile(config_out);
-        outputFile << config_data.dump(4);
-        outputFile.close();
-    }
-
-    void saveResult(double recall, size_t correct, size_t total, double query_time) {
-        config_data["result"]["recall"] = recall;
-        config_data["result"]["correct"] = correct;
-        config_data["result"]["total"] = total;
-        config_data["result"]["query_total_time"] = query_time;
-        config_data["result"]["qps"] = total / query_time;
-
-        std::string config_out = log_dir + "/config_" + run_id + ".json";
-        std::ofstream outputFile(config_out);
-        outputFile << config_data.dump(4);
         outputFile.close();
     }
 

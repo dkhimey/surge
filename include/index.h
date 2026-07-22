@@ -5,12 +5,12 @@
 #include <shared_mutex>
 #include <unordered_map>
 
-#define KMEANS_EPOCHS 100
-#define VECTOR_BATCH_SIZE 100000
+constexpr int KMEANS_EPOCHS = 100;
+constexpr int VECTOR_BATCH_SIZE = 100000;
 
 enum class RoutingMode {
     BranchingFactor, // param = branching factor (number of nearest centroids to search)
-    NProbe,          // param = number of unique partitions to collect
+    NProbe,          // param = number of unique partitions_ to collect
     RecallTarget,    // param = target recall in [0, 1]
 };
 
@@ -35,7 +35,7 @@ public:
     Coordinator(const Coordinator&)            = delete;
     Coordinator& operator=(const Coordinator&) = delete;
 
-    void setSampleData(float* data, size_t count);
+    void set_sample_data(float* data, size_t count);
     void build(
         int ncenters,
         int num_partitions,
@@ -49,8 +49,8 @@ public:
 
     // Load coordinator state from cluster analysis output
     // Reads step_<step>_hnsw.bin, _centers.csv, _center_counts.csv, _labels.csv,
-    // and partitions file (center -> shard mapping)
-    void loadFromClusterAnalysis(
+    // and partitions_ file (center -> shard mapping)
+    void load_from_cluster_analysis(
         const std::string& state_dir,
         int                step,
         const std::string& partitions_file,
@@ -59,40 +59,40 @@ public:
         int                init_start);
 
     // Expose routing state for replication across ranks
-    hnswlib::HierarchicalNSW<float>* getMetaHNSW() { return meta_HNSW_; }
-    const std::vector<int>& getPartitions() const { return partitions; }
-    const std::unordered_map<int,int>& getLabelToCenter() const { return label_to_center_; }
-    const std::vector<int>& getCenterCounts() const { return center_counts_; }
+    hnswlib::HierarchicalNSW<float>* get_meta_hnsw() { return meta_HNSW_; }
+    const std::vector<int>& get_partitions() const { return partitions_; }
+    const std::unordered_map<int,int>& get_label_to_center() const { return label_to_center_; }
+    const std::vector<int>& get_center_counts() const { return center_counts_; }
 
     // Batch updates with two-phase locking: accumulate in parallel, apply under write lock
-    void updateCentersForInsertBatch(const std::vector<float>& vecs,
+    void update_centers_for_insert_batch(const std::vector<float>& vecs,
                                       const std::vector<int>& center_ids);
 
-    void updateCentersForDeleteBatch(const std::vector<float>& vecs, 
+    void update_centers_for_delete_batch(const std::vector<float>& vecs, 
                                      const std::vector<int>& closest_center_labels);
     // Check if rebuild needed without executing; caches result (returns 0/1/2)
-    int checkNeedRebuild(int full_threshold, int partial_threshold,
+    int check_need_rebuild(int full_threshold, int partial_threshold,
                          int ef_construction, int M_meta);
 
-    // Execute cached rebuild from checkNeedRebuild; serial only
-    void doRebuildSimple(int world_size);
+    // Execute cached rebuild from check_need_rebuild; serial only
+    void do_rebuild_simple(int world_size);
 
     // Delta rebuild: mark-delete departing elements, insert arriving without reconstructing
-    void doRebuildDelta(int world_size);
+    void do_rebuild_delta(int world_size);
 
     // Force full rebuild independent of thresholds; used for external conditions like tombstone ratio
-    void doForceFullRebuild(int world_size, int ef_construction, int M_meta);
+    void do_force_full_rebuild(int world_size, int ef_construction, int M_meta);
 
-    // Returns statistics from most recent checkNeedRebuild (all zero before first call)
-    int    getCachedElementsMoved()  const { return cached_elements_moved_; }
-    int    getCachedCentersMoved()   const { return cached_centers_moved_; }
-    double getCachedRepartHnswS()    const { return cached_repart_hnsw_s_; }
-    double getCachedRepartBottomS()  const { return cached_repart_bottom_s_; }
-    double getCachedRepartKaffpaS()  const { return cached_repart_kaffpa_s_; }
-    double getCachedRepartRelabelS() const { return cached_repart_relabel_s_; }
+    // Returns statistics from most recent check_need_rebuild (all zero before first call)
+    int    get_cached_elements_moved()  const { return cached_elements_moved_; }
+    int    get_cached_centers_moved()   const { return cached_centers_moved_; }
+    double get_cached_repart_hnsw_s()    const { return cached_repart_hnsw_s_; }
+    double get_cached_repart_bottom_s()  const { return cached_repart_bottom_s_; }
+    double get_cached_repart_kaffpa_s()  const { return cached_repart_kaffpa_s_; }
+    double get_cached_repart_relabel_s() const { return cached_repart_relabel_s_; }
 
     void load_gp(const std::string& prefix, int ef_search);
-    void setEfSearch(int ef_search);
+    void set_ef_search(int ef_search);
 
     // std::vector<size_t> routeQuery(float* query, size_t top_n = 1) const;
     // std::vector<size_t> getPartition(float* vec, int n = 1);
@@ -107,7 +107,7 @@ public:
         int start_offset = 0
     );
 
-    int rePartition(
+    int repartition(
         std::vector<int>& new_partitions,
         hnswlib::HierarchicalNSW<float>*& new_meta_HNSW,
         int ef_construction,
@@ -115,10 +115,10 @@ public:
         double* out_hnsw_s    = nullptr,  // time to build new meta-HNSW
         double* out_bottom_s  = nullptr,  // time to extract bottom layer
         double* out_kaffpa_s  = nullptr,  // time to run kaffpa
-        double* out_relabel_s = nullptr   // time to relabel partitions
+        double* out_relabel_s = nullptr   // time to relabel partitions_
     );
 
-    int reBuild(int world_size, int ef_construction, int M_meta, int full_threshold = 0, int partial_threshold = 0);
+    int rebuild(int world_size, int ef_construction, int M_meta, int full_threshold = 0, int partial_threshold = 0);
 
     std::vector<size_t> route_query(
         float* query_vector,
@@ -199,7 +199,7 @@ public:
 
     void handle_deletes(const std::vector<int>& labels, int world_size);
     
-    size_t getCurrentPartition(float* vec);
+    size_t get_current_partition(float* vec);
     
 private:
     Log* logger_;
@@ -220,26 +220,26 @@ private:
 
     std::vector<int> center_counts_;
     std::vector<float> centers_;
-    std::vector<int> partitions;
+    std::vector<int> partitions_;
     std::atomic<RebuildState> rebuild_state = IDLE;
 
     // building helpers
     int kmeans_(float* sample, size_t nPrime, size_t m_centers, float* centers, float EPSILON = 1e-4f);
-    std::pair<std::vector<int>, std::vector<int>> getBottomLayer_(hnswlib::HierarchicalNSW<float>* graph = nullptr);
-    std::pair<int, std::vector<int>> matchPartitions_(const std::vector<int>& part1, const std::vector<int>& part2);
+    std::pair<std::vector<int>, std::vector<int>> get_bottom_layer_(hnswlib::HierarchicalNSW<float>* graph = nullptr);
+    std::pair<int, std::vector<int>> match_partitions_(const std::vector<int>& part1, const std::vector<int>& part2);
 
     // query helpers
-    std::vector<size_t> getPartitionsForSearch_Branching_(float* vec, int branching_factor, float* dist = nullptr);
-    std::vector<size_t> getPartitionsForSearch_Nprobe_(float* vec, int nprobe, float* dist = nullptr);
-    std::vector<size_t> getPartitionsForSearch_RecallTgt_(float* vec, float recall_target, float* dist = nullptr);
-    std::vector<size_t> getPartitionsForInsert_(float* vec, size_t label, float* dist = nullptr);
-    std::vector<size_t> getPartitionsForDelete_(size_t label);
-    std::vector<std::pair<float, hnswlib::labeltype>> findClosestCenters_(float* vec, size_t n);
-    std::vector<size_t> convertCentersToPartitions_(const std::vector<std::pair<float, hnswlib::labeltype>>& centers, float* dist);
-    void updateCentersForInsert_(float* vec, size_t label, size_t closest_center_label);
-    void updateCentersForDelete_(std::vector<float>& vec, int closest_center_label);
+    std::vector<size_t> get_partitions_for_search_branching_(float* vec, int branching_factor, float* dist = nullptr);
+    std::vector<size_t> get_partitions_for_search_nprobe_(float* vec, int nprobe, float* dist = nullptr);
+    std::vector<size_t> get_partitions_for_search_recall_tgt_(float* vec, float recall_target, float* dist = nullptr);
+    std::vector<size_t> get_partitions_for_insert_(float* vec, size_t label, float* dist = nullptr);
+    std::vector<size_t> get_partitions_for_delete_(size_t label);
+    std::vector<std::pair<float, hnswlib::labeltype>> find_closest_centers_(float* vec, size_t n);
+    std::vector<size_t> convert_centers_to_partitions_(const std::vector<std::pair<float, hnswlib::labeltype>>& centers, float* dist);
+    void update_centers_for_insert_(float* vec, size_t label, size_t closest_center_label);
+    void update_centers_for_delete_(std::vector<float>& vec, int closest_center_label);
 
-    // Cached materials for the checkNeedRebuild / doRebuildSimple split.
+    // Cached materials for the check_need_rebuild / do_rebuild_simple split.
     hnswlib::HierarchicalNSW<float>* cached_new_meta_HNSW_  = nullptr;
     std::vector<int>                 cached_new_partitions_;
     std::vector<char>                cached_hnsw_buffer_;
@@ -277,8 +277,8 @@ public:
     Executor(const Executor&)            = delete;
     Executor& operator=(const Executor&) = delete;
 
-    void receiveData(size_t nrecv_vecs);
-    void setData(float* data, int* indices, size_t count);
+    void receive_data(size_t nrecv_vecs);
+    void set_data(float* data, int* indices, size_t count);
     void build(
         int ef_construction,
         int M_sub,
@@ -287,7 +287,7 @@ public:
 
     void load(const std::string& prefix, int ef_search);
     std::string save(const std::string& prefix);
-    void setEfSearch(int ef_search);
+    void set_ef_search(int ef_search);
 
     void search(size_t k, int tag);
     void insert(int tag);
@@ -296,41 +296,41 @@ public:
 
     // Direct (MPI-free) batch operations for distributed experiments
     // Insert vectors received via AllToAllV; exclusive lock for full batch
-    void insertLocalBatch(const std::vector<float>& vecs,
+    void insert_local_batch(const std::vector<float>& vecs,
                           const std::vector<int>&   labels);
 
     // Mark single vector deleted; silently ignores missing labels
-    void markDeleteLocal(int label);
+    void mark_delete_local(int label);
 
     // Batch delete with shared lock (thread-safe per-element in hnswlib)
-    void markDeleteLocalBatch(const std::vector<int>& labels);
+    void mark_delete_local_batch(const std::vector<int>& labels);
 
     // Search batch of queries; returns sorted results (nearest-first)
     std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>
-    searchLocalBatch(const std::vector<float>& queries,
+    search_local_batch(const std::vector<float>& queries,
                      size_t                     num_queries,
                      size_t                     k);
 
     // Return active (non-deleted) elements in sub-HNSW
-    size_t getElementCount() const;
+    size_t get_element_count() const;
 
     // Return fraction of deleted slots: num_deleted / getCurrentElementCount
-    double getTombstoneRatio() const;
+    double get_tombstone_ratio() const;
 
     // Per-phase timing from most recent rebuild (zero before first call)
-    double getLastRebuildIterateS()  const { return last_rebuild_iterate_s_; }
-    double getLastRebuildExchangeS() const { return last_rebuild_exchange_s_; }
-    double getLastRebuildGraphS()    const { return last_rebuild_graph_s_; }
+    double get_last_rebuild_iterate_s()  const { return last_rebuild_iterate_s_; }
+    double get_last_rebuild_exchange_s() const { return last_rebuild_exchange_s_; }
+    double get_last_rebuild_graph_s()    const { return last_rebuild_graph_s_; }
 
     // Count of deleted slots not yet reused after most recent delta rebuild
-    size_t getLastRebuildRemainingDeleted() const { return last_rebuild_remaining_deleted_; }
+    size_t get_last_rebuild_remaining_deleted() const { return last_rebuild_remaining_deleted_; }
 
     // Labels of vectors that arrived during most recent rebuild (for label_to_shard sync)
-    const std::vector<int>& getLastRebuildMovedLabels() const { return last_rebuild_moved_labels_; }
+    const std::vector<int>& get_last_rebuild_moved_labels() const { return last_rebuild_moved_labels_; }
 
     void batch_search(size_t num_queries, size_t k, int tag);
 
-    void reBuild(
+    void rebuild(
         int meta_size, 
         int ncenters, 
         int world_size, 
@@ -339,7 +339,7 @@ public:
         int num_building_threads = -1
     );
 
-    void reBuildReplace(
+    void rebuild_replace(
         int meta_size,
         int ncenters,
         int world_size,
@@ -349,14 +349,14 @@ public:
 
     // Delta rebuild: mark-delete migrated-out elements, insert migrated-in with replace_deleted=true
     // Graph topology retained; not reconstructed from scratch
-    void reBuildDelta(
+    void rebuild_delta(
         int meta_size,
         int ncenters,
         int world_size,
         int num_building_threads = -1
     );
     
-    void partialReBuild(
+    void partial_rebuild(
         int meta_size, 
         int ncenters, 
         int world_size,

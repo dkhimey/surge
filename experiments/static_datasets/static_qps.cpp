@@ -330,7 +330,7 @@ static void runSearchPass(
             if (recv_qids[src].empty()) continue;
             const size_t nrecv = recv_qids[src].size();
             my_search_load += static_cast<long long>(nrecv);
-            auto results = sub_index->searchLocalBatch(recv_qvecs[src], nrecv, k);
+            auto results = sub_index->search_local_batch(recv_qvecs[src], nrecv, k);
 
             for (size_t j = 0; j < nrecv; j++) {
                 const uint32_t qid   = recv_qids[src][j];
@@ -479,11 +479,11 @@ int main(int argc, char** argv)
         meta_index = new Coordinator(dim, &comm, &logger);
         meta_index->load(meta_dir, EF_SEARCH);
 
-        routing_hnsw = meta_index->getMetaHNSW();
+        routing_hnsw = meta_index->get_meta_hnsw();
         bcastRoutingState(rank, dim,
-                          meta_index->getMetaHNSW(),
-                          &meta_index->getPartitions(),
-                          &meta_index->getCenterCounts(),
+                          meta_index->get_meta_hnsw(),
+                          &meta_index->get_partitions(),
+                          &meta_index->get_center_counts(),
                           routing_hnsw, routing_partitions,
                           routing_counts,
                           &meta_space);
@@ -501,7 +501,7 @@ int main(int argc, char** argv)
         sub_index->load(filename_prefix, EF_SEARCH);
 
         std::cout << "[Static] Executor " << rank
-                  << " loaded " << sub_index->getElementCount()
+                  << " loaded " << sub_index->get_element_count()
                   << " vectors in local graph\n";
 
         bcastRoutingState(rank, dim, nullptr, nullptr, nullptr,
@@ -810,10 +810,6 @@ int main(int argc, char** argv)
     }
 
     // ── Hot-node summary across the whole sweep (rank 0) ───────────────────────
-    // For each mode, print per-executor cumulative load normalised by the mean,
-    // and which executor was hottest most often.  If the same executor tops every
-    // mode, the skew is a property of the partitioning (popularity), and the
-    // recall-target router merely amplifies it.
     if (rank == 0) {
         std::cout << "\n[Static] ===== HOT-NODE SUMMARY (per-executor load / mean) =====\n";
         for (auto& [mode_str, cl] : cum_load) {

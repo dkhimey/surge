@@ -22,9 +22,16 @@
 #include <iomanip>
 #include <omp.h>
 
-#define TAG_SEND_NUM 100000001
-#define TAG_SEND_VECS 100000002
-#define TAG_SEND_LABELS 100000003
+// MPI tags for the peer-to-peer vector exchange during rebuilds.
+constexpr int TAG_SEND_NUM    = 100000001;
+constexpr int TAG_SEND_VECS   = 100000002;
+constexpr int TAG_SEND_LABELS = 100000003;
+
+// Tuning constants (previously magic numbers).
+constexpr double KAFFPA_IMBALANCE       = 0.03;  // KaHIP allowed partition imbalance
+constexpr int    REPARTITION_META_EF    = 200;   // ef for the rebuilt meta-HNSW
+constexpr size_t INSERT_CAPACITY_SLACK  = 100;   // headroom before an insert forces a resize
+constexpr size_t RECALL_TARGET_CANDIDATES = 50;  // nearest centers scored for RecallTarget routing
 
 Coordinator::Coordinator(
         int dim,
@@ -68,14 +75,14 @@ Coordinator::~Coordinator() {
     for (auto& entry : insert_log_) delete[] entry.first;
 }
 
-void Coordinator::setSampleData(float* data, size_t count) {
+void Coordinator::set_sample_data(float* data, size_t count) {
     sample_data_ = data;
     sample_count_ = count;
 
     std::cout << "[Coordinator] Sample data set with " << count << " elements\n";
 }
 
-std::pair<std::vector<int>, std::vector<int>> Coordinator::getBottomLayer_(hnswlib::HierarchicalNSW<float>* graph) {
+std::pair<std::vector<int>, std::vector<int>> Coordinator::get_bottom_layer_(hnswlib::HierarchicalNSW<float>* graph) {
     if (graph == nullptr) graph = meta_HNSW_;
 
     std::unordered_map<int, std::unordered_set<int>> adj_map;
@@ -121,7 +128,7 @@ std::pair<std::vector<int>, std::vector<int>> Coordinator::getBottomLayer_(hnswl
     return {xadj, adjncy};
 }
 
-void Coordinator::setEfSearch(int ef_search) {
+void Coordinator::set_ef_search(int ef_search) {
     std::unique_lock lock(graph_mutex_);
     meta_HNSW_->setEf(ef_search);
 }
@@ -168,10 +175,10 @@ void Coordinator::build(
     logger_->logCenters(centers_);
     // delete[] centers;
 
-    // 4. partition the bottom layer into w partitions
+    // 4. partition the bottom layer into w partitions_
     // Step 1: Build symmetric adjacency list without duplicates
     start = MPI_Wtime();
-    std::pair<std::vector<int>, std::vector<int>> ret = getBottomLayer_();
+    std::pair<std::vector<int>, std::vector<int>> ret = get_bottom_layer_();
     std::vector<int> xadj = ret.first;
     std::vector<int> adjncy = ret.second;
 
@@ -179,26 +186,26 @@ void Coordinator::build(
     int edge_cut = 0; // TODO
     int ncenters_int = (int) ncenters;
     int w_partitions_int = (int) num_partitions;
-    double imbalance = 0.03; // TODO
-    partitions = std::vector<int>(ncenters, -1);
+    double imbalance = KAFFPA_IMBALANCE;
+    partitions_ = std::vector<int>(ncenters, -1);
     int seed = 0;
 
     std::cout << "NUMBER OF PARTITIONS: " << num_partitions << std::endl;
-    // run Karlsuhe partitioning algorithm (no vertex weights, matching rePartition)
+    // run Karlsuhe partitioning algorithm (no vertex weights, matching repartition)
     kaffpa(&ncenters_int, nullptr, xadj.data(), nullptr, adjncy.data(),
-           &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, partitions.data());
+           &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, partitions_.data());
 
     end = MPI_Wtime();
     logger_->karlsuhe_time = end - start;
 
-    logger_->logPartitions(partitions);
+    logger_->logPartitions(partitions_);
     std::cout << "EDGE CUT: " << edge_cut << "\n";
     size_t total_edges = adjncy.size() / 2;
     std::cout << "EDGE CUT RATIO: " << edge_cut / float(total_edges) << "\n";
     logger_->edge_cut_ratio = edge_cut / double(total_edges);
 }
 
-std::vector<std::pair<float, hnswlib::labeltype>> Coordinator::findClosestCenters_(float* vec, size_t n) {
+std::vector<std::pair<float, hnswlib::labeltype>> Coordinator::find_closest_centers_(float* vec, size_t n) {
     std::shared_lock lock(graph_mutex_); // protect meta_HNSW access
     std::vector<std::pair<float, hnswlib::labeltype>> centers;
     if (meta_HNSW_ == nullptr) {
@@ -210,13 +217,13 @@ std::vector<std::pair<float, hnswlib::labeltype>> Coordinator::findClosestCenter
     return centers;
 }
 
-std::vector<size_t> Coordinator::convertCentersToPartitions_(const std::vector<std::pair<float, hnswlib::labeltype>>& centers, float* dist) {
-    // Return partitions in nearest-centroid order (centers is already sorted
+std::vector<size_t> Coordinator::convert_centers_to_partitions_(const std::vector<std::pair<float, hnswlib::labeltype>>& centers, float* dist) {
+    // Return partitions_ in nearest-centroid order (centers is already sorted
     // closer-first by searchKnnCloserFirst), deduplicating via a seen set.
     std::vector<size_t> ret_partitions;
     std::unordered_set<int> seen;
     for (const auto& ref : centers) {
-        int pid = partitions[ref.second];
+        int pid = partitions_[ref.second];
         if (seen.insert(pid).second) {
             ret_partitions.push_back(static_cast<size_t>(pid));
         }
@@ -227,7 +234,7 @@ std::vector<size_t> Coordinator::convertCentersToPartitions_(const std::vector<s
     return ret_partitions;
 }
 
-void Coordinator::updateCentersForInsert_(float* vec, size_t label, size_t closest_center_label) {
+void Coordinator::update_centers_for_insert_(float* vec, size_t label, size_t closest_center_label) {
     int closest_center_idx = closest_center_label * dim_;
 
     {
@@ -244,7 +251,7 @@ void Coordinator::updateCentersForInsert_(float* vec, size_t label, size_t close
     }
 }
 
-void Coordinator::updateCentersForInsertBatch(const std::vector<float>& vecs,
+void Coordinator::update_centers_for_insert_batch(const std::vector<float>& vecs,
                                                const std::vector<int>& center_ids) {
     // Phase 1 – parallel accumulation.  Each OMP thread builds a thread-local
     // map of (center_id → {sum_vector, count}).  No lock is held here.
@@ -290,7 +297,7 @@ void Coordinator::updateCentersForInsertBatch(const std::vector<float>& vecs,
     }
 }
 
-void Coordinator::updateCentersForDelete_(std::vector<float>& vec, int closest_center_label) {
+void Coordinator::update_centers_for_delete_(std::vector<float>& vec, int closest_center_label) {
     int closest_center_idx = closest_center_label * dim_;
 
     {
@@ -304,12 +311,12 @@ void Coordinator::updateCentersForDelete_(std::vector<float>& vec, int closest_c
             }
         }
         // If count <= 1 the center becomes empty; leave coordinates as-is to
-        // avoid a divide-by-zero (matches updateCentersForDeleteBatch).
+        // avoid a divide-by-zero (matches update_centers_for_delete_batch).
         center_counts_[closest_center_label] = std::max(count - 1, 0);
     }
 }
 
-void Coordinator::updateCentersForDeleteBatch(const std::vector<float>& vecs,
+void Coordinator::update_centers_for_delete_batch(const std::vector<float>& vecs,
                                                const std::vector<int>& closest_center_labels) {
     // Phase 1 – parallel accumulation of deleted-vector sums per center.
     const int n = static_cast<int>(closest_center_labels.size());
@@ -359,25 +366,25 @@ void Coordinator::updateCentersForDeleteBatch(const std::vector<float>& vecs,
 }
 
 
-std::vector<size_t> Coordinator::getPartitionsForSearch_Branching_(float* vec, int branching_factor, float* dist) {
-    std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, branching_factor);
-    return convertCentersToPartitions_(centers, dist);
+std::vector<size_t> Coordinator::get_partitions_for_search_branching_(float* vec, int branching_factor, float* dist) {
+    std::vector<std::pair<float, hnswlib::labeltype>> centers = find_closest_centers_(vec, branching_factor);
+    return convert_centers_to_partitions_(centers, dist);
 }
 
 
-std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int nprobe, float* dist) {
-    // Mirrors visit_enforced_p: increase k until nprobe unique partitions are found,
+std::vector<size_t> Coordinator::get_partitions_for_search_nprobe_(float* vec, int nprobe, float* dist) {
+    // Mirrors visit_enforced_p: increase k until nprobe unique partitions_ are found,
     // then return them in the order they first appear among the nearest centers.
     size_t cur_k = static_cast<size_t>(std::min((size_t)(nprobe), (size_t)(ncenters_))); // start with a reasonably large k to reduce number of iterations; will be capped at ncenters_
 
     std::vector<std::pair<float, hnswlib::labeltype>> centers;
     while (true) {
         cur_k = std::min(cur_k, ncenters_);
-        centers = findClosestCenters_(vec, cur_k);
+        centers = find_closest_centers_(vec, cur_k);
 
         std::unordered_set<int> unique_partitions;
         for (const auto& c : centers) {
-            unique_partitions.insert(partitions[c.second]);
+            unique_partitions.insert(partitions_[c.second]);
         }
 
         if (static_cast<int>(unique_partitions.size()) >= nprobe || cur_k >= ncenters_) {
@@ -390,12 +397,12 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int 
         *dist = centers[0].first;
     }
 
-    // Walk centers in nearest-first order; collect partitions until nprobe unique ones seen.
+    // Walk centers in nearest-first order; collect partitions_ until nprobe unique ones seen.
     std::vector<size_t> visited_partitions;
     std::unordered_set<int> seen;
 
     for (const auto& c : centers) {
-        int pid = partitions[c.second];
+        int pid = partitions_[c.second];
         if (seen.insert(pid).second) {          // newly seen partition
             visited_partitions.push_back(static_cast<size_t>(pid));
             if (static_cast<int>(visited_partitions.size()) == nprobe) {
@@ -407,13 +414,13 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_Nprobe_(float* vec, int 
     return visited_partitions;
 }
 
-std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, float recall_target, float* dist) {
+std::vector<size_t> Coordinator::get_partitions_for_search_recall_tgt_(float* vec, float recall_target, float* dist) {
     recall_target = std::clamp(recall_target, 0.0f, 1.0f);
 
     // Fetch a fixed candidate set of the nearest centers, then weight each
     // partition by its size and the query's proximity to its centers.
-    const size_t knn = std::min<size_t>(50, ncenters_);
-    std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, knn);
+    const size_t knn = std::min<size_t>(RECALL_TARGET_CANDIDATES, ncenters_);
+    std::vector<std::pair<float, hnswlib::labeltype>> centers = find_closest_centers_(vec, knn);
 
     if (centers.empty()) {
         return {};
@@ -424,16 +431,16 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
     }
 
     // Per-partition size prior: number of centers assigned to each partition.
-    // Derived from partitions[] so it is valid even before any vectors are
+    // Derived from partitions_[] so it is valid even before any vectors are
     // routed (e.g. theoretical_partitioning_quality).
     std::vector<int> part_size(num_partitions_, 0);
-    for (int p : partitions) ++part_size[static_cast<size_t>(p)];
+    for (int p : partitions_) ++part_size[static_cast<size_t>(p)];
 
     // Distances normalised against the nearest center (d / d0).
     const double d0 = static_cast<double>(centers[0].first) + 1e-10;
     std::vector<double> partition_probs(num_partitions_, 0.0);
     for (const auto& [d, center_id] : centers) {
-        const int    pid     = partitions[center_id];
+        const int    pid     = partitions_[center_id];
         const double rel_d   = static_cast<double>(d) / d0;
         const double size_wt = static_cast<double>(part_size[static_cast<size_t>(pid)]);
         partition_probs[static_cast<size_t>(pid)] += size_wt * std::exp(-rel_d);
@@ -441,7 +448,7 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
 
     const double prob_sum = std::accumulate(partition_probs.begin(), partition_probs.end(), 0.0);
     if (prob_sum <= 0.0) {
-        return {static_cast<size_t>(partitions[centers[0].second])};
+        return {static_cast<size_t>(partitions_[centers[0].second])};
     }
     for (double& p : partition_probs) p /= prob_sum;
 
@@ -461,27 +468,27 @@ std::vector<size_t> Coordinator::getPartitionsForSearch_RecallTgt_(float* vec, f
     }
 
     if (visited_partitions.empty()) {
-        visited_partitions.push_back(static_cast<size_t>(partitions[centers[0].second]));
+        visited_partitions.push_back(static_cast<size_t>(partitions_[centers[0].second]));
     }
 
     return visited_partitions;
 }
 
-size_t Coordinator::getCurrentPartition(float* vec) {
-    std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, 1);
-    return convertCentersToPartitions_(centers, nullptr)[0];
+size_t Coordinator::get_current_partition(float* vec) {
+    std::vector<std::pair<float, hnswlib::labeltype>> centers = find_closest_centers_(vec, 1);
+    return convert_centers_to_partitions_(centers, nullptr)[0];
 }
 
-std::vector<size_t> Coordinator::getPartitionsForInsert_(float* vec, size_t label, float* dist) {
-    std::vector<std::pair<float, hnswlib::labeltype>> centers = findClosestCenters_(vec, 1);
-    updateCentersForInsert_(vec, label, centers[0].second);
-    return convertCentersToPartitions_(centers, dist);
+std::vector<size_t> Coordinator::get_partitions_for_insert_(float* vec, size_t label, float* dist) {
+    std::vector<std::pair<float, hnswlib::labeltype>> centers = find_closest_centers_(vec, 1);
+    update_centers_for_insert_(vec, label, centers[0].second);
+    return convert_centers_to_partitions_(centers, dist);
 }
-std::vector<size_t> Coordinator::getPartitionsForDelete_(size_t label) {
+std::vector<size_t> Coordinator::get_partitions_for_delete_(size_t label) {
     auto it = label_to_center_.find(label);
     if (it == label_to_center_.end()) return {};
     int center_idx = it->second;
-    size_t partition = partitions[center_idx];
+    size_t partition = partitions_[center_idx];
     return std::vector<size_t>{partition};
 }
 
@@ -541,7 +548,7 @@ std::vector<int> Coordinator::distribute_vectors(
                 if (partitions_assigned) {
                     p = (*preassigned_partitions)[vec_index];
                 } else {
-                    p = getPartitionsForInsert_(vec_ptr, vec_index, &center_dist)[0];
+                    p = get_partitions_for_insert_(vec_ptr, vec_index, &center_dist)[0];
                 }
 
                 if (log_partitions) {
@@ -577,7 +584,7 @@ std::vector<int> Coordinator::distribute_vectors(
     return counts_per_partition;
 }
 
-std::pair<int, std::vector<int>> Coordinator::matchPartitions_(const std::vector<int>& part1, const std::vector<int>& part2) {
+std::pair<int, std::vector<int>> Coordinator::match_partitions_(const std::vector<int>& part1, const std::vector<int>& part2) {
     int n = part1.size();
     if (part2.size() != n) return {0, std::vector<int>()};
 
@@ -609,7 +616,7 @@ std::pair<int, std::vector<int>> Coordinator::matchPartitions_(const std::vector
     return {ncenters_ - score, assignment};
 }
 
-int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::HierarchicalNSW<float>*& new_meta_HNSW, int ef_construction, int M_meta,
+int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::HierarchicalNSW<float>*& new_meta_HNSW, int ef_construction, int M_meta,
                               double* out_hnsw_s, double* out_bottom_s, double* out_kaffpa_s, double* out_relabel_s) {
     double start = MPI_Wtime();
     new_meta_HNSW = new hnswlib::HierarchicalNSW<float>(space_, ncenters_, M_meta, ef_construction);
@@ -619,12 +626,12 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
             new_meta_HNSW->addPoint(centers_.data() + (i * dim_), i);
         }
     }
-    new_meta_HNSW->setEf(200);
+    new_meta_HNSW->setEf(REPARTITION_META_EF);
     double end = MPI_Wtime();
     double hnsw_time = end-start;
 
     start = MPI_Wtime();
-    std::pair<std::vector<int>, std::vector<int>> ret = getBottomLayer_(new_meta_HNSW);
+    std::pair<std::vector<int>, std::vector<int>> ret = get_bottom_layer_(new_meta_HNSW);
     std::vector<int> xadj = ret.first;
     std::vector<int> adjncy = ret.second;
     end = MPI_Wtime();
@@ -633,7 +640,7 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     int edge_cut = 0; // TODO
     int m_centers_int = (int) ncenters_;
     int w_partitions_int = (int) num_partitions_;
-    double imbalance = 0.03; // TODO
+    double imbalance = KAFFPA_IMBALANCE;
     new_partitions = std::vector<int>(ncenters_, -1);
     int seed = gen_();
     // run partitioning algo
@@ -644,7 +651,7 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     double partition_time = end-start;
 
     start = MPI_Wtime();
-    std::pair<int, std::vector<int>> matching = matchPartitions_(new_partitions, partitions);
+    std::pair<int, std::vector<int>> matching = match_partitions_(new_partitions, partitions_);
     int to_move = matching.first;
     std::vector<int> relabel = matching.second;
 
@@ -664,7 +671,7 @@ int Coordinator::rePartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     return to_move;
 }
 
-int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int full_threshold, int partial_threshold) {
+int Coordinator::rebuild(int world_size, int ef_construction, int M_meta, int full_threshold, int partial_threshold) {
     std::cout << "[Controller] rebuild? \n";
     RebuildState expected = IDLE;
     if (!rebuild_state.compare_exchange_strong(expected, REBUILDING)) { // todo: atomic check & swap
@@ -675,7 +682,7 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
     double start = MPI_Wtime();
     hnswlib::HierarchicalNSW<float>* new_meta_HNSW = nullptr;
     std::vector<int> new_partitions;
-    int to_move = rePartition(new_partitions, new_meta_HNSW, ef_construction, M_meta);
+    int to_move = repartition(new_partitions, new_meta_HNSW, ef_construction, M_meta);
     double end = MPI_Wtime();
     double total_repartition_time = end - start;
 
@@ -741,7 +748,7 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
         std::unique_lock lock(graph_mutex_);
         delete meta_HNSW_;
         meta_HNSW_ = new_meta_HNSW;
-        partitions = new_partitions;
+        partitions_ = new_partitions;
     }
 
     logger_->logCoordinatorRebuild(rebuild_type, total_repartition_time, hnsw_serialization_time, reorganization_time);
@@ -808,7 +815,7 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
     // }
 
     if (rebuild_pending_.exchange(false)) {
-        return reBuild(world_size, ef_construction, M_meta, full_threshold, partial_threshold);
+        return rebuild(world_size, ef_construction, M_meta, full_threshold, partial_threshold);
     }
 
     if (rebuild_type == FULL_REBUILD_REQUEST)
@@ -816,9 +823,9 @@ int Coordinator::reBuild(int world_size, int ef_construction, int M_meta, int fu
     return 2;
 }
 
-// Prepare rebuild (via rePartition): returns 0 (no rebuild), 1 (full), or 2 (partial).
-// Caches result without MPI or state changes; must be followed by doRebuildSimple().
-int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
+// Prepare rebuild (via repartition): returns 0 (no rebuild), 1 (full), or 2 (partial).
+// Caches result without MPI or state changes; must be followed by do_rebuild_simple().
+int Coordinator::check_need_rebuild(int full_threshold, int partial_threshold,
                                    int ef_construction, int M_meta) {
     // Discard any stale cached rebuild from a previous call.
     if (cached_new_meta_HNSW_) {
@@ -841,7 +848,7 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
     }
     hnswlib::HierarchicalNSW<float>* new_meta = nullptr;
     std::vector<int>                 new_parts;
-    const int to_move = rePartition(new_parts, new_meta, ef_construction, M_meta,
+    const int to_move = repartition(new_parts, new_meta, ef_construction, M_meta,
                                     &cached_repart_hnsw_s_,
                                     &cached_repart_bottom_s_,
                                     &cached_repart_kaffpa_s_,
@@ -853,11 +860,11 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
         return 0;
     }
 
-    // Count centers/elements that move; new_parts already relabeled by matchPartitions_
+    // Count centers/elements that move; new_parts already relabeled by match_partitions_
     {
         int centers = 0, elems = 0;
         for (size_t c = 0; c < new_parts.size(); c++) {
-            if (new_parts[c] != partitions[c]) {
+            if (new_parts[c] != partitions_[c]) {
                 centers++;
                 elems += center_counts_[c];
             }
@@ -866,7 +873,7 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
         cached_elements_moved_ = elems;
     }
 
-    // Cache materials needed for doRebuildSimple().
+    // Cache materials needed for do_rebuild_simple().
     cached_new_meta_HNSW_    = new_meta;
     cached_new_partitions_   = std::move(new_parts);
 
@@ -880,17 +887,17 @@ int Coordinator::checkNeedRebuild(int full_threshold, int partial_threshold,
     return cached_rebuild_type_;
 }
 
-// Send rebuild to all executors (broadcasts meta-HNSW + partitions).
+// Send rebuild to all executors (broadcasts meta-HNSW + partitions_).
 // Serial only; does not drain insert/delete logs.
-void Coordinator::doRebuildSimple(int world_size) {
-    assert(cached_new_meta_HNSW_ != nullptr && "doRebuildSimple called without a cached rebuild");
+void Coordinator::do_rebuild_simple(int world_size) {
+    assert(cached_new_meta_HNSW_ != nullptr && "do_rebuild_simple called without a cached rebuild");
 
     const MessageType rebuild_type = (cached_rebuild_type_ == 1)
                                      ? FULL_REBUILD_REQUEST
                                      : PARTIAL_REBUILD_REQUEST;
     const int meta_size = static_cast<int>(cached_hnsw_buffer_.size());
 
-    // Send header + HNSW bytes + partitions to every executor.
+    // Send header + HNSW bytes + partitions_ to every executor.
     for (int i = 1; i < world_size; i++) {
         MessageHeader hdr;
         hdr.type = rebuild_type;
@@ -910,12 +917,12 @@ void Coordinator::doRebuildSimple(int world_size) {
                  i, REBUILD_SUCCESS, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
 
-    // Swap in the new meta-HNSW and partitions.
+    // Swap in the new meta-HNSW and partitions_.
     {
         std::unique_lock<std::shared_mutex> lk(graph_mutex_);
         if (meta_HNSW_) delete meta_HNSW_;
         meta_HNSW_ = cached_new_meta_HNSW_;
-        partitions  = cached_new_partitions_;
+        partitions_  = cached_new_partitions_;
     }
 
     // Clear the cache.
@@ -925,9 +932,9 @@ void Coordinator::doRebuildSimple(int world_size) {
     cached_rebuild_type_ = 0;
 }
 
-// Force full rebuild (bypass threshold checks); reuses doRebuildSimple() protocol.
-void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_meta) {
-    // Clear any stale cache from previous checkNeedRebuild() call
+// Force full rebuild (bypass threshold checks); reuses do_rebuild_simple() protocol.
+void Coordinator::do_force_full_rebuild(int world_size, int ef_construction, int M_meta) {
+    // Clear any stale cache from previous check_need_rebuild() call
     if (cached_new_meta_HNSW_) {
         delete cached_new_meta_HNSW_;
         cached_new_meta_HNSW_ = nullptr;
@@ -938,7 +945,7 @@ void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_
     // Recompute the partitioning (also fills the repart timing accumulators).
     hnswlib::HierarchicalNSW<float>* new_meta = nullptr;
     std::vector<int>                 new_parts;
-    rePartition(new_parts, new_meta, ef_construction, M_meta,
+    repartition(new_parts, new_meta, ef_construction, M_meta,
                 &cached_repart_hnsw_s_,
                 &cached_repart_bottom_s_,
                 &cached_repart_kaffpa_s_,
@@ -948,7 +955,7 @@ void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_
     {
         int centers = 0, elems = 0;
         for (size_t c = 0; c < new_parts.size(); c++) {
-            if (new_parts[c] != partitions[c]) {
+            if (new_parts[c] != partitions_[c]) {
                 centers++;
                 elems += center_counts_[c];
             }
@@ -957,7 +964,7 @@ void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_
         cached_elements_moved_ = elems;
     }
 
-    // Cache materials for doRebuildSimple() and serialise the new meta-HNSW.
+    // Cache materials for do_rebuild_simple() and serialise the new meta-HNSW.
     cached_new_meta_HNSW_  = new_meta;
     cached_new_partitions_ = std::move(new_parts);
     cached_new_meta_HNSW_->saveIndex("tmp_hnsw.bin");
@@ -967,12 +974,12 @@ void Coordinator::doForceFullRebuild(int world_size, int ef_construction, int M_
     }
     cached_rebuild_type_ = 1; // FULL
 
-    doRebuildSimple(world_size);
+    do_rebuild_simple(world_size);
 }
 
 // Send in-place rebuild (mark-delete + insert) instead of graph reconstruction.
-void Coordinator::doRebuildDelta(int world_size) {
-    assert(cached_new_meta_HNSW_ != nullptr && "doRebuildDelta called without a cached rebuild");
+void Coordinator::do_rebuild_delta(int world_size) {
+    assert(cached_new_meta_HNSW_ != nullptr && "do_rebuild_delta called without a cached rebuild");
 
     const int meta_size = static_cast<int>(cached_hnsw_buffer_.size());
 
@@ -1023,7 +1030,7 @@ void Coordinator::doRebuildDelta(int world_size) {
         std::unique_lock<std::shared_mutex> lk(graph_mutex_);
         if (meta_HNSW_) delete meta_HNSW_;
         meta_HNSW_ = cached_new_meta_HNSW_;
-        partitions  = cached_new_partitions_;
+        partitions_  = cached_new_partitions_;
     }
 
     cached_new_meta_HNSW_ = nullptr;
@@ -1045,18 +1052,18 @@ void Coordinator::load_gp(const std::string& prefix, int ef_search) {
 
     meta_HNSW_->setEf(ef_search);
 
-    std::cout << "[Coordinator] Loading partitions from: " << partitions_path << "\n";
+    std::cout << "[Coordinator] Loading partitions_ from: " << partitions_path << "\n";
     std::ifstream in(partitions_path);
     std::vector<int> partition;
     int part;
     while (in >> part) partition.push_back(part);
 
-    partitions = partition;
+    partitions_ = partition;
 }
 
 void Coordinator::load(const std::string& dir_path, int ef_search) {
     std::string hnsw_path = dir_path + "/metaHNSW.bin";
-    std::string partitions_path = dir_path + "/partitions.bin";
+    std::string partitions_path = dir_path + "/partitions_.bin";
 
     std::string centers_path = dir_path + "/centers_pos.bin";
     std::string centers_count_path = dir_path + "/centers_counts.bin";
@@ -1071,18 +1078,18 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
 
     meta_HNSW_->setEf(ef_search);
 
-    std::cout << "[Coordinator] Loading partitions from: " << partitions_path << "\n";
+    std::cout << "[Coordinator] Loading partitions_ from: " << partitions_path << "\n";
     std::ifstream in(partitions_path, std::ios::binary);
     size_t size = 0;
     in.read(reinterpret_cast<char*>(&size), sizeof(size));
-    partitions = std::vector<int>(size);
-    in.read(reinterpret_cast<char*>(partitions.data()), size * sizeof(int));
+    partitions_ = std::vector<int>(size);
+    in.read(reinterpret_cast<char*>(partitions_.data()), size * sizeof(int));
 
-    std::cout << "[Coordinator] size of partitions: " << size << "\n";
+    std::cout << "[Coordinator] size of partitions_: " << size << "\n";
 
     this->ncenters_ = size;
     this->num_partitions_ = static_cast<size_t>(
-        *std::max_element(partitions.begin(), partitions.end()) + 1
+        *std::max_element(partitions_.begin(), partitions_.end()) + 1
     );
 
     std::cout << "[Coordinator] Loading centers from: " << centers_path << "\n";
@@ -1109,7 +1116,7 @@ void Coordinator::load(const std::string& dir_path, int ef_search) {
     }
 }
 
-void Coordinator::loadFromClusterAnalysis(
+void Coordinator::load_from_cluster_analysis(
     const std::string& state_dir,
     int                step,
     const std::string& partitions_file,
@@ -1127,7 +1134,7 @@ void Coordinator::loadFromClusterAnalysis(
     const std::string labels_path  = base + "_labels.csv";
 
     auto fail = [](const std::string& msg) {
-        throw std::runtime_error("[Coordinator] loadFromClusterAnalysis: " + msg);
+        throw std::runtime_error("[Coordinator] load_from_cluster_analysis: " + msg);
     };
 
     // 1. meta-HNSW over the centroids (hnswlib label == centroid id, 0..k-1).
@@ -1173,20 +1180,20 @@ void Coordinator::loadFromClusterAnalysis(
                  " entries, expected " + std::to_string(ncenters_));
     }
 
-    // 4. partitions (center → shard): one shard id per line.
+    // 4. partitions_ (center → shard): one shard id per line.
     //    runbook_partitions_parallel.cpp appends a trailing moved-nodes count;
     //    read all integers and keep only the first ncenters_.
-    std::cout << "[Coordinator] Loading partitions from: " << partitions_file << "\n";
-    partitions.clear();
+    std::cout << "[Coordinator] Loading partitions_ from: " << partitions_file << "\n";
+    partitions_.clear();
     {
         std::ifstream f(partitions_file);
         if (!f) fail("cannot open " + partitions_file);
         int p;
-        while (f >> p) partitions.push_back(p);
+        while (f >> p) partitions_.push_back(p);
     }
-    if (partitions.size() > ncenters_) partitions.resize(ncenters_); // drop trailing moved-nodes count
-    if (partitions.size() != ncenters_)
-        fail("partitions file has " + std::to_string(partitions.size()) +
+    if (partitions_.size() > ncenters_) partitions_.resize(ncenters_); // drop trailing moved-nodes count
+    if (partitions_.size() != ncenters_)
+        fail("partitions_ file has " + std::to_string(partitions_.size()) +
              " entries, expected " + std::to_string(ncenters_));
     num_partitions_ = static_cast<size_t>(num_partitions);
 
@@ -1217,11 +1224,11 @@ void Coordinator::save(const std::string& output_dir) {
     std::string hnsw_filename = output_dir + "/metaHNSW.bin";
     meta_HNSW_->saveIndex(hnsw_filename);
 
-    std::string partition_filename = output_dir + "/partitions.bin";
+    std::string partition_filename = output_dir + "/partitions_.bin";
     std::ofstream out(partition_filename, std::ios::binary);
-    size_t size = partitions.size();
+    size_t size = partitions_.size();
     out.write(reinterpret_cast<const char*>(&size), sizeof(size));
-    out.write(reinterpret_cast<const char*>(partitions.data()), size * sizeof(int));
+    out.write(reinterpret_cast<const char*>(partitions_.data()), size * sizeof(int));
 
     std::string centers_filename = output_dir + "/centers_pos.bin";
     logFloatVec(centers_, centers_filename);
@@ -1245,7 +1252,7 @@ std::vector<size_t> Coordinator::route_query(
     size_t branching_factor,
     float* dist
 ) {
-    return getPartitionsForSearch_Branching_(query_vector, static_cast<int>(branching_factor), dist);
+    return get_partitions_for_search_branching_(query_vector, static_cast<int>(branching_factor), dist);
 }
 
 std::vector<size_t> Coordinator::route_query_nprobe(
@@ -1253,7 +1260,7 @@ std::vector<size_t> Coordinator::route_query_nprobe(
     size_t nprobe,
     float* dist
 ) {
-    return getPartitionsForSearch_Nprobe_(query_vector, static_cast<int>(nprobe), dist);
+    return get_partitions_for_search_nprobe_(query_vector, static_cast<int>(nprobe), dist);
 }
 
 std::vector<size_t> Coordinator::route_query_recall_target(
@@ -1261,7 +1268,7 @@ std::vector<size_t> Coordinator::route_query_recall_target(
     float recall_target,
     float* dist
 ) {
-    return getPartitionsForSearch_RecallTgt_(query_vector, recall_target, dist);
+    return get_partitions_for_search_recall_tgt_(query_vector, recall_target, dist);
 }
 
 std::vector<std::vector<size_t>> Coordinator::route_queries(
@@ -1277,13 +1284,13 @@ std::vector<std::vector<size_t>> Coordinator::route_queries(
         float* vec = const_cast<float*>(query_vectors.data() + i * dim_);
         switch (mode) {
             case RoutingMode::BranchingFactor:
-                results[i] = getPartitionsForSearch_Branching_(vec, static_cast<int>(param));
+                results[i] = get_partitions_for_search_branching_(vec, static_cast<int>(param));
                 break;
             case RoutingMode::NProbe:
-                results[i] = getPartitionsForSearch_Nprobe_(vec, static_cast<int>(param));
+                results[i] = get_partitions_for_search_nprobe_(vec, static_cast<int>(param));
                 break;
             case RoutingMode::RecallTarget:
-                results[i] = getPartitionsForSearch_RecallTgt_(vec, param);
+                results[i] = get_partitions_for_search_recall_tgt_(vec, param);
                 break;
         }
     }
@@ -1487,9 +1494,9 @@ void Coordinator::handle_insert(
     // }
     size_t executor;
     if (insert_distances.size() == 0 )
-        executor = getPartitionsForInsert_(insert_vector, label, nullptr)[0];
+        executor = get_partitions_for_insert_(insert_vector, label, nullptr)[0];
     else 
-        executor = getPartitionsForInsert_(insert_vector, label, &(insert_distances[insert_idx]))[0];
+        executor = get_partitions_for_insert_(insert_vector, label, &(insert_distances[insert_idx]))[0];
     
     // int tag = insert_idx + 1;
     int tag = make_tag(INSERT_SEND, insert_idx);
@@ -1518,7 +1525,7 @@ void Coordinator::handle_inserts(std::vector<float>& insert_vectors, std::vector
     if (cur == REBUILDING) {
         std::lock_guard<std::mutex> lock(insert_log_mutex_);
         // Allocate one owning buffer per entry so the drain path can free each
-        // with a matching delete[] (see reBuild). A single block with interior
+        // with a matching delete[] (see rebuild). A single block with interior
         // pointers cannot be freed element-by-element.
         for (size_t i = 0; i < labels.size(); i++) {
             float* persistent_vec = new float[dim_];
@@ -1536,7 +1543,7 @@ void Coordinator::handle_inserts(std::vector<float>& insert_vectors, std::vector
     for (size_t i = 0; i < labels.size(); i++) {
         float* insert_vector = insert_vectors.data() + i * dim_;
         int label = labels[i];
-        size_t partition = getPartitionsForInsert_(insert_vector, label, nullptr)[0];
+        size_t partition = get_partitions_for_insert_(insert_vector, label, nullptr)[0];
 
         #pragma omp critical
         {
@@ -1594,7 +1601,7 @@ bool Coordinator::handle_delete(int label, int world_size) {
     auto it = label_to_center_.find(label);
     if (it == label_to_center_.end()) return false;
     int center_idx = it->second;
-    int partition = partitions[center_idx];
+    int partition = partitions_[center_idx];
     comm_->send_delete(label, partition + 1, tag);
     if (comm_->recv_ack(DELETE_SUCCESS, partition + 1, tag)) {
         success = true;
@@ -1602,7 +1609,7 @@ bool Coordinator::handle_delete(int label, int world_size) {
     }
 
     if (success)
-        updateCentersForDelete_(vec, center_idx);
+        update_centers_for_delete_(vec, center_idx);
 
     return success;
 }
@@ -1627,7 +1634,7 @@ void Coordinator::handle_deletes(const std::vector<int>& labels, int world_size)
         auto it = label_to_center_.find(label);
         if (it == label_to_center_.end()) continue;
         int center = it->second;
-        size_t partition = partitions[center];
+        size_t partition = partitions_[center];
         #pragma omp critical
         {
             per_executor_labels[partition + 1].push_back(label);
@@ -1655,9 +1662,9 @@ void Coordinator::handle_deletes(const std::vector<int>& labels, int world_size)
 
         comm_->recv_delete_batch_results(per_executor_vecs[idx].data(), dim_, idx, tag);
 
-        updateCentersForDeleteBatch(per_executor_vecs[idx], per_executor_centerids[idx]);
+        update_centers_for_delete_batch(per_executor_vecs[idx], per_executor_centerids[idx]);
         // two options: run in the parallel loop per executor, 
-        // or aggregate all vectors and run a single updateCentersForDeleteBatch after the loop.
+        // or aggregate all vectors and run a single update_centers_for_delete_batch after the loop.
         // - requires sorting received vectors by label
     }
     
@@ -1709,26 +1716,26 @@ Executor::~Executor() {
     delete space_;
 }
 
-void Executor::setData(float* data, int* indices, size_t count) {
+void Executor::set_data(float* data, int* indices, size_t count) {
     data_ = data;
     indices_ = indices;
     data_count_ = count;
     std::cout << "[Executor " << node_id_ << " ] Data set with " << count << " elements\n";
 }
 
-void Executor::receiveData(size_t nrecv_vecs) {
+void Executor::receive_data(size_t nrecv_vecs) {
     size_t required_nvecs = data_count_ + nrecv_vecs;
     if (local_vectors_.capacity() < required_nvecs * dim_)
         local_vectors_.reserve(required_nvecs * dim_ * 2);
     if (local_indices_.capacity() < required_nvecs)
         local_indices_.reserve(required_nvecs * 2);
 
-    // std::cout << "[Executor " << node_id_ << "] receiveData() reserved\n ";
+    // std::cout << "[Executor " << node_id_ << "] receive_data() reserved\n ";
 
     local_vectors_.resize(required_nvecs * dim_);
     local_indices_.resize(required_nvecs);
 
-    // std::cout << "[Executor " << node_id_ << "]--receiveData()-- Receiving " << nrecv_vecs << " vectors from coordinator\n";
+    // std::cout << "[Executor " << node_id_ << "]--receive_data()-- Receiving " << nrecv_vecs << " vectors from coordinator\n";
 
     float* vec_recv_ptr = local_vectors_.data() + (data_count_ * dim_);
     int* idx_recv_ptr = local_indices_.data() + data_count_;
@@ -1743,7 +1750,7 @@ void Executor::receiveData(size_t nrecv_vecs) {
     indices_ = local_indices_.data();
 }
 
-void Executor::setEfSearch(int ef_search) {
+void Executor::set_ef_search(int ef_search) {
     std::unique_lock lock(graph_mutex_);
     sub_HNSW_->setEf(ef_search);
 }
@@ -1779,7 +1786,7 @@ void Executor::build(
     sub_HNSW_->setEf(ef_construction);
 }
 
-void Executor::partialReBuild(
+void Executor::partial_rebuild(
     int meta_size, 
     int ncenters, 
     int world_size,
@@ -1927,7 +1934,7 @@ void Executor::partialReBuild(
     MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS, MPI_COMM_WORLD);
 }
 
-void Executor::reBuild(
+void Executor::rebuild(
     int meta_size, 
     int ncenters, 
     int world_size, 
@@ -2120,7 +2127,7 @@ void Executor::reBuild(
     }
 
     // Cache per-phase timings before notifying coordinator (so getters are
-    // valid as soon as reBuild() returns on the experiment side).
+    // valid as soon as rebuild() returns on the experiment side).
     last_rebuild_iterate_s_     = end_iter     - start_iter;
     last_rebuild_exchange_s_    = end_exchange - start_exchange;
     last_rebuild_graph_s_       = end_hnsw     - start_hnsw;
@@ -2133,7 +2140,7 @@ void Executor::reBuild(
 // In-place rebuild: classify live elements, mark-delete migrants, insert newcomers.
 // Preserves graph topology; reuses freed slots via replace_deleted=true.
 // Logs count of remaining deleted slots (tombstones for departed elements).
-void Executor::reBuildDelta(
+void Executor::rebuild_delta(
     int meta_size,
     int ncenters,
     int world_size,
@@ -2177,7 +2184,7 @@ void Executor::reBuildDelta(
 
             // Canonical-ownership check: skip ghost labels (stale slots with label_lookup
             // already pointing elsewhere via replace_deleted). No lock needed; rebuild
-            // protocol blocks insertLocalBatch during this iterate pass.
+            // protocol blocks insert_local_batch during this iterate pass.
             {
                 const auto it = sub_HNSW_->label_lookup_.find(
                     static_cast<hnswlib::labeltype>(ext_lbl));
@@ -2202,7 +2209,7 @@ void Executor::reBuildDelta(
     }
 
     // Mark-delete pass: mark-delete for distinct labels is thread-safe under a
-    // shared lock (same convention as markDeleteLocalBatch).
+    // shared lock (same convention as mark_delete_local_batch).
     {
         std::shared_lock<std::shared_mutex> lk(graph_mutex_);
         for (int p = 1; p < world_size; p++) {
@@ -2342,7 +2349,7 @@ void Executor::reBuildDelta(
              MPI_COMM_WORLD);
 }
 
-void Executor::reBuildReplace(
+void Executor::rebuild_replace(
     int meta_size,
     int ncenters,
     int world_size,
@@ -2532,7 +2539,7 @@ void Executor::batch_search(size_t num_queries, size_t k, int tag) {
 
 }
 
-size_t Executor::getElementCount() const {
+size_t Executor::get_element_count() const {
     std::shared_lock lock(graph_mutex_);
     // cur_element_count includes soft-deleted entries; subtract them for the
     // live count.  Both accessors are thread-safe atomics in hnswlib.
@@ -2541,7 +2548,7 @@ size_t Executor::getElementCount() const {
     return (total > deleted) ? (total - deleted) : 0;
 }
 
-double Executor::getTombstoneRatio() const {
+double Executor::get_tombstone_ratio() const {
     std::shared_lock lock(graph_mutex_);
     const size_t total   = sub_HNSW_->getCurrentElementCount();
     if (total == 0) return 0.0;
@@ -2552,7 +2559,7 @@ double Executor::getTombstoneRatio() const {
 // Insert a batch of vectors (received via AllToAllV in shared_batch_experiment)
 // directly into the local sub-HNSW without going through the MPI message
 // protocol.  Resizes the index if capacity would be exceeded.
-void Executor::insertLocalBatch(const std::vector<float>& vecs,
+void Executor::insert_local_batch(const std::vector<float>& vecs,
                                 const std::vector<int>&   labels) {
     if (labels.empty()) return;
     const size_t incoming = labels.size();
@@ -2585,7 +2592,7 @@ void Executor::insertLocalBatch(const std::vector<float>& vecs,
 
 // Mark a single vector deleted without MPI.  Ignores labels not present in
 // this shard (the label may have been routed to a different executor).
-void Executor::markDeleteLocal(int label) {
+void Executor::mark_delete_local(int label) {
     std::unique_lock<std::shared_mutex> lk(graph_mutex_);
     try {
         sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(label));
@@ -2600,7 +2607,7 @@ void Executor::markDeleteLocal(int label) {
 // atomic num_deleted_ — so concurrent calls on different labels are safe under
 // a shared (reader) lock on graph_mutex_.  Labels absent from this shard are
 // silently skipped.
-void Executor::markDeleteLocalBatch(const std::vector<int>& labels) {
+void Executor::mark_delete_local_batch(const std::vector<int>& labels) {
     if (labels.empty()) return;
     std::shared_lock<std::shared_mutex> lk(graph_mutex_);
     #pragma omp parallel for schedule(dynamic)
@@ -2616,7 +2623,7 @@ void Executor::markDeleteLocalBatch(const std::vector<int>& labels) {
 // Search a batch of query vectors (received via AllToAllV phase-1) and return
 // results without MPI.  Each result vector is sorted nearest-first.
 std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>
-Executor::searchLocalBatch(const std::vector<float>& queries,
+Executor::search_local_batch(const std::vector<float>& queries,
                             size_t                     num_queries,
                             size_t                     k) {
     std::vector<std::vector<std::pair<float, hnswlib::labeltype>>> results(num_queries);
@@ -2673,7 +2680,7 @@ void Executor::insert(int tag) {
     {
         std::shared_lock read_lock(graph_mutex_);
         // +1 because we're about to add one element
-        if (sub_HNSW_->getCurrentElementCount() + 100 <= sub_HNSW_->getMaxElements()) {
+        if (sub_HNSW_->getCurrentElementCount() + INSERT_CAPACITY_SLACK <= sub_HNSW_->getMaxElements()) {
             sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/true);
 
             comm_.send_ack(INSERT_SUCCESS, 0, tag);

@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
         
         // build meta hnsw on the centers
         Coordinator metaIndex(dim, &comm, &logger);
-        metaIndex.setSampleData(sample.data(), sample_size);
+        metaIndex.set_sample_data(sample.data(), sample_size);
 
         int ncenters = 10000; //TODO: hard coded
         int ef_construction = 200; //TODO: hard coded
@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
             } else {
                 assert(recv_header.type == VECTOR_SEND);
                 // receive vectors
-                subIndex.receiveData(recv_header.size);
+                subIndex.receive_data(recv_header.size);
                 num_recv += recv_header.size;
             }
         }
