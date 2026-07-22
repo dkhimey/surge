@@ -1617,8 +1617,9 @@ int main(int argc, char** argv)
 
         Executor subIndex(rank, dim, comm, &logger);
 
-        // Receive initial vectors and build shard
-        {
+        if (!resuming) {
+            // Receive initial vectors and build shard
+            {
                 bool done = false;
                 while (!done) {
                     MessageHeader hdr;
