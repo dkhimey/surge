@@ -840,3 +840,58 @@ std::vector<RunbookStep> load_runbook(const std::string& path,
     for (auto& [k, v] : step_map) result.push_back(v);
     return result;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build logging: metrics JSON + binary artifact dumps (replaces the old Log
+// struct). The index populates BuildMetrics; experiments persist it here.
+// ─────────────────────────────────────────────────────────────────────────────
+std::string ensure_log_dir(const std::string& log_id) {
+    std::string log_dir = "logs/run_" + log_id;
+    if (!std::filesystem::exists(log_dir)) {
+        std::filesystem::create_directories(log_dir);
+    }
+    return log_dir;
+}
+
+void write_controller_build_json(const std::string& out_path, const BuildMetrics& m,
+                                 double distribute_time,
+                                 const std::vector<int>& per_partition_counts,
+                                 const std::string& index_file) {
+    json data;
+    data["index_build_time"]      = m.index_build_time;
+    data["index_size"]            = (!index_file.empty() && std::filesystem::exists(index_file))
+                                        ? std::filesystem::file_size(index_file) : 0;
+    data["partition_time"]        = distribute_time;
+    data["kmeans_num_iterations"] = m.kmeans_num_iterations;
+    data["kmeans_time"]           = m.kmeans_time;
+    data["karlsuhe_time"]         = m.kaffpa_time;   // JSON key kept for downstream parsers
+    data["edge_cut_ratio"]        = m.edge_cut_ratio;
+    data["per_partition_counts"]  = per_partition_counts;
+
+    std::ofstream out(out_path);
+    out << data.dump(4);
+}
+
+void write_executor_build_json(const std::string& out_path, const BuildMetrics& m,
+                               size_t num_elements, const std::string& index_file) {
+    json data;
+    data["index_build_time"] = m.index_build_time;
+    data["index_size"]       = (!index_file.empty() && std::filesystem::exists(index_file))
+                                   ? std::filesystem::file_size(index_file) : 0;
+    data["num_elements"]     = num_elements;
+
+    std::ofstream out(out_path);
+    out << data.dump(4);
+}
+
+void dump_centers(const std::string& dir, const std::vector<float>& centers) {
+    logFloatVec(centers, dir + "/centers.bin");
+}
+
+void dump_partitions(const std::string& dir, const std::vector<int>& partitions, bool all) {
+    logIntVec(partitions, dir + (all ? "/all_partitions.bin" : "/center_partitions.bin"));
+}
+
+void dump_partition_dists(const std::string& dir, const std::vector<float>& dists) {
+    logFloatVec(dists, dir + "/partition_dists.bin");
+}

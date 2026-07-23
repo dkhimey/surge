@@ -52,19 +52,19 @@ inline float computeEuclideanDistance(const float* __restrict__ a, const float* 
     return dist;
 }
 
-inline void logIntVec(std::vector<int>& vec, std::string& output_filename) {
+inline void logIntVec(const std::vector<int>& vec, const std::string& output_filename) {
     std::ofstream outFile(output_filename, std::ios::binary);
     outFile.write(reinterpret_cast<const char*>(vec.data()), sizeof(int)*vec.size());
     outFile.close();
 }
 
-inline void logFloatVec(std::vector<float>& vec, std::string& output_filename) {
+inline void logFloatVec(const std::vector<float>& vec, const std::string& output_filename) {
     std::ofstream outFile(output_filename, std::ios::binary);
     outFile.write(reinterpret_cast<const char*>(vec.data()), sizeof(float)*vec.size());
     outFile.close();
 }
 
-inline void logDoubleVec(std::vector<double>& vec, std::string& output_filename) {
+inline void logDoubleVec(const std::vector<double>& vec, const std::string& output_filename) {
     std::ofstream outFile(output_filename, std::ios::binary);
     outFile.write(reinterpret_cast<const char*>(vec.data()), sizeof(double)*vec.size());
     outFile.close();

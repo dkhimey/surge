@@ -18,14 +18,12 @@ enum class RoutingMode {
 class Coordinator {
 public:
     Coordinator(
-        int dim,
-        Log* logger
+        int dim
     );
 
     Coordinator(
         int dim,
-        Communicator* comm,
-        Log* logger
+        Communicator* comm
     );
 
     ~Coordinator();
@@ -63,6 +61,10 @@ public:
     const std::vector<int>& get_partitions() const { return partitions_; }
     const std::unordered_map<int,int>& get_label_to_center() const { return label_to_center_; }
     const std::vector<int>& get_center_counts() const { return center_counts_; }
+    const std::vector<float>& centers() const { return centers_; }
+
+    // Timings/quality measured during build() (for the experiment to persist).
+    const BuildMetrics& build_metrics() const { return build_metrics_; }
 
     // Batch updates with two-phase locking: accumulate in parallel, apply under write lock
     void update_centers_for_insert_batch(const std::vector<float>& vecs,
@@ -101,7 +103,6 @@ public:
     std::vector<int> distribute_vectors(
         const std::string& base_file,
         int total_vectors,
-        bool log_partitions,
         int num_threads = -1,
         std::vector<int>* preassigned_partitions = nullptr,
         int start_offset = 0
@@ -202,12 +203,13 @@ public:
     size_t get_current_partition(float* vec);
     
 private:
-    Log* logger_;
     Communicator* comm_ = nullptr;
 
     size_t dim_;
     size_t num_partitions_;
     size_t ncenters_;
+
+    BuildMetrics build_metrics_;
 
     float* sample_data_;
     size_t sample_count_;
@@ -269,13 +271,16 @@ private:
 // EXECUTOR
 class Executor {
 public:
-    Executor(int node_id, int dim, Communicator& comm, Log* logger = nullptr);
+    Executor(int node_id, int dim, Communicator& comm);
 
     ~Executor();
 
     // Owns raw pointers (space_, sub_HNSW_); non-copyable to avoid double-free.
     Executor(const Executor&)            = delete;
     Executor& operator=(const Executor&) = delete;
+
+    // Timings measured during build() (for the experiment to persist).
+    const BuildMetrics& build_metrics() const { return build_metrics_; }
 
     void receive_data(size_t nrecv_vecs);
     void set_data(float* data, int* indices, size_t count);
@@ -371,7 +376,7 @@ private:
 
     mutable std::shared_mutex graph_mutex_;
     // when inserting, each thread holds the shared lock, when swapping hnsw in final step, get exclusive lock
-    Log* logger_;
+    BuildMetrics build_metrics_;
     size_t node_id_;
 
     size_t dim_;

@@ -75,202 +75,38 @@ typedef struct MessageHeader {
     }
 } MessageHeader;
 
-typedef enum { 
-    IDLE, 
-    REBUILDING, 
-    DRAINING 
+typedef enum {
+    IDLE,
+    REBUILDING,
+    DRAINING
 } RebuildState;
 
-typedef struct Log {
-    size_t correct, total;
+// Timing/quality measurements produced by Coordinator::build / Executor::build.
+// The index populates this; experiments read it back and persist it.
+struct BuildMetrics {
+    double index_build_time      = 0.0;  // meta-HNSW (coordinator) or sub-HNSW (executor) build
+    double kmeans_time           = 0.0;
+    size_t kmeans_num_iterations = 0;
+    double kaffpa_time           = 0.0;  // KaHIP graph partitioning
+    double edge_cut_ratio        = 0.0;
+};
 
-    size_t kmeans_num_iterations;
-    size_t num_elements;
+// Create logs/run_<log_id>/ if needed and return its path.
+std::string ensure_log_dir(const std::string& log_id);
 
-    double index_build_time;
+// Write the per-role build-metrics JSON. index_file (if it exists) contributes an
+// "index_size" field via std::filesystem::file_size.
+void write_controller_build_json(const std::string& out_path, const BuildMetrics& m,
+                                 double distribute_time,
+                                 const std::vector<int>& per_partition_counts,
+                                 const std::string& index_file = "");
+void write_executor_build_json(const std::string& out_path, const BuildMetrics& m,
+                               size_t num_elements, const std::string& index_file = "");
 
-    double partition_time, kmeans_time, karlsuhe_time;
-    double search_time, send_time;
-    double edge_cut_ratio;
-
-    std::string log_dir;
-    std::string run_id;
-    std::string meta_index_path;  // set explicitly when not using a config file
-    std::string sub_index_path;   // set explicitly when not using a config file
-
-    Log(std::string& log_id) {
-        // TODO
-        log_dir = "logs/run_" + log_id;
-        if (!std::filesystem::exists(log_dir)) {
-            std::filesystem::create_directories(log_dir);
-        }
-
-    }
-
-
-    void saveControllerLog(std::vector<int> per_partition_counts) {
-        std::string filename = log_dir + "/controller_build.json";
-        json data;
-        data["index_build_time"] = index_build_time;
-        data["index_size"] = 0;
-
-        std::string index_path;
-        if (!meta_index_path.empty()) {
-            index_path = meta_index_path;
-        }
-        if (!index_path.empty() && std::filesystem::exists(index_path)) {
-            data["index_size"] = std::filesystem::file_size(index_path);
-        }
-
-        data["partition_time"] = partition_time;
-        data["kmeans_num_iterations"] = kmeans_num_iterations;
-        data["kmeans_time"] = kmeans_time;
-        data["karlsuhe_time"] = karlsuhe_time;
-        data["edge_cut_ratio"] = edge_cut_ratio;
-        data["search_time"] = search_time;
-        data["send_time"] = send_time;
-        data["per_partition_counts"] = per_partition_counts;
-
-        std::ofstream outputFile(filename);
-        outputFile << data.dump(4);
-        outputFile.close();
-    }
-
-    void saveExecutorLog(size_t node) {
-        char node_str[10];
-        snprintf(node_str, 10, "%lu", node);
-        std::string filename = log_dir + "/executor_" + node_str + "_build.json";
-        json data;
-        data["index_build_time"] = index_build_time;
-        data["index_size"] = 0;
-
-        std::string index_path;
-        if (!sub_index_path.empty()) {
-            index_path = sub_index_path;
-        }
-        if (!index_path.empty() && std::filesystem::exists(index_path)) {
-            data["index_size"] = std::filesystem::file_size(index_path);
-        }
-
-        data["num_elements"] = num_elements;
-
-        std::ofstream outputFile(filename);
-        outputFile << data.dump(4);
-        outputFile.close();
-    }
-
-    void logQueryLatencies(std::vector<double>& vec, std::string id) {
-        std::string output_filename = log_dir + "/query_latencies_" + id + ".bin";
-        logDoubleVec(vec, output_filename);
-        std::cout << "Latencies saved to " << output_filename << "\n";
-    }
-
-    void logQueryLatencies(std::vector<double>& vec) {
-        std::string output_filename = log_dir + "/query_latencies_" + run_id + ".bin";
-        logDoubleVec(vec, output_filename);
-        std::cout << "Latencies saved to " << output_filename << "\n";
-    }
-
-    void logCenters(std::vector<float>& centers) {
-        std::string output_filename = log_dir + "/centers.bin";
-
-        logFloatVec(centers, output_filename);
-        std::cout << "Centers saved to " << output_filename << "\n";
-    }
-
-    void logPartitions(std::vector<int>& partitions, bool all = false) {
-        std::string output_filename;
-        if (all) output_filename = log_dir + "/all_partitions.bin";
-        else output_filename = log_dir + "/center_partitions.bin";
-
-        logIntVec(partitions, output_filename);
-        std::cout << "Center Partitions saved to " << output_filename << "\n";
-    }
-
-    void logPartitionDists(std::vector<float>& distances) {
-        std::string output_filename = log_dir + "/partition_dists.bin";
-        logFloatVec(distances, output_filename);
-        std::cout << "Distances saved to " << output_filename << "\n";
-    }
-
-    void logInsertDists(std::vector<float>& distances, int step) {
-        std::string output_filename = log_dir + "/insert_" + std::to_string(step) + "_dists.bin";
-        logFloatVec(distances, output_filename);
-        std::cout << "Distances saved to " << output_filename << "\n";
-    }
-
-    void logInsertDists(std::vector<float>& distances, std::string step) {
-        std::string output_filename = log_dir + "/insert_" + step + "_dists.bin";
-        logFloatVec(distances, output_filename);
-        std::cout << "Distances saved to " << output_filename << "\n";
-    }
-
-    void logExecutorHits(std::vector<std::atomic<int>>& vec) {
-        std::string output_filename = log_dir + "/executor_hits_" + run_id + ".bin";
-
-        std::vector<int> snapshot;
-        snapshot.reserve(vec.size());
-        for (int i = 0; i < vec.size(); i++) {
-            snapshot.push_back(vec[i].load());  // load atomic safely
-        }
-
-        logIntVec(snapshot, output_filename);
-    }
-
-    void logExecutorHits(std::vector<std::atomic<int>>& vec, std::string id) {
-        std::string output_filename = log_dir + "/executor_hits_" + id + ".bin";
-
-        std::vector<int> snapshot;
-        snapshot.reserve(vec.size());
-        for (int i = 0; i < vec.size(); i++) {
-            snapshot.push_back(vec[i].load());  // load atomic safely
-        }
-
-        logIntVec(snapshot, output_filename);
-    }
-
-    void logAccessRate(std::vector<int>& vec) {
-        std::string output_filename = log_dir + "/access_rate_" + run_id + ".bin";
-        logIntVec(vec, output_filename);
-    }
-
-     void logAccessRate(std::vector<int>& vec, std::string id) {
-        std::string output_filename = log_dir + "/access_rate_" + id + ".bin";
-        logIntVec(vec, output_filename);
-    }
-
-    void logRepartition(double hnsw_time, double bottom_layer, 
-                        double partition_time, double partition_relabel) {
-        std::string output_filename = log_dir + "/rebuild_" + run_id + ".bin";
-
-        std::cout << "[Coordinator] - meta hnsw time: " << hnsw_time << "\n";
-        std::cout << "[Coordinator] - bottom layer graph build time: " << bottom_layer << "\n";
-        std::cout << "[Coordinator] - bottom layer partition time: " << partition_time << "\n";
-        std::cout << "[Coordinator] - bottom layer relabel time: " << partition_relabel << "\n";
-    }
-
-    void logCoordinatorRebuild(MessageType rebuild_type,
-                               double total_repartition_time, 
-                               double hnsw_serialization_time, 
-                               double reorganization_time) {
-        std::string output_filename = log_dir + "/rebuild_" + run_id + ".bin";
-
-        std::string type;
-        if (rebuild_type == FULL_REBUILD_REQUEST) type = "FULL REBUILD";
-        else type = "PARTIAL REBUILD";
-
-        std::cout << "[Coordinator] - rebuild type: " << type << "\n";
-        std::cout << "[Coordinator] - total repartition time: " << total_repartition_time << "\n";
-        std::cout << "[Coordinator] - hnsw serialization time: " << hnsw_serialization_time << "\n";
-        std::cout << "[Coordinator] - rebuild reorganization time: " << reorganization_time << "\n";
-        
-    }
-
-    void logExecutorRebuild() {
-
-    }
-    
-} Log;
+// Binary dumps of build artifacts into `dir` (thin wrappers over logFloatVec/logIntVec).
+void dump_centers(const std::string& dir, const std::vector<float>& centers);
+void dump_partitions(const std::string& dir, const std::vector<int>& partitions, bool all = false);
+void dump_partition_dists(const std::string& dir, const std::vector<float>& dists);
 
 FileFormat getFileFormat(const std::string& filename);
 std::pair<int, int> get_dataset_info(const std::string& base_file);

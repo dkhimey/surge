@@ -34,11 +34,9 @@ constexpr size_t INSERT_CAPACITY_SLACK  = 100;   // headroom before an insert fo
 constexpr size_t RECALL_TARGET_CANDIDATES = 50;  // nearest centers scored for RecallTarget routing
 
 Coordinator::Coordinator(
-        int dim,
-        Log* logger)
+        int dim)
         : dim_(dim),
-    comm_(nullptr),
-        logger_(logger),
+        comm_(nullptr),
         gen_(std::random_device{}())
 {
     
@@ -51,11 +49,9 @@ Coordinator::Coordinator(
 
 Coordinator::Coordinator(
         int dim,
-        Communicator* comm,
-        Log* logger)
+        Communicator* comm)
         : dim_(dim),
         comm_(comm),
-        logger_(logger),
         gen_(std::random_device{}())
 {
     
@@ -155,8 +151,8 @@ void Coordinator::build(
     num_iterations = kmeans_(sample_data_, sample_count_, ncenters, centers_.data());
     double end = MPI_Wtime();
 
-    logger_->kmeans_time = end - start;
-    logger_->kmeans_num_iterations = num_iterations;
+    build_metrics_.kmeans_time = end - start;
+    build_metrics_.kmeans_num_iterations = num_iterations;
 
     // 3. build meta-HNSW on the centers
     start = MPI_Wtime();
@@ -168,12 +164,9 @@ void Coordinator::build(
     }
     end = MPI_Wtime();
 
-    logger_->index_build_time = end - start;
+    build_metrics_.index_build_time = end - start;
 
     meta_HNSW_->setEf(ef_construction);
-
-    logger_->logCenters(centers_);
-    // delete[] centers;
 
     // 4. partition the bottom layer into w partitions_
     // Step 1: Build symmetric adjacency list without duplicates
@@ -196,13 +189,12 @@ void Coordinator::build(
            &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, partitions_.data());
 
     end = MPI_Wtime();
-    logger_->karlsuhe_time = end - start;
+    build_metrics_.kaffpa_time = end - start;
 
-    logger_->logPartitions(partitions_);
     std::cout << "EDGE CUT: " << edge_cut << "\n";
     size_t total_edges = adjncy.size() / 2;
     std::cout << "EDGE CUT RATIO: " << edge_cut / float(total_edges) << "\n";
-    logger_->edge_cut_ratio = edge_cut / double(total_edges);
+    build_metrics_.edge_cut_ratio = edge_cut / double(total_edges);
 }
 
 std::vector<std::pair<float, hnswlib::labeltype>> Coordinator::find_closest_centers_(float* vec, size_t n) {
@@ -495,7 +487,6 @@ std::vector<size_t> Coordinator::get_partitions_for_delete_(size_t label) {
 std::vector<int> Coordinator::distribute_vectors(
         const std::string& base_file,
         int total_vectors,
-        bool log_partitions,
         int num_threads,
         std::vector<int>* preassigned_partitions,
         int start_offset
@@ -508,13 +499,6 @@ std::vector<int> Coordinator::distribute_vectors(
 
     omp_set_num_threads(num_threads);
     int vectors_per_thread = (total_vectors + num_threads - 1) / num_threads;
-
-    std::vector<int> partition_assignments;
-    std::vector<float> partition_distances;
-    if (log_partitions) {
-        partition_assignments = std::vector<int>(total_vectors, -1);
-        partition_distances = std::vector<float>(total_vectors, -1);
-    }
 
     std::vector<omp_lock_t> locks(num_partitions_ + 1);
     for (auto& l : locks) omp_init_lock(&l);
@@ -539,7 +523,6 @@ std::vector<int> Coordinator::distribute_vectors(
             std::vector<std::vector<float>> partition_vectors(num_partitions_ + 1);
             std::vector<std::vector<int>> partition_indices(num_partitions_ + 1);
 
-            float center_dist = 0;
             for (size_t i = 0; i < num_to_read; ++i) {
                 size_t vec_index = global_index + i;
                 float* vec_ptr = X.data() + i * dim_;
@@ -548,13 +531,9 @@ std::vector<int> Coordinator::distribute_vectors(
                 if (partitions_assigned) {
                     p = (*preassigned_partitions)[vec_index];
                 } else {
-                    p = get_partitions_for_insert_(vec_ptr, vec_index, &center_dist)[0];
+                    p = get_partitions_for_insert_(vec_ptr, vec_index, nullptr)[0];
                 }
 
-                if (log_partitions) {
-                    partition_assignments[vec_index] = p+1;
-                    partition_distances[vec_index] = center_dist;
-                }
                 partition_vectors[p+1].insert(partition_vectors[p+1].end(), vec_ptr, vec_ptr + dim_);
                 partition_indices[p+1].push_back(vec_index);
             }
@@ -574,11 +553,6 @@ std::vector<int> Coordinator::distribute_vectors(
                 }
             }
         }
-    }
-
-    if (log_partitions) {
-        logger_->logPartitions(partition_assignments, true);
-        logger_->logPartitionDists(partition_distances);
     }
 
     return counts_per_partition;
@@ -661,7 +635,10 @@ int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     end = MPI_Wtime();
     double partition_relabel = end-start;
 
-    logger_->logRepartition(hnsw_time, bottom_layer, partition_time, partition_relabel);
+    std::cout << "[Coordinator] - meta hnsw time: " << hnsw_time << "\n";
+    std::cout << "[Coordinator] - bottom layer graph build time: " << bottom_layer << "\n";
+    std::cout << "[Coordinator] - bottom layer partition time: " << partition_time << "\n";
+    std::cout << "[Coordinator] - bottom layer relabel time: " << partition_relabel << "\n";
 
     if (out_hnsw_s)    *out_hnsw_s    = hnsw_time;
     if (out_bottom_s)  *out_bottom_s  = bottom_layer;
@@ -751,7 +728,11 @@ int Coordinator::rebuild(int world_size, int ef_construction, int M_meta, int fu
         partitions_ = new_partitions;
     }
 
-    logger_->logCoordinatorRebuild(rebuild_type, total_repartition_time, hnsw_serialization_time, reorganization_time);
+    std::cout << "[Coordinator] - rebuild type: "
+              << (rebuild_type == FULL_REBUILD_REQUEST ? "FULL REBUILD" : "PARTIAL REBUILD") << "\n";
+    std::cout << "[Coordinator] - total repartition time: " << total_repartition_time << "\n";
+    std::cout << "[Coordinator] - hnsw serialization time: " << hnsw_serialization_time << "\n";
+    std::cout << "[Coordinator] - rebuild reorganization time: " << reorganization_time << "\n";
 
     // expected = true;
     // rebuilding.compare_exchange_strong(expected, false); // atomic check and flip
@@ -1698,14 +1679,13 @@ int Coordinator::kmeans_(float* sample, size_t nPrime, size_t m_centers, float* 
     return iters;
 }
 
-Executor::Executor(int node_id, int dim, Communicator& comm, Log* logger)
-    : node_id_(node_id),
+Executor::Executor(int node_id, int dim, Communicator& comm)
+    : comm_(comm),
+      node_id_(node_id),
       dim_(dim),
-      comm_(comm),
       data_(nullptr),
       data_count_(0)
 {
-    if (logger) logger_ = logger;
     space_ = new hnswlib::L2Space(dim_);
     computeDistance_ = [this](float* a, float* b) { return computeEuclideanDistance(a, b, dim_); };
 }
@@ -1781,7 +1761,7 @@ void Executor::build(
 
     delete[] norm_element;
     double end = MPI_Wtime();
-    logger_->index_build_time = end - start;
+    build_metrics_.index_build_time = end - start;
 
     sub_HNSW_->setEf(ef_construction);
 }

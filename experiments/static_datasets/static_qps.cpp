@@ -457,8 +457,6 @@ int main(int argc, char** argv)
     // Index directory follows streaming experiment naming
     const std::string meta_dir = dataset_name + "_" + std::to_string(num_partitions);
 
-    std::string log_id = "shared_static_" + dataset_name + "_" + std::to_string(num_partitions);
-    Log logger(log_id);
     Communicator comm;
 
     // Routing state shared across all ranks
@@ -476,7 +474,7 @@ int main(int argc, char** argv)
     if (rank == 0) {
         // Coordinator: load meta-index, then broadcast routing state.
         std::cout << "[Static] Loading coordinator index from " << meta_dir << "\n";
-        meta_index = new Coordinator(dim, &comm, &logger);
+        meta_index = new Coordinator(dim, &comm);
         meta_index->load(meta_dir, EF_SEARCH);
 
         routing_hnsw = meta_index->get_meta_hnsw();
@@ -497,7 +495,7 @@ int main(int argc, char** argv)
 
         std::cout << "[Static] Executor " << rank
                   << " loading shard from " << filename_prefix << "\n";
-        sub_index = new Executor(rank, dim, comm, &logger);
+        sub_index = new Executor(rank, dim, comm);
         sub_index->load(filename_prefix, EF_SEARCH);
 
         std::cout << "[Static] Executor " << rank

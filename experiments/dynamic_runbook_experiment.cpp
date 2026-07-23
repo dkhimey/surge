@@ -566,8 +566,6 @@ int main(int argc, char** argv)
         }
     }
 
-    std::string log_id = "shared_sweep_" + dataset_name + "_" + std::to_string(num_partitions);
-    Log logger(log_id);
     Communicator comm;
 
     // Routing state shared across ranks
@@ -611,7 +609,7 @@ int main(int argc, char** argv)
         const int init_start = init.start;
         const int init_n     = init.end - init.start;
 
-        Coordinator metaIndex(dim, &comm, &logger);
+        Coordinator metaIndex(dim, &comm);
 
         if (!resuming && use_init_state) {
             std::cout << "[Sweep] Loading starting state from cluster analysis: "
@@ -646,7 +644,7 @@ int main(int argc, char** argv)
             std::cout << "[Sweep] Distributing initial " << init_n
                       << " vectors (offset " << init_start
                       << ") using loaded assignment\n";
-            metaIndex.distribute_vectors(base_file, init_n, false,
+            metaIndex.distribute_vectors(base_file, init_n,
                                          NUM_BUILDING_THREADS, &preassigned, init_start);
             comm.broadcast_termination(world_size);
             MPI_Barrier(MPI_COMM_WORLD);
@@ -658,7 +656,7 @@ int main(int argc, char** argv)
             metaIndex.set_sample_data(sample.data(), ss);
             metaIndex.build(NCENTERS, num_partitions, EF_CONSTRUCTION, M_META);
             std::cout << "[Sweep] Distributing initial " << init_n << " vectors (offset " << init_start << ")\n";
-            metaIndex.distribute_vectors(base_file, init_n, false, NUM_BUILDING_THREADS, nullptr, init_start);
+            metaIndex.distribute_vectors(base_file, init_n, NUM_BUILDING_THREADS, nullptr, init_start);
             comm.broadcast_termination(world_size);
             MPI_Barrier(MPI_COMM_WORLD);
             std::cout << "[Sweep] Initial build complete\n";
@@ -1615,7 +1613,7 @@ int main(int argc, char** argv)
 
     } else {
 
-        Executor subIndex(rank, dim, comm, &logger);
+        Executor subIndex(rank, dim, comm);
 
         if (!resuming) {
             // Receive initial vectors and build shard

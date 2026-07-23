@@ -24,7 +24,7 @@ int main(int argc, char **argv) {
     int num_partitions = std::stoi(argv[2]);
 
     std::string log_id = "partition_quality_" + dataset_name + "_" + std::to_string(num_partitions);
-    Log logger(log_id);
+    std::string log_dir = ensure_log_dir(log_id);
 
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
                                               nvectors, dim, sample_size);
         
         // build meta hnsw on the centers
-        Coordinator metaIndex(dim, &comm, &logger);
+        Coordinator metaIndex(dim, &comm);
         metaIndex.set_sample_data(sample.data(), sample_size);
 
         int ncenters = 10000; //TODO: hard coded
@@ -79,31 +79,32 @@ int main(int argc, char **argv) {
         // assign vectors to workers
         double start = MPI_Wtime();
         int num_threads = omp_get_max_threads(); //TODO: hard coded
-        bool log_partitions = false; //TODO: hard coded
         std::vector<int> counts_per_partition = metaIndex.distribute_vectors(
-            DATASETS[dataset_name]["base_file"], 
-            nvectors, 
-            log_partitions, 
+            DATASETS[dataset_name]["base_file"],
+            nvectors,
             num_threads
         );
         double end = MPI_Wtime();
 
-        logger.partition_time = end - start;
-        std::cout << "Partition time: " << end - start << " seconds\n";
+        double distribute_time = end - start;
+        std::cout << "Partition time: " << distribute_time << " seconds\n";
 
         // complete build process from Coordinator side
         comm.broadcast_termination(world_size);
 
         std::string meta_dir = dataset_name + "_" + std::to_string(num_partitions);
         metaIndex.save(meta_dir);
-        logger.meta_index_path = meta_dir + "/metaHNSW.bin";
-        logger.saveControllerLog(counts_per_partition);
+
+        write_controller_build_json(log_dir + "/controller_build.json", metaIndex.build_metrics(),
+                                    distribute_time, counts_per_partition, meta_dir + "/metaHNSW.bin");
+        dump_centers(log_dir, metaIndex.centers());
+        dump_partitions(log_dir, metaIndex.get_partitions());
     } else {
         std::cout << "[Executor " << node << "] log_id: " << log_id << "\n";
         comm.recv_dataset_info(nvectors, dim);
         std::cout << "[Executor " << node << "] Received dataset info: num vectors = " << nvectors << ", dimension = " << dim << "\n";
 
-        Executor subIndex(node, dim, comm, &logger);
+        Executor subIndex(node, dim, comm);
 
         size_t num_recv = 0;
         bool done = false;
@@ -123,7 +124,6 @@ int main(int argc, char **argv) {
             }
         }
 
-        logger.num_elements = num_recv;
         std::cout << "[Executor " << node << "] Total vectors received: " << num_recv << "\n";
         subIndex.build(
             200, // ef_construction, TODO: hard coded
@@ -135,8 +135,9 @@ int main(int argc, char **argv) {
         std::filesystem::create_directories(output_dir);
 
         std::string filename_prefix = output_dir + "/executor_" + std::to_string(node) + "_" + dataset_name + "_" + std::to_string(num_partitions);
-        logger.sub_index_path = subIndex.save(filename_prefix);
-        logger.saveExecutorLog(node);
+        std::string sub_file = subIndex.save(filename_prefix);
+        write_executor_build_json(log_dir + "/executor_" + std::to_string(node) + "_build.json",
+                                  subIndex.build_metrics(), num_recv, sub_file);
     }
 
     MPI_Finalize();
