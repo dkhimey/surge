@@ -243,9 +243,6 @@ static std::set<int> routeQuery(
     return target_ranks;
 }
 
-// AllToAllV now lives in Communicator::all_to_all_v (see include/communicator.h);
-// call comm.all_to_all_v(send_bufs, recv_bufs, dtype, world_size) instead.
-
 // Broadcast meta-HNSW, partitions, and labels from rank 0
 static void bcastRoutingState(
     Communicator&                            comm,
@@ -562,7 +559,7 @@ int main(int argc, char** argv)
             std::cout << "[Sweep] No checkpoint found; starting fresh.\n";
         }
     }
-    MPI_Bcast(&ckpt_resume_s_ll, 1, MPI_LONG_LONG_INT, 0, MPI_COMM_WORLD);
+    comm.bcast(&ckpt_resume_s_ll, 1, MPI_LONG_LONG_INT, 0);
     const size_t resume_s  = static_cast<size_t>(ckpt_resume_s_ll);
     const bool   resuming  = (resume_s > 1);
     const std::string resume_ckpt = resuming
@@ -612,7 +609,7 @@ int main(int argc, char** argv)
             metaIndex.distribute_vectors(base_file, init_n,
                                          NUM_BUILDING_THREADS, &preassigned, init_start);
             comm.broadcast_termination(world_size);
-            MPI_Barrier(MPI_COMM_WORLD);
+            comm.barrier();
             std::cout << "[Sweep] Initial build complete (from loaded state)\n";
             comm.broadcast_ef_search(EF_SEARCH, world_size);
         } else if (!resuming) {
@@ -623,7 +620,7 @@ int main(int argc, char** argv)
             std::cout << "[Sweep] Distributing initial " << init_n << " vectors (offset " << init_start << ")\n";
             metaIndex.distribute_vectors(base_file, init_n, NUM_BUILDING_THREADS, nullptr, init_start);
             comm.broadcast_termination(world_size);
-            MPI_Barrier(MPI_COMM_WORLD);
+            comm.barrier();
             std::cout << "[Sweep] Initial build complete\n";
             comm.broadcast_ef_search(EF_SEARCH, world_size);
         } else {
@@ -672,11 +669,11 @@ int main(int argc, char** argv)
             {
             // Broadcast label to shard to executors
                 int n_lts = static_cast<int>(label_to_shard.size());
-                MPI_Bcast(&n_lts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&n_lts, 1, MPI_INT, 0);
                 std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
                 { int i = 0; for (auto& [k, v] : label_to_shard) { lts_keys[i] = k; lts_vals[i] = v; ++i; } }
-                MPI_Bcast(lts_keys.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
-                MPI_Bcast(lts_vals.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(lts_keys.data(), n_lts, MPI_INT, 0);
+                comm.bcast(lts_vals.data(), n_lts, MPI_INT, 0);
             }
         }
 
@@ -787,15 +784,15 @@ int main(int argc, char** argv)
         auto sync_label_to_shard_after_rebuild_coord = [&]() {
             int my_n = 0;
             std::vector<int> all_ns(world_size);
-            MPI_Allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+            comm.allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT);
             std::vector<int> displs(world_size, 0);
             for (int r = 1; r < world_size; r++) displs[r] = displs[r-1] + all_ns[r-1];
             const int total_moved = displs[world_size-1] + all_ns[world_size-1];
             std::vector<int> all_moved(total_moved);
             int dummy = 0;
-            MPI_Allgatherv(&dummy, 0, MPI_INT,
+            comm.allgatherv(&dummy, 0, MPI_INT,
                            all_moved.data(), all_ns.data(), displs.data(),
-                           MPI_INT, MPI_COMM_WORLD);
+                           MPI_INT);
             for (int r = 0; r < world_size; r++)
                 for (int i = displs[r]; i < displs[r] + all_ns[r]; i++)
                     label_to_shard[all_moved[i]] = r;
@@ -822,8 +819,8 @@ int main(int argc, char** argv)
             int op_code = (step.operation == "insert") ? 0
                         : (step.operation == "delete") ? 1
                         : 2;
-            MPI_Bcast(&op_code,  1, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Bcast(bcast_buf, 3, MPI_INT, 0, MPI_COMM_WORLD);
+            comm.bcast(&op_code,  1, MPI_INT, 0);
+            comm.bcast(bcast_buf, 3, MPI_INT, 0);
 
             if (step.operation == "insert") {
                 const int n_insert = step.end - step.start;
@@ -868,7 +865,7 @@ int main(int argc, char** argv)
                     }
                 }
 
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.barrier();
                 const double t0 = MPI_Wtime();
 
                 std::vector<std::vector<int>>   recv_ids;
@@ -880,7 +877,7 @@ int main(int argc, char** argv)
                 {
                     const int my_n = static_cast<int>(my_assignments.size());
                     std::vector<int> all_ns(world_size);
-                    MPI_Allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+                    comm.allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT);
                     std::vector<int> displs(world_size, 0);
                     for (int r = 1; r < world_size; r++)
                         displs[r] = displs[r-1] + all_ns[r-1];
@@ -891,12 +888,12 @@ int main(int argc, char** argv)
                         my_labels[i]  = my_assignments[i].first;
                         my_centers[i] = my_assignments[i].second;
                     }
-                    MPI_Allgatherv(my_labels.data(),  my_n, MPI_INT,
+                    comm.allgatherv(my_labels.data(),  my_n, MPI_INT,
                                    all_labels.data(),  all_ns.data(), displs.data(),
-                                   MPI_INT, MPI_COMM_WORLD);
-                    MPI_Allgatherv(my_centers.data(), my_n, MPI_INT,
+                                   MPI_INT);
+                    comm.allgatherv(my_centers.data(), my_n, MPI_INT,
                                    all_centers.data(), all_ns.data(), displs.data(),
-                                   MPI_INT, MPI_COMM_WORLD);
+                                   MPI_INT);
                     for (int i = 0; i < total; i++)
                         label_to_center[all_labels[i]] = all_centers[i];
                     // Update label to shard from new center assignment
@@ -911,7 +908,7 @@ int main(int argc, char** argv)
                 double max_t = 0.0;
                 {
                     double elapsed = t1 - t0;
-                    MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0);
                 }
 
                 {
@@ -927,13 +924,13 @@ int main(int argc, char** argv)
                     rb_type = metaIndex.check_need_rebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     double coord_ratio = 0.0;
-                    MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
-                               MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
+                               MPI_MAX, 0);
                 }
                 const bool tombstone_forces = (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
 
                 int do_rebuild = (rb_type > 0 || tombstone_forces) ? 1 : 0;
-                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&do_rebuild, 1, MPI_INT, 0);
 
                 RebuildStats rb_stats;
                 if (do_rebuild) {
@@ -965,11 +962,11 @@ int main(int argc, char** argv)
 
                     sync_routing_after_rebuild();
 
-                    // Collect executor per-phase timings via MPI_Reduce(MAX).
+                    // Collect executor per-phase timings via comm.reduce (MAX).
                     double exec_send[3] = {0.0, 0.0, 0.0};
                     double exec_recv[3] = {0.0, 0.0, 0.0};
-                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
-                               0, MPI_COMM_WORLD);
+                    comm.reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0);
                     rb_stats.exec_iterate_s  = exec_recv[0];
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
@@ -977,8 +974,8 @@ int main(int argc, char** argv)
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
-                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
-                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                        comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0);
                         rb_stats.remaining_deleted_slots = del_recv;
                     }
 
@@ -1025,7 +1022,7 @@ int main(int argc, char** argv)
                     if (it != label_to_center.end()) del_center_ids[i] = it->second;
                 }
 
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.barrier();
                 const double t0 = MPI_Wtime();
 
                 for (int i = 0; i < n_delete; i++) {
@@ -1040,7 +1037,7 @@ int main(int argc, char** argv)
                 double max_t = 0.0;
                 {
                     double elapsed = t1 - t0;
-                    MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0);
                 }
 
                 {
@@ -1064,13 +1061,13 @@ int main(int argc, char** argv)
                     rb_type = metaIndex.check_need_rebuild(
                         full_threshold, partial_threshold, EF_CONSTRUCTION, M_META);
                     double coord_ratio = 0.0;
-                    MPI_Reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
-                               MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
+                               MPI_MAX, 0);
                 }
                 const bool tombstone_forces = (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
 
                 int do_rebuild = (rb_type > 0 || tombstone_forces) ? 1 : 0;
-                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&do_rebuild, 1, MPI_INT, 0);
 
                 RebuildStats rb_stats;
                 if (do_rebuild) {
@@ -1102,11 +1099,11 @@ int main(int argc, char** argv)
 
                     sync_routing_after_rebuild();
 
-                    // Collect executor per-phase timings via MPI_Reduce(MAX).
+                    // Collect executor per-phase timings via comm.reduce (MAX).
                     double exec_send[3] = {0.0, 0.0, 0.0};
                     double exec_recv[3] = {0.0, 0.0, 0.0};
-                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
-                               0, MPI_COMM_WORLD);
+                    comm.reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0);
                     rb_stats.exec_iterate_s  = exec_recv[0];
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
@@ -1114,8 +1111,8 @@ int main(int argc, char** argv)
                     if (actual_delta) {
                         long long del_send = 0LL;
                         long long del_recv = 0LL;
-                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
-                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                        comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0);
                         rb_stats.remaining_deleted_slots = del_recv;
                     }
 
@@ -1173,8 +1170,8 @@ int main(int argc, char** argv)
                 {
                     routing_center_counts = metaIndex.get_center_counts();
                     int n = static_cast<int>(routing_center_counts.size());
-                    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
-                    MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
+                    comm.bcast(&n, 1, MPI_INT, 0);
+                    comm.bcast(routing_center_counts.data(), n, MPI_INT, 0);
                 }
 
                 routing_hnsw->setEf(EF_ROUTING);
@@ -1285,7 +1282,7 @@ int main(int argc, char** argv)
                         }
                     }
 
-                    MPI_Barrier(MPI_COMM_WORLD);
+                    comm.barrier();
                     const double t0_s = MPI_Wtime();
 
                     std::vector<std::vector<uint32_t>> recv_qids;
@@ -1308,7 +1305,7 @@ int main(int argc, char** argv)
                     double max_t = 0.0;
                     {
                         double elapsed = t1_s - t0_s;
-                        MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                        comm.reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0);
                     }
 
                     double local_sum[3]  = {
@@ -1317,8 +1314,8 @@ int main(int argc, char** argv)
                         static_cast<double>(my_theo_counted),
                     };
                     double global_sum[3] = {0.0, 0.0, 0.0};
-                    MPI_Reduce(local_sum, global_sum, 3, MPI_DOUBLE,
-                               MPI_SUM, 0, MPI_COMM_WORLD);
+                    comm.reduce(local_sum, global_sum, 3, MPI_DOUBLE,
+                               MPI_SUM, 0);
                     const double avg_parts =
                         (nq > 0) ? global_sum[0] / static_cast<double>(nq) : -1.0;
                     const double theoretical_recall =
@@ -1366,8 +1363,8 @@ int main(int argc, char** argv)
                         }
                     }
                     uint64_t total_hits = 0;
-                    MPI_Reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
-                               MPI_SUM, 0, MPI_COMM_WORLD);
+                    comm.reduce(&my_hits, &total_hits, 1, MPI_UINT64_T,
+                               MPI_SUM, 0);
 
                     const size_t nq_recall = std::min(nq, nq_orig);
                     const double recall = (have_gt && nq_recall > 0)
@@ -1392,7 +1389,7 @@ int main(int argc, char** argv)
 
                 // No rebuild after search.
                 int rb_type = 0;
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&rb_type, 1, MPI_INT, 0);
 
                 // Collect shard sizes for all combo rows
                 auto sizes = collect_sizes();
@@ -1412,7 +1409,7 @@ int main(int argc, char** argv)
                 std::cerr << "[Sweep] Unknown operation '" << step.operation
                           << "' in step " << step.step_num << "; skipping\n";
                 int rb_type = 0;
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&rb_type, 1, MPI_INT, 0);
                 unsigned long long dummy = 0;
                 std::vector<unsigned long long> sizes_tmp;
                 comm.gather_sizes(dummy, sizes_tmp, world_size);
@@ -1519,10 +1516,10 @@ int main(int argc, char** argv)
                               << "at " << ckpt_dir << "\n";
 
                 // barrier + all-ranks write validation
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.barrier();
                 int all_ckpt_writes_ok = 0;
-                MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
-                              1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+                comm.allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
+                              1, MPI_INT, MPI_MIN);
 
                 // commit (rank 0 writes the marker LAST)
                 if (all_ckpt_writes_ok) {
@@ -1541,8 +1538,8 @@ int main(int argc, char** argv)
                 }
 
                 // barrier so the marker is durable before anyone deletes
-                MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0);
+                comm.barrier();
 
                 // remove the previous checkpoint
                 if (all_ckpt_writes_ok) {
@@ -1590,7 +1587,7 @@ int main(int argc, char** argv)
                 }
             }
             subIndex.build(EF_CONSTRUCTION, M_SUB, NUM_BUILDING_THREADS);
-            MPI_Barrier(MPI_COMM_WORLD);
+            comm.barrier();
 
             {
                 MessageHeader hdr;
@@ -1615,10 +1612,10 @@ int main(int argc, char** argv)
                     label_to_shard[lbl] = routing_partitions[cid] + 1;
         } else {
             int n_lts = 0;
-            MPI_Bcast(&n_lts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            comm.bcast(&n_lts, 1, MPI_INT, 0);
             std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
-            MPI_Bcast(lts_keys.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Bcast(lts_vals.data(), n_lts, MPI_INT, 0, MPI_COMM_WORLD);
+            comm.bcast(lts_keys.data(), n_lts, MPI_INT, 0);
+            comm.bcast(lts_vals.data(), n_lts, MPI_INT, 0);
             label_to_shard.reserve(n_lts);
             for (int j = 0; j < n_lts; j++) label_to_shard[lts_keys[j]] = lts_vals[j];
         }
@@ -1632,15 +1629,15 @@ int main(int argc, char** argv)
             const auto& arrived = subIndex.get_last_rebuild_moved_labels();
             const int my_n = static_cast<int>(arrived.size());
             std::vector<int> all_ns(world_size);
-            MPI_Allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+            comm.allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT);
             std::vector<int> displs(world_size, 0);
             for (int r = 1; r < world_size; r++) displs[r] = displs[r-1] + all_ns[r-1];
             const int total_moved = displs[world_size-1] + all_ns[world_size-1];
             std::vector<int> all_moved(total_moved);
             int dummy = 0;
-            MPI_Allgatherv(arrived.empty() ? &dummy : arrived.data(), my_n, MPI_INT,
+            comm.allgatherv(arrived.empty() ? &dummy : arrived.data(), my_n, MPI_INT,
                            all_moved.data(), all_ns.data(), displs.data(),
-                           MPI_INT, MPI_COMM_WORLD);
+                           MPI_INT);
             for (int r = 0; r < world_size; r++)
                 for (int i = displs[r]; i < displs[r] + all_ns[r]; i++)
                     label_to_shard[all_moved[i]] = r;
@@ -1656,8 +1653,8 @@ int main(int argc, char** argv)
             const bool rebuild_check_due = (s % REBUILD_CHECK_INTERVAL == 0);
 
             int op_code, bcast_buf[3];
-            MPI_Bcast(&op_code,  1, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Bcast(bcast_buf, 3, MPI_INT, 0, MPI_COMM_WORLD);
+            comm.bcast(&op_code,  1, MPI_INT, 0);
+            comm.bcast(bcast_buf, 3, MPI_INT, 0);
             const int range_start = bcast_buf[1];
             const int range_end   = bcast_buf[2];
 
@@ -1702,7 +1699,7 @@ int main(int argc, char** argv)
                     }
                 }
 
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.barrier();
                 const double t0_ex = MPI_Wtime();
 
                 std::vector<std::vector<int>>   recv_ids;
@@ -1728,7 +1725,7 @@ int main(int argc, char** argv)
                 {
                     const int my_n = static_cast<int>(my_assignments.size());
                     std::vector<int> all_ns(world_size);
-                    MPI_Allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT, MPI_COMM_WORLD);
+                    comm.allgather(&my_n, 1, MPI_INT, all_ns.data(), 1, MPI_INT);
                     std::vector<int> displs(world_size, 0);
                     for (int r = 1; r < world_size; r++) displs[r] = displs[r-1] + all_ns[r-1];
                     const int total = displs[world_size-1] + all_ns[world_size-1];
@@ -1738,12 +1735,12 @@ int main(int argc, char** argv)
                         my_labels[i]  = my_assignments[i].first;
                         my_centers[i] = my_assignments[i].second;
                     }
-                    MPI_Allgatherv(my_labels.data(),  my_n, MPI_INT,
+                    comm.allgatherv(my_labels.data(),  my_n, MPI_INT,
                                    all_labels.data(),  all_ns.data(), displs.data(),
-                                   MPI_INT, MPI_COMM_WORLD);
-                    MPI_Allgatherv(my_centers.data(), my_n, MPI_INT,
+                                   MPI_INT);
+                    comm.allgatherv(my_centers.data(), my_n, MPI_INT,
                                    all_centers.data(), all_ns.data(), displs.data(),
-                                   MPI_INT, MPI_COMM_WORLD);
+                                   MPI_INT);
                     for (int i = 0; i < total; i++)
                         label_to_center[all_labels[i]] = all_centers[i];
 
@@ -1757,18 +1754,18 @@ int main(int argc, char** argv)
                 {
                     double elapsed = MPI_Wtime() - t0_ex;
                     double max_t   = 0.0;
-                    MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0);
                 }
 
                 // Tombstone ratio check
                 if (maintenance_enabled && rebuild_check_due) {
                     double my_ratio = subIndex.get_tombstone_ratio();
                     double dummy_max = 0.0;
-                    MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
-                               MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
+                               MPI_MAX, 0);
                 }
                 int do_rebuild = 0;
-                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&do_rebuild, 1, MPI_INT, 0);
                 if (do_rebuild) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
@@ -1784,23 +1781,23 @@ int main(int argc, char** argv)
                     bcastRoutingState(comm, rank, dim, nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
                                       &meta_space, false);
-                    // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
+                    // Contribute per-phase timings to coordinator's comm.reduce (MAX).
                     double exec_send[3] = {
                         subIndex.get_last_rebuild_iterate_s(),
                         subIndex.get_last_rebuild_exchange_s(),
                         subIndex.get_last_rebuild_graph_s()
                     };
                     double exec_recv[3]; // unused on non-root ranks
-                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
-                               0, MPI_COMM_WORLD);
+                    comm.reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0);
                     // Delta rebuild only: contribute remaining deleted slots to
                     // the coordinator's SUM reduce.
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {
                         long long del_send = static_cast<long long>(
                             subIndex.get_last_rebuild_remaining_deleted());
                         long long del_recv = 0LL; // unused on non-root ranks
-                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
-                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                        comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0);
                     }
                     // Sync label_to_shard: report arrived labels to all ranks.
                     sync_label_to_shard_after_rebuild_exec();
@@ -1820,7 +1817,7 @@ int main(int argc, char** argv)
                     if (it != label_to_center.end()) del_center_ids[i] = it->second;
                 }
 
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.barrier();
                 const double t0_del = MPI_Wtime();
 
                 std::vector<int> my_delete_labels;
@@ -1845,18 +1842,18 @@ int main(int argc, char** argv)
                 {
                     double elapsed = MPI_Wtime() - t0_del;
                     double max_t   = 0.0;
-                    MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0);
                 }
 
                 // Tombstone ratio check
                 if (maintenance_enabled && rebuild_check_due) {
                     double my_ratio = subIndex.get_tombstone_ratio();
                     double dummy_max = 0.0;
-                    MPI_Reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
-                               MPI_MAX, 0, MPI_COMM_WORLD);
+                    comm.reduce(&my_ratio, &dummy_max, 1, MPI_DOUBLE,
+                               MPI_MAX, 0);
                 }
                 int do_rebuild = 0;
-                MPI_Bcast(&do_rebuild, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&do_rebuild, 1, MPI_INT, 0);
                 if (do_rebuild) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
@@ -1872,23 +1869,23 @@ int main(int argc, char** argv)
                     bcastRoutingState(comm, rank, dim, nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
                                       &meta_space, false);
-                    // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
+                    // Contribute per-phase timings to coordinator's comm.reduce (MAX).
                     double exec_send[3] = {
                         subIndex.get_last_rebuild_iterate_s(),
                         subIndex.get_last_rebuild_exchange_s(),
                         subIndex.get_last_rebuild_graph_s()
                     };
                     double exec_recv[3]; // unused on non-root ranks
-                    MPI_Reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
-                               0, MPI_COMM_WORLD);
+                    comm.reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
+                               0);
                     // Delta rebuild only: contribute remaining deleted slots to
                     // the coordinator's SUM reduce.
                     if (hdr.type == INPLACE_REBUILD_REQUEST) {
                         long long del_send = static_cast<long long>(
                             subIndex.get_last_rebuild_remaining_deleted());
                         long long del_recv = 0LL; // unused on non-root ranks
-                        MPI_Reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
-                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                        comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
+                                   MPI_SUM, 0);
                     }
                     // Sync label_to_shard: report arrived labels to all ranks.
                     sync_label_to_shard_after_rebuild_exec();
@@ -1919,9 +1916,9 @@ int main(int argc, char** argv)
 
                 {
                     int n = 0;
-                    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                    comm.bcast(&n, 1, MPI_INT, 0);
                     routing_center_counts.resize(n);
-                    MPI_Bcast(routing_center_counts.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
+                    comm.bcast(routing_center_counts.data(), n, MPI_INT, 0);
                 }
                 routing_hnsw->setEf(EF_ROUTING);
 
@@ -2018,7 +2015,7 @@ int main(int argc, char** argv)
                         }
                     }
 
-                    MPI_Barrier(MPI_COMM_WORLD);
+                    comm.barrier();
                     const double t0_srch = MPI_Wtime();
 
                     std::vector<std::vector<uint32_t>> recv_qids;
@@ -2066,7 +2063,7 @@ int main(int argc, char** argv)
                     {
                         double elapsed = MPI_Wtime() - t0_srch;
                         double max_t   = 0.0;
-                        MPI_Reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                        comm.reduce(&elapsed, &max_t, 1, MPI_DOUBLE, MPI_MAX, 0);
                     }
 
                     {
@@ -2078,8 +2075,8 @@ int main(int argc, char** argv)
                             static_cast<double>(my_theo_counted),
                         };
                         double dummy_recv[3] = {0.0, 0.0, 0.0}; // unused on non-root
-                        MPI_Reduce(local_sum, dummy_recv, 3, MPI_DOUBLE,
-                                   MPI_SUM, 0, MPI_COMM_WORLD);
+                        comm.reduce(local_sum, dummy_recv, 3, MPI_DOUBLE,
+                                   MPI_SUM, 0);
                     }
 
                     // Merge results and compute partial hits.
@@ -2122,15 +2119,15 @@ int main(int argc, char** argv)
                         }
                     }
                     uint64_t dummy_hits = 0;
-                    MPI_Reduce(&my_hits, &dummy_hits, 1, MPI_UINT64_T,
-                               MPI_SUM, 0, MPI_COMM_WORLD);
+                    comm.reduce(&my_hits, &dummy_hits, 1, MPI_UINT64_T,
+                               MPI_SUM, 0);
 
                 } // end executor combo loop
                 } // end executor search-variant loop
 
                 // No rebuild after search.
                 int rb_type = 0;
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&rb_type, 1, MPI_INT, 0);
 
                 // Participate in shard size gather.
                 {
@@ -2140,7 +2137,7 @@ int main(int argc, char** argv)
 
             } else {
                 int rb_type = 0;
-                MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
+                comm.bcast(&rb_type, 1, MPI_INT, 0);
                 unsigned long long my_size = subIndex.get_element_count();
                 comm.gather_sizes(my_size);
             }
@@ -2166,14 +2163,14 @@ int main(int argc, char** argv)
                 }
 
                 // Synchronize all ranks
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.barrier();
                 int all_ckpt_writes_ok = 0;
-                MPI_Allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
-                              1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+                comm.allreduce(&my_ckpt_write_ok, &all_ckpt_writes_ok,
+                              1, MPI_INT, MPI_MIN);
 
                 // Rank 0 writes the COMMITTED marker between the Allreduce and the Bcast/Barrier below
-                MPI_Bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-                MPI_Barrier(MPI_COMM_WORLD);
+                comm.bcast(&all_ckpt_writes_ok, 1, MPI_INT, 0);
+                comm.barrier();
 
                 // Delete old checkpoint (this rank's local copy)
                 if (all_ckpt_writes_ok) {

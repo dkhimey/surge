@@ -382,4 +382,37 @@ public:
         MPI_Gather(&value, 1, MPI_UNSIGNED_LONG_LONG,
                    nullptr, 1, MPI_UNSIGNED_LONG_LONG, root, mpi_comm_);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Thin 1:1 wrappers over the remaining MPI collectives. These deliberately
+    // mirror the MPI signatures (void* buffers, explicit datatype/op) — their
+    // only job is to inject mpi_comm_ so all communication flows through the
+    // Communicator and can share a sub-communicator.
+    // ─────────────────────────────────────────────────────────────────────────
+    void barrier() { MPI_Barrier(mpi_comm_); }
+
+    void bcast(void* buf, int count, MPI_Datatype dtype, int root = 0) {
+        MPI_Bcast(buf, count, dtype, root, mpi_comm_);
+    }
+
+    void reduce(const void* sendbuf, void* recvbuf, int count,
+                MPI_Datatype dtype, MPI_Op op, int root = 0) {
+        MPI_Reduce(sendbuf, recvbuf, count, dtype, op, root, mpi_comm_);
+    }
+
+    void allreduce(const void* sendbuf, void* recvbuf, int count,
+                   MPI_Datatype dtype, MPI_Op op) {
+        MPI_Allreduce(sendbuf, recvbuf, count, dtype, op, mpi_comm_);
+    }
+
+    void allgather(const void* sendbuf, int sendcount, MPI_Datatype sdtype,
+                   void* recvbuf, int recvcount, MPI_Datatype rdtype) {
+        MPI_Allgather(sendbuf, sendcount, sdtype, recvbuf, recvcount, rdtype, mpi_comm_);
+    }
+
+    void allgatherv(const void* sendbuf, int sendcount, MPI_Datatype sdtype,
+                    void* recvbuf, const int* recvcounts, const int* displs,
+                    MPI_Datatype rdtype) {
+        MPI_Allgatherv(sendbuf, sendcount, sdtype, recvbuf, recvcounts, displs, rdtype, mpi_comm_);
+    }
 };
