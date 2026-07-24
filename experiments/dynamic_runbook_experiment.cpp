@@ -243,37 +243,12 @@ static std::set<int> routeQuery(
     return target_ranks;
 }
 
-// MPI AllToAllV wrapper
-template<typename T>
-static void AllToAllV(const std::vector<std::vector<T>>& send_bufs,
-                      std::vector<std::vector<T>>&       recv_bufs,
-                      MPI_Datatype                       dtype,
-                      int world_size, MPI_Comm comm)
-{
-    std::vector<int> sc(world_size), sd(world_size, 0);
-    for (int r = 0; r < world_size; ++r) sc[r] = static_cast<int>(send_bufs[r].size());
-    for (int r = 1; r < world_size; ++r) sd[r] = sd[r-1] + sc[r-1];
-
-    std::vector<T> sf;
-    { size_t tot = 0; for (auto& b : send_bufs) tot += b.size(); sf.reserve(tot); }
-    for (int r = 0; r < world_size; ++r)
-        sf.insert(sf.end(), send_bufs[r].begin(), send_bufs[r].end());
-
-    std::vector<int> rc(world_size, 0), rd(world_size, 0);
-    MPI_Alltoall(sc.data(), 1, MPI_INT, rc.data(), 1, MPI_INT, comm);
-    for (int r = 1; r < world_size; ++r) rd[r] = rd[r-1] + rc[r-1];
-    int total_recv = rd[world_size-1] + rc[world_size-1];
-    std::vector<T> rf(total_recv);
-    MPI_Alltoallv(sf.data(), sc.data(), sd.data(), dtype,
-                  rf.data(), rc.data(), rd.data(), dtype, comm);
-
-    recv_bufs.assign(world_size, {});
-    for (int r = 0; r < world_size; ++r)
-        recv_bufs[r].assign(rf.begin() + rd[r], rf.begin() + rd[r] + rc[r]);
-}
+// AllToAllV now lives in Communicator::all_to_all_v (see include/communicator.h);
+// call comm.all_to_all_v(send_bufs, recv_bufs, dtype, world_size) instead.
 
 // Broadcast meta-HNSW, partitions, and labels from rank 0
 static void bcastRoutingState(
+    Communicator&                            comm,
     int                                      rank,
     int                                      dim,
     hnswlib::HierarchicalNSW<float>*         coord_meta,
@@ -285,51 +260,41 @@ static void bcastRoutingState(
     hnswlib::SpaceInterface<float>*          space,
     bool                                     include_ltc)
 {
-    // Broadcast partitions
+    // Broadcast partitions (rank 0 seeds out_parts from its copy first).
     {
-        int n = (rank == 0) ? static_cast<int>(coord_parts->size()) : 0;
-        MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (rank != 0) out_parts.resize(n);
-        MPI_Bcast(
-            (rank == 0) ? const_cast<int*>(coord_parts->data()) : out_parts.data(),
-            n, MPI_INT, 0, MPI_COMM_WORLD);
         if (rank == 0) out_parts = *coord_parts;
+        comm.bcast_vector(out_parts, MPI_INT);
     }
     // Broadcast meta-HNSW
     {
-        int hnsw_size = 0;
         std::vector<char> buf;
         if (rank == 0) {
             coord_meta->saveIndex("tmp_shared_sweep_bcast.bin");
             std::ifstream f("tmp_shared_sweep_bcast.bin", std::ios::binary);
             buf.assign(std::istreambuf_iterator<char>(f), {});
-            hnsw_size = static_cast<int>(buf.size());
         }
-        MPI_Bcast(&hnsw_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (rank != 0) buf.resize(hnsw_size);
-        MPI_Bcast(buf.data(), hnsw_size, MPI_BYTE, 0, MPI_COMM_WORLD);
+        comm.bcast_bytes(buf);
         if (rank != 0) {
             const std::string tmp = "tmp_shared_sweep_r" + std::to_string(rank) + ".bin";
-            { std::ofstream f(tmp, std::ios::binary); f.write(buf.data(), hnsw_size); }
+            { std::ofstream f(tmp, std::ios::binary); f.write(buf.data(), buf.size()); }
             delete out_meta;
             out_meta = new hnswlib::HierarchicalNSW<float>(space, tmp);
             out_meta->setEf(EF_SEARCH);
         }
     }
-    // Broadcast label_to_center
+    // Broadcast label_to_center as parallel label/center arrays.
     if (include_ltc) {
-        int n_lc = (rank == 0) ? static_cast<int>(coord_ltc->size()) : 0;
-        MPI_Bcast(&n_lc, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        std::vector<int> labels(n_lc), centers(n_lc);
+        std::vector<int> labels, centers;
         if (rank == 0) {
-            int i = 0;
-            for (auto& [lbl, cid] : *coord_ltc) { labels[i] = lbl; centers[i] = cid; i++; }
+            labels.reserve(coord_ltc->size());
+            centers.reserve(coord_ltc->size());
+            for (auto& [lbl, cid] : *coord_ltc) { labels.push_back(lbl); centers.push_back(cid); }
         }
-        MPI_Bcast(labels.data(),  n_lc, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(centers.data(), n_lc, MPI_INT, 0, MPI_COMM_WORLD);
+        comm.bcast_vector(labels,  MPI_INT);
+        comm.bcast_vector(centers, MPI_INT);
         if (rank != 0) {
-            out_ltc.clear(); out_ltc.reserve(n_lc);
-            for (int i = 0; i < n_lc; i++) out_ltc[labels[i]] = centers[i];
+            out_ltc.clear(); out_ltc.reserve(labels.size());
+            for (size_t i = 0; i < labels.size(); i++) out_ltc[labels[i]] = centers[i];
         } else {
             out_ltc.clear();
             for (auto& [lbl, cid] : *coord_ltc) out_ltc[lbl] = cid;
@@ -670,7 +635,7 @@ int main(int argc, char** argv)
         routing_hnsw = metaIndex.get_meta_hnsw();
 
         // Broadcast routing state to executors
-        bcastRoutingState(rank, dim,
+        bcastRoutingState(comm, rank, dim,
                           metaIndex.get_meta_hnsw(),
                           &metaIndex.get_partitions(),
                           &metaIndex.get_label_to_center(),
@@ -801,9 +766,8 @@ int main(int argc, char** argv)
         // Collect shard sizes from all ranks
         auto collect_sizes = [&]() -> std::vector<unsigned long long> {
             unsigned long long dummy = 0;
-            std::vector<unsigned long long> sizes(world_size, 0);
-            MPI_Gather(&dummy, 1, MPI_UNSIGNED_LONG_LONG,
-                       sizes.data(), 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+            std::vector<unsigned long long> sizes;
+            comm.gather_sizes(dummy, sizes, world_size);
             return std::vector<unsigned long long>(sizes.begin() + 1, sizes.end());
         };
 
@@ -811,7 +775,7 @@ int main(int argc, char** argv)
         auto sync_routing_after_rebuild = [&]() {
             routing_hnsw       = metaIndex.get_meta_hnsw();
             routing_partitions = metaIndex.get_partitions();
-            bcastRoutingState(rank, dim,
+            bcastRoutingState(comm, rank, dim,
                               metaIndex.get_meta_hnsw(),
                               &metaIndex.get_partitions(),
                               nullptr,
@@ -909,8 +873,8 @@ int main(int argc, char** argv)
 
                 std::vector<std::vector<int>>   recv_ids;
                 std::vector<std::vector<float>> recv_vecs;
-                AllToAllV(send_ids,  recv_ids,  MPI_INT,   world_size, MPI_COMM_WORLD);
-                AllToAllV(send_vecs, recv_vecs, MPI_FLOAT, world_size, MPI_COMM_WORLD);
+                comm.all_to_all_v(send_ids,  recv_ids,  MPI_INT,   world_size);
+                comm.all_to_all_v(send_vecs, recv_vecs, MPI_FLOAT, world_size);
 
                 // Synchronize label to center mapping
                 {
@@ -1326,8 +1290,8 @@ int main(int argc, char** argv)
 
                     std::vector<std::vector<uint32_t>> recv_qids;
                     std::vector<std::vector<float>>    recv_qvecs;
-                    AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, world_size, MPI_COMM_WORLD);
-                    AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    world_size, MPI_COMM_WORLD);
+                    comm.all_to_all_v(send_qids,  recv_qids,  MPI_UINT32_T, world_size);
+                    comm.all_to_all_v(send_qvecs, recv_qvecs, MPI_FLOAT,    world_size);
 
                     // Coordinator has no shard — empty Phase-2 send buffers.
                     std::vector<std::vector<uint32_t>> snd_rqids(world_size);
@@ -1336,9 +1300,9 @@ int main(int argc, char** argv)
                     std::vector<std::vector<uint32_t>> rcv_rqids;
                     std::vector<std::vector<uint32_t>> rcv_rids;
                     std::vector<std::vector<float>>    rcv_rdists;
-                    AllToAllV(snd_rqids,  rcv_rqids,  MPI_UINT32_T, world_size, MPI_COMM_WORLD);
-                    AllToAllV(snd_rids,   rcv_rids,   MPI_UINT32_T, world_size, MPI_COMM_WORLD);
-                    AllToAllV(snd_rdists, rcv_rdists,  MPI_FLOAT,    world_size, MPI_COMM_WORLD);
+                    comm.all_to_all_v(snd_rqids,  rcv_rqids,  MPI_UINT32_T, world_size);
+                    comm.all_to_all_v(snd_rids,   rcv_rids,   MPI_UINT32_T, world_size);
+                    comm.all_to_all_v(snd_rdists, rcv_rdists,  MPI_FLOAT,    world_size);
 
                     const double t1_s = MPI_Wtime();
                     double max_t = 0.0;
@@ -1450,9 +1414,8 @@ int main(int argc, char** argv)
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 unsigned long long dummy = 0;
-                std::vector<unsigned long long> sizes_tmp(world_size);
-                MPI_Gather(&dummy, 1, MPI_UNSIGNED_LONG_LONG,
-                           sizes_tmp.data(), 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+                std::vector<unsigned long long> sizes_tmp;
+                comm.gather_sizes(dummy, sizes_tmp, world_size);
             }
 
             // CHECKPOINT
@@ -1641,7 +1604,7 @@ int main(int argc, char** argv)
         }
 
         // Receive routing state from coordinator
-        bcastRoutingState(rank, dim, nullptr, nullptr, nullptr,
+        bcastRoutingState(comm, rank, dim, nullptr, nullptr, nullptr,
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
@@ -1661,8 +1624,7 @@ int main(int argc, char** argv)
         }
         if (!resuming) {
             unsigned long long my_size = subIndex.get_element_count();
-            MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
-                       nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+            comm.gather_sizes(my_size);
         }
 
         // Helper: sync label_to_shard after rebuild
@@ -1745,8 +1707,8 @@ int main(int argc, char** argv)
 
                 std::vector<std::vector<int>>   recv_ids;
                 std::vector<std::vector<float>> recv_vecs;
-                AllToAllV(send_ids,  recv_ids,  MPI_INT,   world_size, MPI_COMM_WORLD);
-                AllToAllV(send_vecs, recv_vecs, MPI_FLOAT, world_size, MPI_COMM_WORLD);
+                comm.all_to_all_v(send_ids,  recv_ids,  MPI_INT,   world_size);
+                comm.all_to_all_v(send_vecs, recv_vecs, MPI_FLOAT, world_size);
 
                 {
                     std::vector<float> flat_vecs;
@@ -1819,7 +1781,7 @@ int main(int argc, char** argv)
                                          NUM_BUILDING_THREADS);
                     }
                     // Sync updated routing state.
-                    bcastRoutingState(rank, dim, nullptr, nullptr, nullptr,
+                    bcastRoutingState(comm, rank, dim, nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
                                       &meta_space, false);
                     // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
@@ -1846,8 +1808,7 @@ int main(int argc, char** argv)
 
                 {
                     unsigned long long my_size = subIndex.get_element_count();
-                    MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
-                               nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+                    comm.gather_sizes(my_size);
                 }
 
             } else if (op_code == 1) {
@@ -1908,7 +1869,7 @@ int main(int argc, char** argv)
                                          NUM_BUILDING_THREADS);
                     }
                     // Sync updated routing state.
-                    bcastRoutingState(rank, dim, nullptr, nullptr, nullptr,
+                    bcastRoutingState(comm, rank, dim, nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
                                       &meta_space, false);
                     // Contribute per-phase timings to coordinator's MPI_Reduce(MAX).
@@ -1935,8 +1896,7 @@ int main(int argc, char** argv)
 
                 {
                     unsigned long long my_size = subIndex.get_element_count();
-                    MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
-                               nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+                    comm.gather_sizes(my_size);
                 }
 
             // SEARCH (executor side of sweep loop)
@@ -2063,8 +2023,8 @@ int main(int argc, char** argv)
 
                     std::vector<std::vector<uint32_t>> recv_qids;
                     std::vector<std::vector<float>>    recv_qvecs;
-                    AllToAllV(send_qids,  recv_qids,  MPI_UINT32_T, world_size, MPI_COMM_WORLD);
-                    AllToAllV(send_qvecs, recv_qvecs, MPI_FLOAT,    world_size, MPI_COMM_WORLD);
+                    comm.all_to_all_v(send_qids,  recv_qids,  MPI_UINT32_T, world_size);
+                    comm.all_to_all_v(send_qvecs, recv_qvecs, MPI_FLOAT,    world_size);
 
                     // Search received queries and aggregate results
                     std::vector<std::vector<uint32_t>> snd_rqids(world_size);
@@ -2099,9 +2059,9 @@ int main(int argc, char** argv)
                     std::vector<std::vector<uint32_t>> rcv_rqids;
                     std::vector<std::vector<uint32_t>> rcv_rids;
                     std::vector<std::vector<float>>    rcv_rdists;
-                    AllToAllV(snd_rqids,  rcv_rqids,  MPI_UINT32_T, world_size, MPI_COMM_WORLD);
-                    AllToAllV(snd_rids,   rcv_rids,   MPI_UINT32_T, world_size, MPI_COMM_WORLD);
-                    AllToAllV(snd_rdists, rcv_rdists,  MPI_FLOAT,    world_size, MPI_COMM_WORLD);
+                    comm.all_to_all_v(snd_rqids,  rcv_rqids,  MPI_UINT32_T, world_size);
+                    comm.all_to_all_v(snd_rids,   rcv_rids,   MPI_UINT32_T, world_size);
+                    comm.all_to_all_v(snd_rdists, rcv_rdists,  MPI_FLOAT,    world_size);
 
                     {
                         double elapsed = MPI_Wtime() - t0_srch;
@@ -2175,16 +2135,14 @@ int main(int argc, char** argv)
                 // Participate in shard size gather.
                 {
                     unsigned long long my_size = subIndex.get_element_count();
-                    MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
-                               nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+                    comm.gather_sizes(my_size);
                 }
 
             } else {
                 int rb_type = 0;
                 MPI_Bcast(&rb_type, 1, MPI_INT, 0, MPI_COMM_WORLD);
                 unsigned long long my_size = subIndex.get_element_count();
-                MPI_Gather(&my_size, 1, MPI_UNSIGNED_LONG_LONG,
-                           nullptr,  1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+                comm.gather_sizes(my_size);
             }
 
             // CHECKPOINT

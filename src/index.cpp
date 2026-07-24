@@ -22,10 +22,8 @@
 #include <iomanip>
 #include <omp.h>
 
-// MPI tags for the peer-to-peer vector exchange during rebuilds.
-constexpr int TAG_SEND_NUM    = 100000001;
-constexpr int TAG_SEND_VECS   = 100000002;
-constexpr int TAG_SEND_LABELS = 100000003;
+// TAG_SEND_NUM / TAG_SEND_VECS / TAG_SEND_LABELS are defined in communicator.h
+// (shared with the Communicator's exchange_counts/exchange_vectors helpers).
 
 // Tuning constants (previously magic numbers).
 constexpr double KAFFPA_IMBALANCE       = 0.03;  // KaHIP allowed partition imbalance
@@ -702,20 +700,17 @@ int Coordinator::rebuild(int world_size, int ef_construction, int M_meta, int fu
     }
 
     for (int i = 1; i < world_size; i++) {
-        MessageHeader header; 
+        MessageHeader header;
         header.type = rebuild_type;
         header.size = meta_size;
-        MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-
-        MPI_Send(buffer.data(), meta_size, MPI_BYTE, i, META_HNSW_SEND, MPI_COMM_WORLD);
-
-        MPI_Send(new_partitions.data(), ncenters_, MPI_INT, i, META_PARTITIONS_SEND, MPI_COMM_WORLD);
+        comm_->send_header(header, i);
+        comm_->send_bytes(buffer, i, META_HNSW_SEND);
     }
+    comm_->broadcast_partitions(new_partitions, world_size);
 
     for (int i = 1; i < world_size; i++) {
-        MessageHeader header;
-        MPI_Recv(&header, sizeof(MessageHeader), MPI_BYTE, i, REBUILD_SUCCESS, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        assert(header.type == REBUILD_SUCCESS);
+        bool ok = comm_->recv_ack(REBUILD_SUCCESS, i, REBUILD_SUCCESS);
+        assert(ok);
         // std::cout << "[Coordinator] : received REBUILD_SUCCESS from" << i << "\n";
     }
     end = MPI_Wtime();
@@ -884,18 +879,14 @@ void Coordinator::do_rebuild_simple(int world_size) {
         hdr.type = rebuild_type;
         hdr.size = static_cast<size_t>(meta_size);
         hdr.tag  = 0;
-        MPI_Send(&hdr, sizeof(MessageHeader), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-        MPI_Send(cached_hnsw_buffer_.data(), meta_size, MPI_BYTE,
-                 i, META_HNSW_SEND, MPI_COMM_WORLD);
-        MPI_Send(cached_new_partitions_.data(), static_cast<int>(ncenters_), MPI_INT,
-                 i, META_PARTITIONS_SEND, MPI_COMM_WORLD);
+        comm_->send_header(hdr, i);
+        comm_->send_bytes(cached_hnsw_buffer_, i, META_HNSW_SEND);
     }
+    comm_->broadcast_partitions(cached_new_partitions_, world_size);
 
     // Wait for REBUILD_SUCCESS from every executor.
     for (int i = 1; i < world_size; i++) {
-        MessageHeader resp;
-        MPI_Recv(&resp, sizeof(MessageHeader), MPI_BYTE,
-                 i, REBUILD_SUCCESS, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        comm_->recv_ack(REBUILD_SUCCESS, i, REBUILD_SUCCESS);
     }
 
     // Swap in the new meta-HNSW and partitions_.
@@ -969,42 +960,33 @@ void Coordinator::do_rebuild_delta(int world_size) {
         hdr.type = INPLACE_REBUILD_REQUEST;
         hdr.size = static_cast<size_t>(meta_size);
         hdr.tag  = 0;
-        MPI_Send(&hdr, sizeof(MessageHeader), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-        MPI_Send(cached_hnsw_buffer_.data(), meta_size, MPI_BYTE,
-                 i, META_HNSW_SEND, MPI_COMM_WORLD);
-        MPI_Send(cached_new_partitions_.data(), static_cast<int>(ncenters_), MPI_INT,
-                 i, META_PARTITIONS_SEND, MPI_COMM_WORLD);
+        comm_->send_header(hdr, i);
+        comm_->send_bytes(cached_hnsw_buffer_, i, META_HNSW_SEND);
     }
+    comm_->broadcast_partitions(cached_new_partitions_, world_size);
 
-    // Coordinator has no shard; call dummy alltoall to keep ranks in step
+    // Coordinator has no shard; call the same three collectives with empty
+    // buffers to keep every rank in step with the executors' delta exchange.
     {
-        // Non-null ptrs required by MPI for zero counts
-        int   dummy_i = 0;
-        float dummy_f = 0.0f;
         std::vector<int> zero_counts(world_size, 0);
         std::vector<int> zero_displs(world_size, 0);
 
-        // Round 1: element counts.
-        std::vector<int> recv_counts(world_size, 0);
-        MPI_Alltoall(zero_counts.data(), 1, MPI_INT,
-                     recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-        // recv_counts will all be 0: no executor sends vectors to rank 0.
+        // Round 1: element counts (all zero — no executor sends vectors to rank 0).
+        std::vector<int> recv_counts;
+        comm_->all_to_all_counts(zero_counts, recv_counts);
 
-        // Round 2: vectors.
-        MPI_Alltoallv(&dummy_f, zero_counts.data(), zero_displs.data(), MPI_FLOAT,
-                      &dummy_f, recv_counts.data(), zero_displs.data(), MPI_FLOAT,
-                      MPI_COMM_WORLD);
-
-        // Round 3: labels.
-        MPI_Alltoallv(&dummy_i, zero_counts.data(), zero_displs.data(), MPI_INT,
-                      &dummy_i, recv_counts.data(), zero_displs.data(), MPI_INT,
-                      MPI_COMM_WORLD);
+        // Rounds 2 & 3: vectors then labels. One-element dummy buffers keep the
+        // pointers non-null (required by some MPI impls) while counts stay zero.
+        std::vector<float> dummy_f(1, 0.0f);
+        std::vector<int>   dummy_i(1, 0);
+        comm_->all_to_all_v_flat(dummy_f, zero_counts, zero_displs,
+                                 dummy_f, recv_counts, zero_displs, MPI_FLOAT);
+        comm_->all_to_all_v_flat(dummy_i, zero_counts, zero_displs,
+                                 dummy_i, recv_counts, zero_displs, MPI_INT);
     }
 
     for (int i = 1; i < world_size; i++) {
-        MessageHeader resp;
-        MPI_Recv(&resp, sizeof(MessageHeader), MPI_BYTE,
-                 i, REBUILD_SUCCESS, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        comm_->recv_ack(REBUILD_SUCCESS, i, REBUILD_SUCCESS);
     }
 
     {
@@ -1792,10 +1774,8 @@ void Executor::partial_rebuild(
     }
 
     // Step 2: Receive meta graph
-    // std::cout << "[Executor " << node_id_ << "] receiving meta HNSW of size " << meta_size << "\n";
-    std::vector<char> buffer(meta_size);
-    MPI_Recv(buffer.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    // std::cout << "[Executor " << node_id_ << "] RECEIVED meta HNSW\n";
+    std::vector<char> buffer;
+    comm_.recv_bytes(buffer, meta_size, 0, META_HNSW_SEND);
 
     // Node-unique temp path so executors sharing a working directory
     // (e.g. single-node mpirun) don't clobber each other's meta-HNSW.
@@ -1809,9 +1789,8 @@ void Executor::partial_rebuild(
         new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
 
     // Step 3: Receive partition mapping
-    std::vector<int> partitions(ncenters);
-    MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    // std::cout << "[Executor " << node_id_ << "] RECEIVED partitions\n";
+    std::vector<int> partitions;
+    comm_.recv_partitions(partitions, ncenters);
 
     // Step 4: Prepare outbound buffers
     std::vector<std::vector<float>> partition_vectors(world_size);
@@ -1843,52 +1822,15 @@ void Executor::partial_rebuild(
         num_to_send[i] = partition_vectors[i].size() / dim_;
     }
 
-    // std::cout << "[Executor " << node_id_ << "] exchanging N\n";
-    std::vector<MPI_Request> requests;
-    for (int peer = 1; peer < world_size; ++peer) {
-        if (peer == node_id_) continue;
-        requests.emplace_back();
-        MPI_Irecv(&num_to_recv[peer], 1, MPI_INT, peer, TAG_SEND_NUM, MPI_COMM_WORLD, &requests.back());
-        requests.emplace_back();
-        MPI_Isend(&num_to_send[peer], 1, MPI_INT, peer, TAG_SEND_NUM, MPI_COMM_WORLD, &requests.back());
-    }
-    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
-    requests.clear();
-    // std::cout << "[Executor " << node_id_ << "] DONE exchanging N\n";
+    comm_.exchange_counts(world_size, num_to_send, num_to_recv);
 
-    // Step 7: Prepare receive buffers
+    // Step 7: Prepare receive buffers, then exchange the actual vector data.
     int total_recv = std::accumulate(num_to_recv.begin(), num_to_recv.end(), 0);
     std::vector<float> all_recv_vectors(total_recv * dim_);
     std::vector<int>   all_recv_labels(total_recv);
 
-    std::vector<int> offset(world_size, 0);
-    for (int i = 1; i < world_size; ++i)
-        offset[i] = offset[i - 1] + num_to_recv[i - 1];
-
-    // Step 8: Exchange actual vector data
-    // std::cout << "[Executor " << node_id_ << "] exchanging vecs\n";
-    for (int peer = 1; peer < world_size; ++peer) {
-        if (peer == node_id_) continue;
-
-        int n_recv = num_to_recv[peer];
-        int peer_offset = offset[peer];
-
-        if (n_recv > 0) {
-            requests.emplace_back();
-            MPI_Irecv(all_recv_vectors.data() + peer_offset * dim_, n_recv * dim_, MPI_FLOAT, peer, TAG_SEND_VECS, MPI_COMM_WORLD, &requests.back());
-            requests.emplace_back();
-            MPI_Irecv(all_recv_labels.data() + peer_offset, n_recv, MPI_INT, peer, TAG_SEND_LABELS, MPI_COMM_WORLD, &requests.back());
-        }
-
-        if (num_to_send[peer] > 0) {
-            requests.emplace_back();
-            MPI_Isend(partition_vectors[peer].data(), num_to_send[peer] * dim_, MPI_FLOAT, peer, TAG_SEND_VECS, MPI_COMM_WORLD, &requests.back());
-            requests.emplace_back();
-            MPI_Isend(partition_indices[peer].data(), num_to_send[peer], MPI_INT, peer, TAG_SEND_LABELS, MPI_COMM_WORLD, &requests.back());
-        }
-    }
-    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
-    // std::cout << "[Executor " << node_id_ << "] DONE exchanging vecs\n";
+    comm_.exchange_vectors(world_size, dim_, partition_vectors, partition_indices,
+                           num_to_send, num_to_recv, all_recv_vectors, all_recv_labels);
 
     // Step 9: Add received points into existing HNSW
     size_t next_data_count = sub_HNSW_->getCurrentElementCount() + total_recv;
@@ -1906,12 +1848,8 @@ void Executor::partial_rebuild(
 
     delete metaHNSW;
 
-    // Step 10: Notify completion
-    MessageHeader header;
-    header.type = REBUILD_SUCCESS;
-    // // additionally send back num levels in the graph
-    header.size = sub_HNSW_->maxlevel_;
-    MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS, MPI_COMM_WORLD);
+    // Step 10: Notify completion (coordinator only checks the type).
+    comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
 
 void Executor::rebuild(
@@ -1945,8 +1883,8 @@ void Executor::rebuild(
         }
     }
 
-    std::vector<char> buffer(meta_size);
-    MPI_Recv(buffer.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    std::vector<char> buffer;
+    comm_.recv_bytes(buffer, meta_size, 0, META_HNSW_SEND);
 
     // Wrap buffer in stream and load (node-unique path to avoid cross-executor
     // collisions when a working directory is shared).
@@ -1958,8 +1896,8 @@ void Executor::rebuild(
 
     hnswlib::HierarchicalNSW<float>* metaHNSW = new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
 
-    std::vector<int> partitions(ncenters);
-    MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    std::vector<int> partitions;
+    comm_.recv_partitions(partitions, ncenters);
 
     hnswlib::HierarchicalNSW<float>* next_sub_HNSW = new hnswlib::HierarchicalNSW<float>(space_, active_count, M_sub, ef_construction, 100, true);
 
@@ -2024,56 +1962,15 @@ void Executor::rebuild(
     // std::cout << "[Executor " << node_id_ << " ] exchanging nums \n";
     double start_exchange = MPI_Wtime();
 
-    std::vector<MPI_Request> requests;
-    for (int peer = 1; peer < world_size; ++peer) {
-        if (peer == node_id_) continue;
-        // --- RECV: n ---
-        requests.emplace_back();
-        MPI_Irecv(&num_to_recv[peer], 1, MPI_INT, peer, TAG_SEND_NUM, MPI_COMM_WORLD, &requests.back());
-
-        // --- SEND: n ---
-        requests.emplace_back();
-        MPI_Isend(&num_to_send[peer], 1, MPI_INT, peer, TAG_SEND_NUM, MPI_COMM_WORLD, &requests.back());
-    }
-
-    // Wait for all n values
-    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
-    requests.clear();
-
+    comm_.exchange_counts(world_size, num_to_send, num_to_recv);
 
     int total_recv = std::accumulate(num_to_recv.begin(), num_to_recv.end(), 0);
     std::vector<float> all_recv_vectors(total_recv * dim_);
     std::vector<int> all_recv_labels(total_recv);
 
-    std::vector<int> offset(world_size, 0);
-    for (int i = 1; i < world_size; ++i)
-        offset[i] = offset[i - 1] + num_to_recv[i - 1];
+    comm_.exchange_vectors(world_size, dim_, partition_vectors, partition_indices,
+                           num_to_send, num_to_recv, all_recv_vectors, all_recv_labels);
 
-    for (int peer = 1; peer < world_size; ++peer) {
-        if (peer == node_id_) continue;
-
-        if (num_to_recv[peer] > 0) {
-            int n_recv = num_to_recv[peer];
-            int peer_offset = offset[peer];
-
-            // --- RECV: vectors and labels ---
-            requests.emplace_back();
-            MPI_Irecv(all_recv_vectors.data() + peer_offset * dim_, n_recv * dim_, MPI_FLOAT, peer, TAG_SEND_VECS, MPI_COMM_WORLD, &requests.back());
-            requests.emplace_back();
-            MPI_Irecv(all_recv_labels.data() + peer_offset, n_recv, MPI_INT, peer, TAG_SEND_LABELS, MPI_COMM_WORLD, &requests.back());
-        }
-
-        if (num_to_send[peer] > 0) {
-            // --- SEND: vectors and labels ---
-            requests.emplace_back();
-            MPI_Isend(partition_vectors[peer].data(), num_to_send[peer] * dim_, MPI_FLOAT, peer, TAG_SEND_VECS, MPI_COMM_WORLD, &requests.back());
-            requests.emplace_back();
-            MPI_Isend(partition_indices[peer].data(), num_to_send[peer], MPI_INT, peer, TAG_SEND_LABELS, MPI_COMM_WORLD, &requests.back());
-        }
-    }
-
-    // wait for all exchanges to happen
-    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
     double end_exchange = MPI_Wtime();
     // std::cout << "[Executor " << node_id_ << " ] DONE EXCHANGING*******\n";
     std::cout << "[Executor " << node_id_ << "] rebuild exchange time : " <<  end_exchange - start_exchange << "\n";
@@ -2113,8 +2010,7 @@ void Executor::rebuild(
     last_rebuild_graph_s_       = end_hnsw     - start_hnsw;
     last_rebuild_moved_labels_  = std::move(all_recv_labels);
 
-    MessageHeader header; header.type = REBUILD_SUCCESS;
-    MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS, MPI_COMM_WORLD);
+    comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
 
 // In-place rebuild: classify live elements, mark-delete migrants, insert newcomers.
@@ -2130,9 +2026,8 @@ void Executor::rebuild_delta(
     if (num_building_threads == -1)
         num_building_threads = omp_get_max_threads();
 
-    std::vector<char> buf(meta_size);
-    MPI_Recv(buf.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND,
-             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    std::vector<char> buf;
+    comm_.recv_bytes(buf, meta_size, 0, META_HNSW_SEND);
 
     const std::string tmp_path =
         "tmp_hnsw_delta_r" + std::to_string(node_id_) + ".bin";
@@ -2143,9 +2038,8 @@ void Executor::rebuild_delta(
     hnswlib::HierarchicalNSW<float>* metaHNSW =
         new hnswlib::HierarchicalNSW<float>(space_, tmp_path);
 
-    std::vector<int> partitions(ncenters);
-    MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND,
-             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    std::vector<int> partitions;
+    comm_.recv_partitions(partitions, ncenters);
 
     // Read pass: shared lock so no concurrent resize can occur.
     std::vector<std::vector<float>> send_vecs(world_size);
@@ -2223,9 +2117,8 @@ void Executor::rebuild_delta(
     double start_exchange = MPI_Wtime();
 
     // Round 1: element counts (one int per rank).
-    std::vector<int> recv_counts(world_size, 0);
-    MPI_Alltoall(num_to_send.data(), 1, MPI_INT,
-                 recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    std::vector<int> recv_counts;
+    comm_.all_to_all_counts(num_to_send, recv_counts);
 
     const int total_recv = std::accumulate(recv_counts.begin(), recv_counts.end(), 0);
 
@@ -2247,9 +2140,8 @@ void Executor::rebuild_delta(
         flat_send_vecs.insert(flat_send_vecs.end(), send_vecs[p].begin(), send_vecs[p].end());
 
     std::vector<float> flat_recv_vecs(static_cast<size_t>(total_recv) * dim_);
-    MPI_Alltoallv(flat_send_vecs.data(), send_vcounts.data(), send_vdispls.data(), MPI_FLOAT,
-                  flat_recv_vecs.data(), recv_vcounts.data(), recv_vdispls.data(), MPI_FLOAT,
-                  MPI_COMM_WORLD);
+    comm_.all_to_all_v_flat(flat_send_vecs, send_vcounts, send_vdispls,
+                            flat_recv_vecs, recv_vcounts, recv_vdispls, MPI_FLOAT);
 
     // Round 3: labels — reuse element counts directly (one int per element).
     std::vector<int> send_ldispls(world_size, 0), recv_ldispls(world_size, 0);
@@ -2264,9 +2156,8 @@ void Executor::rebuild_delta(
         flat_send_labels.insert(flat_send_labels.end(), send_labels[p].begin(), send_labels[p].end());
 
     std::vector<int> flat_recv_labels(total_recv);
-    MPI_Alltoallv(flat_send_labels.data(), num_to_send.data(), send_ldispls.data(), MPI_INT,
-                  flat_recv_labels.data(), recv_counts.data(),  recv_ldispls.data(), MPI_INT,
-                  MPI_COMM_WORLD);
+    comm_.all_to_all_v_flat(flat_send_labels, num_to_send, send_ldispls,
+                            flat_recv_labels, recv_counts, recv_ldispls, MPI_INT);
 
     double end_exchange = MPI_Wtime();
 
@@ -2322,11 +2213,7 @@ void Executor::rebuild_delta(
 
     delete metaHNSW;
 
-    MessageHeader header;
-    header.type = REBUILD_SUCCESS;
-    header.size = sub_HNSW_->maxlevel_;
-    MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS,
-             MPI_COMM_WORLD);
+    comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
 
 void Executor::rebuild_replace(
@@ -2359,8 +2246,8 @@ void Executor::rebuild_replace(
         }
     }
 
-    std::vector<char> buffer(meta_size);
-    MPI_Recv(buffer.data(), meta_size, MPI_BYTE, 0, META_HNSW_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    std::vector<char> buffer;
+    comm_.recv_bytes(buffer, meta_size, 0, META_HNSW_SEND);
 
     // Node-unique temp path to avoid cross-executor collisions on a shared cwd.
     const std::string meta_tmp_path =
@@ -2372,8 +2259,8 @@ void Executor::rebuild_replace(
     hnswlib::HierarchicalNSW<float>* metaHNSW =
         new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
 
-    std::vector<int> partitions(ncenters);
-    MPI_Recv(partitions.data(), ncenters, MPI_INT, 0, META_PARTITIONS_SEND, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    std::vector<int> partitions;
+    comm_.recv_partitions(partitions, ncenters);
 
     std::vector<std::vector<float>> partition_vectors(world_size);
     std::vector<std::vector<int>> partition_indices(world_size);
@@ -2402,46 +2289,14 @@ void Executor::rebuild_replace(
         num_to_send[i] = partition_vectors[i].size() / dim_;
     }
 
-    std::vector<MPI_Request> requests;
-    for (int peer = 1; peer < world_size; ++peer) {
-        if (peer == node_id_) continue;
-        requests.emplace_back();
-        MPI_Irecv(&num_to_recv[peer], 1, MPI_INT, peer, TAG_SEND_NUM, MPI_COMM_WORLD, &requests.back());
-        requests.emplace_back();
-        MPI_Isend(&num_to_send[peer], 1, MPI_INT, peer, TAG_SEND_NUM, MPI_COMM_WORLD, &requests.back());
-    }
-    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
-    requests.clear();
+    comm_.exchange_counts(world_size, num_to_send, num_to_recv);
 
     int total_recv = std::accumulate(num_to_recv.begin(), num_to_recv.end(), 0);
     std::vector<float> all_recv_vectors(total_recv * dim_);
     std::vector<int> all_recv_labels(total_recv);
 
-    std::vector<int> offset(world_size, 0);
-    for (int i = 1; i < world_size; ++i) {
-        offset[i] = offset[i - 1] + num_to_recv[i - 1];
-    }
-
-    for (int peer = 1; peer < world_size; ++peer) {
-        if (peer == node_id_) continue;
-
-        if (num_to_recv[peer] > 0) {
-            int n_recv = num_to_recv[peer];
-            int peer_offset = offset[peer];
-            requests.emplace_back();
-            MPI_Irecv(all_recv_vectors.data() + peer_offset * dim_, n_recv * dim_, MPI_FLOAT, peer, TAG_SEND_VECS, MPI_COMM_WORLD, &requests.back());
-            requests.emplace_back();
-            MPI_Irecv(all_recv_labels.data() + peer_offset, n_recv, MPI_INT, peer, TAG_SEND_LABELS, MPI_COMM_WORLD, &requests.back());
-        }
-
-        if (num_to_send[peer] > 0) {
-            requests.emplace_back();
-            MPI_Isend(partition_vectors[peer].data(), num_to_send[peer] * dim_, MPI_FLOAT, peer, TAG_SEND_VECS, MPI_COMM_WORLD, &requests.back());
-            requests.emplace_back();
-            MPI_Isend(partition_indices[peer].data(), num_to_send[peer], MPI_INT, peer, TAG_SEND_LABELS, MPI_COMM_WORLD, &requests.back());
-        }
-    }
-    MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+    comm_.exchange_vectors(world_size, dim_, partition_vectors, partition_indices,
+                           num_to_send, num_to_recv, all_recv_vectors, all_recv_labels);
 
     {
         std::unique_lock lock(graph_mutex_);
@@ -2471,9 +2326,7 @@ void Executor::rebuild_replace(
 
     delete metaHNSW;
 
-    MessageHeader header;
-    header.type = REBUILD_SUCCESS;
-    MPI_Send(&header, sizeof(MessageHeader), MPI_BYTE, 0, REBUILD_SUCCESS, MPI_COMM_WORLD);
+    comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
 
 void Executor::search(size_t k, int tag) {
