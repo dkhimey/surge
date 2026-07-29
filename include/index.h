@@ -85,6 +85,12 @@ public:
     // Force full rebuild independent of thresholds; used for external conditions like tombstone ratio
     void do_force_full_rebuild(int world_size, int ef_construction, int M_meta);
 
+    // Coordinator-side participation in the executors' migration exchange. Rank
+    // 0 holds no shard, so it joins the 3-round all-to-all with empty buffers to
+    // keep every rank in lockstep. Called by both do_rebuild_simple (full) and
+    // do_rebuild_delta so the collective pattern is identical for every type.
+    void participate_in_migrant_exchange(int world_size);
+
     // Returns statistics from most recent check_need_rebuild (all zero before first call)
     int    get_cached_elements_moved()  const { return cached_elements_moved_; }
     int    get_cached_centers_moved()   const { return cached_centers_moved_; }
@@ -362,14 +368,45 @@ public:
     );
     
     void partial_rebuild(
-        int meta_size, 
-        int ncenters, 
+        int meta_size,
+        int ncenters,
         int world_size,
         int ef_construction,
         int num_building_threads = -1
     );
-    
+
 private:
+    // Result of the unified migration exchange (see exchange_migrants()). Every
+    // rebuild path — full reconstruction or in-place delta — routes its data
+    // movement through the same collective, so an executor's choice of local
+    // rebuild strategy no longer affects the wire protocol.
+    struct MigrantExchange {
+        // Active elements that STAY on this shard (new partition == node_id_).
+        // Only populated when collect_kept=true (needed by full reconstruction).
+        // Pointers alias the current sub_HNSW_'s data and stay valid until the
+        // graph is swapped/deleted (inserts are blocked during a rebuild).
+        std::vector<const float*> kept_vectors;
+        std::vector<int>          kept_labels;
+        // Elements that arrived from peers this round.
+        std::vector<float>        arrived_vectors; // flat: arrived_count * dim_
+        std::vector<int>          arrived_labels;
+        // Labels leaving this shard (routed to a peer) — used by the delta path
+        // to markDelete departing elements after the exchange.
+        std::vector<int>          departed_labels;
+        double iterate_s  = 0.0; // classify pass (searchKnn over active set)
+        double exchange_s = 0.0; // 3-round all-to-all
+    };
+
+    // Classify the local active set against a candidate meta-HNSW/partitioning
+    // and exchange departing/arriving vectors via a 3-round all-to-all that ALL
+    // ranks (including the coordinator, with empty buffers) participate in.
+    MigrantExchange exchange_migrants(
+        hnswlib::HierarchicalNSW<float>* metaHNSW,
+        const std::vector<int>&          partitions,
+        int                              world_size,
+        int                              num_building_threads,
+        bool                             collect_kept);
+
     Communicator& comm_;
 
     hnswlib::HierarchicalNSW<float>* sub_HNSW_ = nullptr;

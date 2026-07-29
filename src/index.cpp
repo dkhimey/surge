@@ -863,6 +863,28 @@ int Coordinator::check_need_rebuild(int full_threshold, int partial_threshold,
     return cached_rebuild_type_;
 }
 
+// Coordinator-side participation in the executors' migration exchange. Rank 0
+// holds no shard, so it joins the same 3-round all-to-all with empty buffers,
+// keeping every rank in lockstep regardless of whether each executor chose a
+// full or in-place rebuild. Mirrors Executor::exchange_migrants.
+void Coordinator::participate_in_migrant_exchange(int world_size) {
+    std::vector<int> zero_counts(world_size, 0);
+    std::vector<int> zero_displs(world_size, 0);
+
+    // Round 1: element counts (all zero — no executor sends vectors to rank 0).
+    std::vector<int> recv_counts;
+    comm_->all_to_all_counts(zero_counts, recv_counts);
+
+    // Rounds 2 & 3: vectors then labels. One-element dummy buffers keep the
+    // pointers non-null (required by some MPI impls) while counts stay zero.
+    std::vector<float> dummy_f(1, 0.0f);
+    std::vector<int>   dummy_i(1, 0);
+    comm_->all_to_all_v_flat(dummy_f, zero_counts, zero_displs,
+                             dummy_f, recv_counts, zero_displs, MPI_FLOAT);
+    comm_->all_to_all_v_flat(dummy_i, zero_counts, zero_displs,
+                             dummy_i, recv_counts, zero_displs, MPI_INT);
+}
+
 // Send rebuild to all executors (broadcasts meta-HNSW + partitions_).
 // Serial only; does not drain insert/delete logs.
 void Coordinator::do_rebuild_simple(int world_size) {
@@ -883,6 +905,10 @@ void Coordinator::do_rebuild_simple(int world_size) {
         comm_->send_bytes(cached_hnsw_buffer_, i, META_HNSW_SEND);
     }
     comm_->broadcast_partitions(cached_new_partitions_, world_size);
+
+    // Executors now route migrants through the collective all-to-all regardless
+    // of full vs delta; rank 0 must join it with empty buffers.
+    participate_in_migrant_exchange(world_size);
 
     // Wait for REBUILD_SUCCESS from every executor.
     for (int i = 1; i < world_size; i++) {
@@ -965,25 +991,9 @@ void Coordinator::do_rebuild_delta(int world_size) {
     }
     comm_->broadcast_partitions(cached_new_partitions_, world_size);
 
-    // Coordinator has no shard; call the same three collectives with empty
-    // buffers to keep every rank in step with the executors' delta exchange.
-    {
-        std::vector<int> zero_counts(world_size, 0);
-        std::vector<int> zero_displs(world_size, 0);
-
-        // Round 1: element counts (all zero — no executor sends vectors to rank 0).
-        std::vector<int> recv_counts;
-        comm_->all_to_all_counts(zero_counts, recv_counts);
-
-        // Rounds 2 & 3: vectors then labels. One-element dummy buffers keep the
-        // pointers non-null (required by some MPI impls) while counts stay zero.
-        std::vector<float> dummy_f(1, 0.0f);
-        std::vector<int>   dummy_i(1, 0);
-        comm_->all_to_all_v_flat(dummy_f, zero_counts, zero_displs,
-                                 dummy_f, recv_counts, zero_displs, MPI_FLOAT);
-        comm_->all_to_all_v_flat(dummy_i, zero_counts, zero_displs,
-                                 dummy_i, recv_counts, zero_displs, MPI_INT);
-    }
+    // Coordinator has no shard; join the same three collectives with empty
+    // buffers to keep every rank in step with the executors' migration exchange.
+    participate_in_migrant_exchange(world_size);
 
     for (int i = 1; i < world_size; i++) {
         comm_->recv_ack(REBUILD_SUCCESS, i, REBUILD_SUCCESS);
@@ -1852,11 +1862,146 @@ void Executor::partial_rebuild(
     comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
 
+// Unified migration exchange shared by every rebuild path. Classifies the local
+// active set against the candidate (metaHNSW, partitions) and moves departing /
+// arriving vectors through a 3-round all-to-all in which ALL ranks participate
+// (the coordinator joins with empty buffers via participate_in_migrant_exchange).
+//
+// This decouples data movement from the local rebuild strategy: whether an
+// executor then reconstructs its graph from scratch or applies an in-place
+// delta, the wire protocol is identical, so different executors may choose
+// different strategies in the same round without deadlocking the collectives.
+Executor::MigrantExchange Executor::exchange_migrants(
+    hnswlib::HierarchicalNSW<float>* metaHNSW,
+    const std::vector<int>&          partitions,
+    int                              world_size,
+    int                              num_building_threads,
+    bool                             collect_kept
+) {
+    MigrantExchange result;
+    if (num_building_threads == -1)
+        num_building_threads = omp_get_max_threads();
+
+    // Per-destination outbound buffers (index p == executor rank).
+    std::vector<std::vector<float>> send_vecs(world_size);
+    std::vector<std::vector<int>>   send_labels(world_size);
+
+    // ---- Classify pass: decide keep vs depart for every active element. ----
+    // Shared lock: safe against concurrent searches; the rebuild protocol blocks
+    // inserts, so no resize can occur while we alias internal data pointers.
+    double start_iter = MPI_Wtime();
+    {
+        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+        const size_t nelts = sub_HNSW_->getCurrentElementCount();
+
+        #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
+        for (hnswlib::tableint iid = 0; iid < static_cast<hnswlib::tableint>(nelts); iid++) {
+            if (sub_HNSW_->isMarkedDeleted(iid)) continue;
+
+            int ext_lbl = static_cast<int>(sub_HNSW_->getExternalLabel(iid));
+
+            // Canonical-ownership check: skip ghost slots whose label_lookup_
+            // already points elsewhere (stale copies left by replace_deleted).
+            {
+                const auto it = sub_HNSW_->label_lookup_.find(
+                    static_cast<hnswlib::labeltype>(ext_lbl));
+                if (it == sub_HNSW_->label_lookup_.end() || it->second != iid)
+                    continue;
+            }
+
+            float* vec_ptr = reinterpret_cast<float*>(sub_HNSW_->getDataByInternalId(iid));
+            hnswlib::labeltype center = metaHNSW->searchKnn(vec_ptr, 1).top().second;
+            int p = partitions[center] + 1;   // executor rank = shard index + 1
+
+            if (p == static_cast<int>(node_id_)) {
+                if (collect_kept) {
+                    #pragma omp critical(migrant_kept)
+                    {
+                        result.kept_vectors.push_back(vec_ptr);
+                        result.kept_labels.push_back(ext_lbl);
+                    }
+                }
+            } else {
+                #pragma omp critical(migrant_classify)
+                {
+                    send_vecs[p].insert(send_vecs[p].end(), vec_ptr, vec_ptr + dim_);
+                    send_labels[p].push_back(ext_lbl);
+                }
+            }
+        }
+    }
+
+    // Flatten departing labels (order matches send buffers; used by delta path).
+    for (int p = 1; p < world_size; p++)
+        result.departed_labels.insert(result.departed_labels.end(),
+                                      send_labels[p].begin(), send_labels[p].end());
+
+    double end_iter = MPI_Wtime();
+    result.iterate_s = end_iter - start_iter;
+
+    // ---- Exchange: 3 collective rounds (counts, vectors, labels). ----
+    // Round 1 — Alltoall of element counts.
+    // Round 2 — Alltoallv of vectors (counts scaled by dim_).
+    // Round 3 — Alltoallv of labels (one int per element).
+    double start_exchange = MPI_Wtime();
+
+    std::vector<int> num_to_send(world_size, 0);
+    for (int p = 1; p < world_size; p++)
+        num_to_send[p] = static_cast<int>(send_labels[p].size());
+
+    std::vector<int> recv_counts;
+    comm_.all_to_all_counts(num_to_send, recv_counts);
+
+    const int total_recv = std::accumulate(recv_counts.begin(), recv_counts.end(), 0);
+
+    // Round 2: vectors.
+    std::vector<int> send_vcounts(world_size), send_vdispls(world_size, 0);
+    std::vector<int> recv_vcounts(world_size), recv_vdispls(world_size, 0);
+    for (int p = 0; p < world_size; p++) {
+        send_vcounts[p] = num_to_send[p] * static_cast<int>(dim_);
+        recv_vcounts[p] = recv_counts[p]  * static_cast<int>(dim_);
+    }
+    for (int p = 1; p < world_size; p++) {
+        send_vdispls[p] = send_vdispls[p-1] + send_vcounts[p-1];
+        recv_vdispls[p] = recv_vdispls[p-1] + recv_vcounts[p-1];
+    }
+
+    std::vector<float> flat_send_vecs;
+    { size_t tot = 0; for (auto& b : send_vecs) tot += b.size(); flat_send_vecs.reserve(tot); }
+    for (int p = 0; p < world_size; p++)
+        flat_send_vecs.insert(flat_send_vecs.end(), send_vecs[p].begin(), send_vecs[p].end());
+
+    result.arrived_vectors.assign(static_cast<size_t>(total_recv) * dim_, 0.0f);
+    comm_.all_to_all_v_flat(flat_send_vecs, send_vcounts, send_vdispls,
+                            result.arrived_vectors, recv_vcounts, recv_vdispls, MPI_FLOAT);
+
+    // Round 3: labels.
+    std::vector<int> send_ldispls(world_size, 0), recv_ldispls(world_size, 0);
+    for (int p = 1; p < world_size; p++) {
+        send_ldispls[p] = send_ldispls[p-1] + num_to_send[p-1];
+        recv_ldispls[p] = recv_ldispls[p-1] + recv_counts[p-1];
+    }
+
+    std::vector<int> flat_send_labels;
+    { size_t tot = 0; for (auto& b : send_labels) tot += b.size(); flat_send_labels.reserve(tot); }
+    for (int p = 0; p < world_size; p++)
+        flat_send_labels.insert(flat_send_labels.end(), send_labels[p].begin(), send_labels[p].end());
+
+    result.arrived_labels.assign(total_recv, 0);
+    comm_.all_to_all_v_flat(flat_send_labels, num_to_send, send_ldispls,
+                            result.arrived_labels, recv_counts, recv_ldispls, MPI_INT);
+
+    double end_exchange = MPI_Wtime();
+    result.exchange_s = end_exchange - start_exchange;
+
+    return result;
+}
+
 void Executor::rebuild(
-    int meta_size, 
-    int ncenters, 
-    int world_size, 
-    int ef_construction, 
+    int meta_size,
+    int ncenters,
+    int world_size,
+    int ef_construction,
     int M_sub,
     int num_building_threads
 ) {
@@ -1864,137 +2009,74 @@ void Executor::rebuild(
     if (num_building_threads == -1)
         num_building_threads = omp_get_max_threads();
 
-    std::vector<float*> active_vectors;
-    std::vector<int> active_indices;
-
-    // TODO: multithreading possible
-    // TODO: ensure all pending inserts complete
-    size_t active_count = 0;
-    {
-        size_t nelts = sub_HNSW_->getCurrentElementCount();
-        for (hnswlib::tableint internal_id = 0; internal_id < nelts; internal_id++) {
-            if (!sub_HNSW_->isMarkedDeleted(internal_id)) {
-                float* vec_ptr = reinterpret_cast<float*>(sub_HNSW_->getDataByInternalId(internal_id));
-                size_t external_label = sub_HNSW_->getExternalLabel(internal_id);
-                active_vectors.push_back(vec_ptr);
-                active_indices.push_back(external_label);
-                active_count++;
-            }
-        }
-    }
-
+    // Receive the candidate meta-HNSW + partitioning.
     std::vector<char> buffer;
     comm_.recv_bytes(buffer, meta_size, 0, META_HNSW_SEND);
 
-    // Wrap buffer in stream and load (node-unique path to avoid cross-executor
-    // collisions when a working directory is shared).
+    // Node-unique temp path to avoid cross-executor collisions on a shared cwd.
     const std::string meta_tmp_path =
         "tmp_hnsw_received_r" + std::to_string(node_id_) + ".bin";
     std::ofstream outfile(meta_tmp_path, std::ios::binary);
     outfile.write(buffer.data(), meta_size);
     outfile.close();
 
-    hnswlib::HierarchicalNSW<float>* metaHNSW = new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
+    hnswlib::HierarchicalNSW<float>* metaHNSW =
+        new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
 
     std::vector<int> partitions;
     comm_.recv_partitions(partitions, ncenters);
 
-    hnswlib::HierarchicalNSW<float>* next_sub_HNSW = new hnswlib::HierarchicalNSW<float>(space_, active_count, M_sub, ef_construction, 100, true);
+    // Unified migration exchange (collect_kept=true: full reconstruction needs
+    // the elements that stay). Same collectives as the delta path.
+    MigrantExchange mig = exchange_migrants(metaHNSW, partitions, world_size,
+                                            num_building_threads, /*collect_kept=*/true);
 
-    std::vector<std::vector<float>> partition_vectors(world_size);
-    std::vector<std::vector<int>> partition_indices(world_size);
+    delete metaHNSW;
 
-    double start_iter = MPI_Wtime();
-    // check which elements stay and move
-    bool first_inserted = false;
-    int idx = 0;
-    int num_kept = 0;
-    while (!first_inserted && idx < active_count) { // first insert into HNSW must be sequential
-        float* vec = active_vectors[idx];
-        //  data_+ (idx * dim_);
-        int index = active_indices[idx];
-        hnswlib::labeltype label = metaHNSW->searchKnn(vec, 1).top().second;
-        int p = partitions[label] + 1;
-        if (p == node_id_) {
-            first_inserted = true;
-            next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/true);
-            num_kept++;
-        } else {
-            partition_vectors[p].insert(partition_vectors[p].end(), vec, vec + dim_);
-            partition_indices[p].push_back(index);
-        }
-        idx++;
-    }
+    const size_t kept_count  = mig.kept_labels.size();
+    const int    total_recv  = static_cast<int>(mig.arrived_labels.size());
 
-    // std::cout << "[Executor " << node_id_ << "] rebuild -- starting parallel iteration\n";
-    #pragma omp parallel for num_threads(num_building_threads)
-    for (int i = idx; i < active_count; i++) {
-        float* vec = active_vectors[i];
-        // data_ + (i * dim_);
-        int index = active_indices[i];
-        hnswlib::labeltype label = metaHNSW->searchKnn(vec, 1).top().second;
-        int p = partitions[label] + 1;
-        if (p == node_id_) {
-            next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/true);
-            num_kept++;
-        }
-        else {
-            // std::cout << "[Executor " << node_id_ << "] rebuild -- entering critical region\n";
-            #pragma omp critical(rebuild_partitions)
-            {
-                partition_vectors[p].insert(partition_vectors[p].end(), vec, vec + dim_);
-                partition_indices[p].push_back(index);
-            }
-            // std::cout << "[Executor " << node_id_ << "] rebuild -- out of critical region\n";
-        }
-    }
-    double end_iter = MPI_Wtime();
+    std::cout << "[Executor " << node_id_ << "] iterate time : "  << mig.iterate_s  << "\n";
+    std::cout << "[Executor " << node_id_ << "] rebuild exchange time : " << mig.exchange_s << "\n";
 
-    std::cout << "[Executor " << node_id_ << "] iterate time : " <<  end_iter - start_iter << "\n";
-    // std::cout << "[Executor " << node_id_ << "] num_kept : " <<  num_kept << "/" << active_count << "\n";
-
-    std::vector<int> num_to_recv(world_size, 0);
-    std::vector<int> num_to_send(world_size);
-    for (int i = 1; i < world_size; i++) {
-        num_to_send[i] = partition_vectors[i].size() / dim_;
-    }
-
-    // std::cout << "[Executor " << node_id_ << " ] exchanging nums \n";
-    double start_exchange = MPI_Wtime();
-
-    comm_.exchange_counts(world_size, num_to_send, num_to_recv);
-
-    int total_recv = std::accumulate(num_to_recv.begin(), num_to_recv.end(), 0);
-    std::vector<float> all_recv_vectors(total_recv * dim_);
-    std::vector<int> all_recv_labels(total_recv);
-
-    comm_.exchange_vectors(world_size, dim_, partition_vectors, partition_indices,
-                           num_to_send, num_to_recv, all_recv_vectors, all_recv_labels);
-
-    double end_exchange = MPI_Wtime();
-    // std::cout << "[Executor " << node_id_ << " ] DONE EXCHANGING*******\n";
-    std::cout << "[Executor " << node_id_ << "] rebuild exchange time : " <<  end_exchange - start_exchange << "\n";
-
-    size_t next_data_count = next_sub_HNSW->getCurrentElementCount() + total_recv;
-    if (next_data_count > next_sub_HNSW->getMaxElements()) 
-        next_sub_HNSW->resizeIndex(next_data_count);
-
+    // Reconstruct a fresh graph over kept + arrived elements.
+    hnswlib::HierarchicalNSW<float>* next_sub_HNSW =
+        new hnswlib::HierarchicalNSW<float>(space_, kept_count + total_recv,
+                                            M_sub, ef_construction, 100, true);
 
     double start_hnsw = MPI_Wtime();
+
+    // First insert into a fresh HNSW must be sequential; use a kept element if
+    // any, otherwise an arrived one.
+    bool   first_done  = false;
+    size_t kept_start  = 0;
+    int    arr_start   = 0;
+    if (kept_count > 0) {
+        next_sub_HNSW->addPoint(mig.kept_vectors[0], mig.kept_labels[0], /*replace_deleted=*/true);
+        first_done = true;
+        kept_start = 1;
+    } else if (total_recv > 0) {
+        next_sub_HNSW->addPoint(mig.arrived_vectors.data(), mig.arrived_labels[0], /*replace_deleted=*/true);
+        first_done = true;
+        arr_start = 1;
+    }
+    (void)first_done;
+
     #pragma omp parallel for num_threads(num_building_threads)
-    for (int i = 0; i < total_recv; i++) {
-        float* vec = all_recv_vectors.data() + (i * dim_);
-        int index = all_recv_labels[i];
-        next_sub_HNSW->addPoint(vec, index, /*replace_deleted=*/true);
+    for (size_t i = kept_start; i < kept_count; i++) {
+        next_sub_HNSW->addPoint(mig.kept_vectors[i], mig.kept_labels[i], /*replace_deleted=*/true);
+    }
+
+    #pragma omp parallel for num_threads(num_building_threads)
+    for (int i = arr_start; i < total_recv; i++) {
+        next_sub_HNSW->addPoint(mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
+                                mig.arrived_labels[i], /*replace_deleted=*/true);
     }
     double end_hnsw = MPI_Wtime();
 
     std::cout << "[Executor " << node_id_ << "] rebuild hnsw time : " <<  end_hnsw - start_hnsw << "\n";
-    // std::cout << "[Executor " << node_id_ << "] total num elements: " <<  next_data_count << "\n";
 
     next_sub_HNSW->setEf(ef_construction);
-
-    delete metaHNSW;
 
     // lock as you make the switch
     {   std::unique_lock lock(graph_mutex_);
@@ -2003,12 +2085,15 @@ void Executor::rebuild(
         sub_HNSW_ = next_sub_HNSW;
     }
 
+    // A full reconstruction leaves no tombstones behind.
+    last_rebuild_remaining_deleted_ = 0;
+
     // Cache per-phase timings before notifying coordinator (so getters are
     // valid as soon as rebuild() returns on the experiment side).
-    last_rebuild_iterate_s_     = end_iter     - start_iter;
-    last_rebuild_exchange_s_    = end_exchange - start_exchange;
-    last_rebuild_graph_s_       = end_hnsw     - start_hnsw;
-    last_rebuild_moved_labels_  = std::move(all_recv_labels);
+    last_rebuild_iterate_s_     = mig.iterate_s;
+    last_rebuild_exchange_s_    = mig.exchange_s;
+    last_rebuild_graph_s_       = end_hnsw - start_hnsw;
+    last_rebuild_moved_labels_  = std::move(mig.arrived_labels);
 
     comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
@@ -2041,128 +2126,31 @@ void Executor::rebuild_delta(
     std::vector<int> partitions;
     comm_.recv_partitions(partitions, ncenters);
 
-    // Read pass: shared lock so no concurrent resize can occur.
-    std::vector<std::vector<float>> send_vecs(world_size);
-    std::vector<std::vector<int>>   send_labels(world_size);
+    // Unified migration exchange (collect_kept=false: kept elements stay in place
+    // and are not needed by the delta path). Same collectives as the full path,
+    // so a mix of full and delta executors in one round cannot deadlock.
+    MigrantExchange mig = exchange_migrants(metaHNSW, partitions, world_size,
+                                            num_building_threads, /*collect_kept=*/false);
 
-    double start_iter = MPI_Wtime();
-    {
-        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
-        const size_t nelts = sub_HNSW_->getCurrentElementCount();
+    const size_t n_departing = mig.departed_labels.size();
+    const int    total_recv  = static_cast<int>(mig.arrived_labels.size());
 
-        #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
-        for (hnswlib::tableint iid = 0; iid < static_cast<hnswlib::tableint>(nelts); iid++) {
-            if (sub_HNSW_->isMarkedDeleted(iid)) continue;
-
-            int ext_lbl = static_cast<int>(sub_HNSW_->getExternalLabel(iid));
-
-            // Canonical-ownership check: skip ghost labels (stale slots with label_lookup
-            // already pointing elsewhere via replace_deleted). No lock needed; rebuild
-            // protocol blocks insert_local_batch during this iterate pass.
-            {
-                const auto it = sub_HNSW_->label_lookup_.find(
-                    static_cast<hnswlib::labeltype>(ext_lbl));
-                if (it == sub_HNSW_->label_lookup_.end() ||
-                        it->second != iid)
-                    continue;
-            }
-
-            float* vec_ptr  = reinterpret_cast<float*>(sub_HNSW_->getDataByInternalId(iid));
-
-            hnswlib::labeltype center = metaHNSW->searchKnn(vec_ptr, 1).top().second;
-            int p = partitions[center] + 1;   // executor rank = shard index + 1
-
-            if (p != static_cast<int>(node_id_)) {
-                #pragma omp critical(delta_classify)
-                {
-                    send_vecs[p].insert(send_vecs[p].end(), vec_ptr, vec_ptr + dim_);
-                    send_labels[p].push_back(ext_lbl);
-                }
-            }
-        }
-    }
-
-    // Mark-delete pass: mark-delete for distinct labels is thread-safe under a
-    // shared lock (same convention as mark_delete_local_batch).
-    {
-        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
-        for (int p = 1; p < world_size; p++) {
-            #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
-            for (int i = 0; i < static_cast<int>(send_labels[p].size()); i++) {
-                sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(send_labels[p][i]));
-            }
-        }
-    }
-
-    size_t n_departing = 0;
-    for (int p = 1; p < world_size; p++)
-        n_departing += send_labels[p].size();
-
-    std::vector<int> num_to_send(world_size, 0);
-    for (int p = 1; p < world_size; p++)
-        num_to_send[p] = static_cast<int>(send_labels[p].size());
-
-    double end_iter = MPI_Wtime();
     std::cout << "[Executor " << node_id_ << "] delta rebuild iterate: departed="
               << n_departing << "\n";
-
-    // All ranks (including the coordinator with empty buffers) call the same
-    // three collectives, so no sub-communicator is needed.
-    //
-    // Round 1 — MPI_Alltoall: exchange element counts so every rank knows how
-    //           many elements it will receive from each peer.
-    // Round 2 — MPI_Alltoallv on MPI_FLOAT: exchange the actual vectors.
-    // Round 3 — MPI_Alltoallv on MPI_INT: exchange the corresponding labels.
-    //           (Receive counts are derived from round 1; no extra Alltoall.)
-    double start_exchange = MPI_Wtime();
-
-    // Round 1: element counts (one int per rank).
-    std::vector<int> recv_counts;
-    comm_.all_to_all_counts(num_to_send, recv_counts);
-
-    const int total_recv = std::accumulate(recv_counts.begin(), recv_counts.end(), 0);
-
-    // Round 2: vectors — convert element counts to float counts for Alltoallv.
-    std::vector<int> send_vcounts(world_size), send_vdispls(world_size, 0);
-    std::vector<int> recv_vcounts(world_size), recv_vdispls(world_size, 0);
-    for (int p = 0; p < world_size; p++) {
-        send_vcounts[p] = num_to_send[p] * static_cast<int>(dim_);
-        recv_vcounts[p] = recv_counts[p]  * static_cast<int>(dim_);
-    }
-    for (int p = 1; p < world_size; p++) {
-        send_vdispls[p] = send_vdispls[p-1] + send_vcounts[p-1];
-        recv_vdispls[p] = recv_vdispls[p-1] + recv_vcounts[p-1];
-    }
-
-    std::vector<float> flat_send_vecs;
-    { size_t tot = 0; for (auto& b : send_vecs) tot += b.size(); flat_send_vecs.reserve(tot); }
-    for (int p = 0; p < world_size; p++)
-        flat_send_vecs.insert(flat_send_vecs.end(), send_vecs[p].begin(), send_vecs[p].end());
-
-    std::vector<float> flat_recv_vecs(static_cast<size_t>(total_recv) * dim_);
-    comm_.all_to_all_v_flat(flat_send_vecs, send_vcounts, send_vdispls,
-                            flat_recv_vecs, recv_vcounts, recv_vdispls, MPI_FLOAT);
-
-    // Round 3: labels — reuse element counts directly (one int per element).
-    std::vector<int> send_ldispls(world_size, 0), recv_ldispls(world_size, 0);
-    for (int p = 1; p < world_size; p++) {
-        send_ldispls[p] = send_ldispls[p-1] + num_to_send[p-1];
-        recv_ldispls[p] = recv_ldispls[p-1] + recv_counts[p-1];
-    }
-
-    std::vector<int> flat_send_labels;
-    { size_t tot = 0; for (auto& b : send_labels) tot += b.size(); flat_send_labels.reserve(tot); }
-    for (int p = 0; p < world_size; p++)
-        flat_send_labels.insert(flat_send_labels.end(), send_labels[p].begin(), send_labels[p].end());
-
-    std::vector<int> flat_recv_labels(total_recv);
-    comm_.all_to_all_v_flat(flat_send_labels, num_to_send, send_ldispls,
-                            flat_recv_labels, recv_counts, recv_ldispls, MPI_INT);
-
-    double end_exchange = MPI_Wtime();
-
     std::cout << "[Executor " << node_id_ << "] delta rebuild exchange: arrived="
               << total_recv << "\n";
+
+    // Mark-delete departing elements AFTER the exchange (their vectors were
+    // already copied into send buffers during classify, so this is safe). This
+    // frees slots for the arriving elements' replace_deleted inserts below.
+    // markDelete on distinct labels is thread-safe under a shared lock.
+    {
+        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+        #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
+        for (int i = 0; i < static_cast<int>(mig.departed_labels.size()); i++) {
+            sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(mig.departed_labels[i]));
+        }
+    }
 
     // Reserve capacity conservatively
     {
@@ -2179,8 +2167,8 @@ void Executor::rebuild_delta(
         #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
         for (int i = 0; i < total_recv; i++) {
             sub_HNSW_->addPoint(
-                flat_recv_vecs.data() + static_cast<size_t>(i) * dim_,
-                static_cast<hnswlib::labeltype>(flat_recv_labels[i]),
+                mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
+                static_cast<hnswlib::labeltype>(mig.arrived_labels[i]),
                 /*replace_deleted=*/true);
         }
     }
@@ -2206,10 +2194,10 @@ void Executor::rebuild_delta(
               << "\n";
 
     last_rebuild_remaining_deleted_ = remaining_deleted;
-    last_rebuild_iterate_s_         = end_iter     - start_iter;
-    last_rebuild_exchange_s_        = end_exchange - start_exchange;
-    last_rebuild_graph_s_           = end_hnsw     - start_hnsw;
-    last_rebuild_moved_labels_      = std::move(flat_recv_labels);
+    last_rebuild_iterate_s_         = mig.iterate_s;
+    last_rebuild_exchange_s_        = mig.exchange_s;
+    last_rebuild_graph_s_           = end_hnsw - start_hnsw;
+    last_rebuild_moved_labels_      = std::move(mig.arrived_labels);
 
     delete metaHNSW;
 
