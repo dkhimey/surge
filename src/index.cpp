@@ -617,7 +617,7 @@ int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     int seed = gen_();
     // run partitioning algo
     start = MPI_Wtime();
-    kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(), 
+    kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(),
            &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, new_partitions.data());
     end = MPI_Wtime();
     double partition_time = end-start;
@@ -1954,16 +1954,20 @@ Executor::MigrantExchange Executor::exchange_migrants(
 
     const int total_recv = std::accumulate(recv_counts.begin(), recv_counts.end(), 0);
 
-    // Round 2: vectors.
-    std::vector<int> send_vcounts(world_size), send_vdispls(world_size, 0);
-    std::vector<int> recv_vcounts(world_size), recv_vdispls(world_size, 0);
-    for (int p = 0; p < world_size; p++) {
-        send_vcounts[p] = num_to_send[p] * static_cast<int>(dim_);
-        recv_vcounts[p] = recv_counts[p]  * static_cast<int>(dim_);
-    }
+    // Round 2: vectors. Count in whole vectors via a contiguous datatype rather
+    // than in floats. Scaling element counts by dim_ overflows 32-bit int once a
+    // peer moves > INT_MAX/dim_ (~16.7M vectors at dim=128), or once a cumulative
+    // float displacement passes INT_MAX — which happens at 500M scale on a large
+    // repartition and aborts Alltoallv with MPI_ERR_COUNT. Using a vector-sized
+    // unit keeps counts/displacements in vectors, ~dim_x below the limit.
+    MPI_Datatype vec_type;
+    MPI_Type_contiguous(static_cast<int>(dim_), MPI_FLOAT, &vec_type);
+    MPI_Type_commit(&vec_type);
+
+    std::vector<int> send_vdispls(world_size, 0), recv_vdispls(world_size, 0);
     for (int p = 1; p < world_size; p++) {
-        send_vdispls[p] = send_vdispls[p-1] + send_vcounts[p-1];
-        recv_vdispls[p] = recv_vdispls[p-1] + recv_vcounts[p-1];
+        send_vdispls[p] = send_vdispls[p-1] + num_to_send[p-1];
+        recv_vdispls[p] = recv_vdispls[p-1] + recv_counts[p-1];
     }
 
     std::vector<float> flat_send_vecs;
@@ -1971,9 +1975,12 @@ Executor::MigrantExchange Executor::exchange_migrants(
     for (int p = 0; p < world_size; p++)
         flat_send_vecs.insert(flat_send_vecs.end(), send_vecs[p].begin(), send_vecs[p].end());
 
+    // Counts/displacements are in vec_type units (= whole vectors), so reuse the
+    // element counts directly instead of the dim_-scaled versions.
     result.arrived_vectors.assign(static_cast<size_t>(total_recv) * dim_, 0.0f);
-    comm_.all_to_all_v_flat(flat_send_vecs, send_vcounts, send_vdispls,
-                            result.arrived_vectors, recv_vcounts, recv_vdispls, MPI_FLOAT);
+    comm_.all_to_all_v_flat(flat_send_vecs, num_to_send, send_vdispls,
+                            result.arrived_vectors, recv_counts, recv_vdispls, vec_type);
+    MPI_Type_free(&vec_type);
 
     // Round 3: labels.
     std::vector<int> send_ldispls(world_size, 0), recv_ldispls(world_size, 0);
