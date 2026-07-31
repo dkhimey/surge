@@ -421,7 +421,8 @@ int main(int argc, char** argv)
     }
     const std::string ckpt_base =
         "checkpoints/" + dataset_name + "_t" + std::to_string(full_threshold);
-    const bool        use_delta_rebuild = true;
+    // Rebuild strategy (full vs in-place delta) is now chosen per-shard inside
+    // Executor::rebuild_adaptive, not globally here.
     const bool        maintenance_enabled = (full_threshold < NCENTERS);
 
     
@@ -934,25 +935,24 @@ int main(int argc, char** argv)
 
                 RebuildStats rb_stats;
                 if (do_rebuild) {
-                    const bool actual_delta = use_delta_rebuild && !tombstone_forces;
                     if (tombstone_forces)
                         std::cout << "[Sweep] Step " << step.step_num
                                   << "  tombstone ratio " << max_ratio
                                   << " >= " << TOMBSTONE_RATIO_THRESHOLD
-                                  << " -- forcing full rebuild"
+                                  << " -- maintenance triggered"
                                   << (rb_type > 0 ? "\n"
                                                   : " (center-movement threshold not met)\n");
 
+                    // Coordinator only ships the new routing/partitioning and joins
+                    // the migration exchange; each executor picks full vs delta for
+                    // its own shard (rebuild_adaptive). Both entry points below are
+                    // equivalent on the coordinator side now (send + exchange + swap);
+                    // which runs just depends on whether check_need_rebuild cached a
+                    // new partitioning. rebuild_type is set from executor votes below.
                     const double t_rb0 = MPI_Wtime();
-                    if (rb_type > 0) {
-                        if (actual_delta) metaIndex.do_rebuild_delta(world_size);
-                        else              metaIndex.do_rebuild_simple(world_size);
-                    } else {
-                        metaIndex.do_force_full_rebuild(world_size, EF_CONSTRUCTION, M_META);
-                    }
+                    if (rb_type > 0) metaIndex.do_rebuild_delta(world_size);
+                    else             metaIndex.do_force_full_rebuild(world_size, EF_CONSTRUCTION, M_META);
                     rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
-
-                    rb_stats.rebuild_type     = actual_delta ? "delta" : "full";
                     rb_stats.centers_moved    = metaIndex.get_cached_centers_moved();
                     rb_stats.elements_moved   = metaIndex.get_cached_elements_moved();
                     rb_stats.repart_hnsw_s    = metaIndex.get_cached_repart_hnsw_s();
@@ -971,12 +971,24 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
-                    if (actual_delta) {
-                        long long del_send = 0LL;
-                        long long del_recv = 0LL;
+                    // Total tombstones remaining across shards (full-rebuild shards
+                    // contribute 0). Unconditional now, matching the executors which
+                    // always participate regardless of the strategy they chose.
+                    {
+                        long long del_send = 0LL, del_recv = 0LL;
                         comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0);
                         rb_stats.remaining_deleted_slots = del_recv;
+                    }
+                    // How many shards reconstructed from scratch this round.
+                    {
+                        int full_send = 0, full_recv = 0;
+                        comm.reduce(&full_send, &full_recv, 1, MPI_INT, MPI_SUM, 0);
+                        const int n_exec = world_size - 1;
+                        rb_stats.rebuild_type =
+                            (full_recv == 0)      ? "delta"
+                          : (full_recv == n_exec) ? "full"
+                          : ("mixed_" + std::to_string(full_recv) + "full");
                     }
 
                     // Sync label_to_shard: each executor reports its arrived labels.
@@ -991,9 +1003,8 @@ int main(int argc, char** argv)
                               << "  centers_moved=" << rb_stats.centers_moved
                               << "  elements_moved=" << rb_stats.elements_moved
                               << "  total_rebuild_s=" << total_rb_s;
-                    if (actual_delta)
-                        std::cout << "  remaining_deleted_slots="
-                                  << rb_stats.remaining_deleted_slots;
+                    std::cout << "  remaining_deleted_slots="
+                              << rb_stats.remaining_deleted_slots;
                     std::cout << "\n";
                 }
 
@@ -1071,25 +1082,24 @@ int main(int argc, char** argv)
 
                 RebuildStats rb_stats;
                 if (do_rebuild) {
-                    const bool actual_delta = use_delta_rebuild && !tombstone_forces;
                     if (tombstone_forces)
                         std::cout << "[Sweep] Step " << step.step_num
                                   << "  tombstone ratio " << max_ratio
                                   << " >= " << TOMBSTONE_RATIO_THRESHOLD
-                                  << " -- forcing full rebuild"
+                                  << " -- maintenance triggered"
                                   << (rb_type > 0 ? "\n"
                                                   : " (center-movement threshold not met)\n");
 
+                    // Coordinator only ships the new routing/partitioning and joins
+                    // the migration exchange; each executor picks full vs delta for
+                    // its own shard (rebuild_adaptive). Both entry points below are
+                    // equivalent on the coordinator side now (send + exchange + swap);
+                    // which runs just depends on whether check_need_rebuild cached a
+                    // new partitioning. rebuild_type is set from executor votes below.
                     const double t_rb0 = MPI_Wtime();
-                    if (rb_type > 0) {
-                        if (actual_delta) metaIndex.do_rebuild_delta(world_size);
-                        else              metaIndex.do_rebuild_simple(world_size);
-                    } else {
-                        metaIndex.do_force_full_rebuild(world_size, EF_CONSTRUCTION, M_META);
-                    }
+                    if (rb_type > 0) metaIndex.do_rebuild_delta(world_size);
+                    else             metaIndex.do_force_full_rebuild(world_size, EF_CONSTRUCTION, M_META);
                     rb_stats.dorebuild_wall_s = MPI_Wtime() - t_rb0;
-
-                    rb_stats.rebuild_type     = actual_delta ? "delta" : "full";
                     rb_stats.centers_moved    = metaIndex.get_cached_centers_moved();
                     rb_stats.elements_moved   = metaIndex.get_cached_elements_moved();
                     rb_stats.repart_hnsw_s    = metaIndex.get_cached_repart_hnsw_s();
@@ -1108,12 +1118,24 @@ int main(int argc, char** argv)
                     rb_stats.exec_exchange_s = exec_recv[1];
                     rb_stats.exec_graph_s    = exec_recv[2];
 
-                    if (actual_delta) {
-                        long long del_send = 0LL;
-                        long long del_recv = 0LL;
+                    // Total tombstones remaining across shards (full-rebuild shards
+                    // contribute 0). Unconditional now, matching the executors which
+                    // always participate regardless of the strategy they chose.
+                    {
+                        long long del_send = 0LL, del_recv = 0LL;
                         comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0);
                         rb_stats.remaining_deleted_slots = del_recv;
+                    }
+                    // How many shards reconstructed from scratch this round.
+                    {
+                        int full_send = 0, full_recv = 0;
+                        comm.reduce(&full_send, &full_recv, 1, MPI_INT, MPI_SUM, 0);
+                        const int n_exec = world_size - 1;
+                        rb_stats.rebuild_type =
+                            (full_recv == 0)      ? "delta"
+                          : (full_recv == n_exec) ? "full"
+                          : ("mixed_" + std::to_string(full_recv) + "full");
                     }
 
                     // Sync label_to_shard: each executor reports its arrived labels.
@@ -1128,9 +1150,8 @@ int main(int argc, char** argv)
                               << "  centers_moved=" << rb_stats.centers_moved
                               << "  elements_moved=" << rb_stats.elements_moved
                               << "  total_rebuild_s=" << total_rb_s;
-                    if (actual_delta)
-                        std::cout << "  remaining_deleted_slots="
-                                  << rb_stats.remaining_deleted_slots;
+                    std::cout << "  remaining_deleted_slots="
+                              << rb_stats.remaining_deleted_slots;
                     std::cout << "\n";
                 }
 
@@ -1769,14 +1790,11 @@ int main(int argc, char** argv)
                 if (do_rebuild) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
-                        subIndex.rebuild_delta(static_cast<int>(hdr.size), NCENTERS,
-                                              world_size, NUM_BUILDING_THREADS);
-                    } else {
-                        subIndex.rebuild(static_cast<int>(hdr.size), NCENTERS,
-                                         world_size, EF_CONSTRUCTION, M_SUB,
-                                         NUM_BUILDING_THREADS);
-                    }
+                    // Each shard decides full vs delta for itself; the header type
+                    // no longer dictates the strategy.
+                    subIndex.rebuild_adaptive(static_cast<int>(hdr.size), NCENTERS,
+                                              world_size, EF_CONSTRUCTION, M_SUB,
+                                              NUM_BUILDING_THREADS);
                     // Sync updated routing state.
                     bcastRoutingState(comm, rank, dim, nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
@@ -1790,14 +1808,20 @@ int main(int argc, char** argv)
                     double exec_recv[3]; // unused on non-root ranks
                     comm.reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
                                0);
-                    // Delta rebuild only: contribute remaining deleted slots to
-                    // the coordinator's SUM reduce.
-                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
+                    // Contribute remaining tombstones (SUM) — full rebuilds report 0.
+                    // Unconditional so every rank matches the coordinator's reduces.
+                    {
                         long long del_send = static_cast<long long>(
                             subIndex.get_last_rebuild_remaining_deleted());
                         long long del_recv = 0LL; // unused on non-root ranks
                         comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0);
+                    }
+                    // Contribute this shard's strategy vote (SUM of full-choosers).
+                    {
+                        int full_send = subIndex.get_last_rebuild_did_full() ? 1 : 0;
+                        int full_recv = 0; // unused on non-root ranks
+                        comm.reduce(&full_send, &full_recv, 1, MPI_INT, MPI_SUM, 0);
                     }
                     // Sync label_to_shard: report arrived labels to all ranks.
                     sync_label_to_shard_after_rebuild_exec();
@@ -1857,14 +1881,11 @@ int main(int argc, char** argv)
                 if (do_rebuild) {
                     MessageHeader hdr;
                     comm.recv_header(hdr, 0);
-                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
-                        subIndex.rebuild_delta(static_cast<int>(hdr.size), NCENTERS,
-                                              world_size, NUM_BUILDING_THREADS);
-                    } else {
-                        subIndex.rebuild(static_cast<int>(hdr.size), NCENTERS,
-                                         world_size, EF_CONSTRUCTION, M_SUB,
-                                         NUM_BUILDING_THREADS);
-                    }
+                    // Each shard decides full vs delta for itself; the header type
+                    // no longer dictates the strategy.
+                    subIndex.rebuild_adaptive(static_cast<int>(hdr.size), NCENTERS,
+                                              world_size, EF_CONSTRUCTION, M_SUB,
+                                              NUM_BUILDING_THREADS);
                     // Sync updated routing state.
                     bcastRoutingState(comm, rank, dim, nullptr, nullptr, nullptr,
                                       routing_hnsw, routing_partitions, label_to_center,
@@ -1878,14 +1899,20 @@ int main(int argc, char** argv)
                     double exec_recv[3]; // unused on non-root ranks
                     comm.reduce(exec_send, exec_recv, 3, MPI_DOUBLE, MPI_MAX,
                                0);
-                    // Delta rebuild only: contribute remaining deleted slots to
-                    // the coordinator's SUM reduce.
-                    if (hdr.type == INPLACE_REBUILD_REQUEST) {
+                    // Contribute remaining tombstones (SUM) — full rebuilds report 0.
+                    // Unconditional so every rank matches the coordinator's reduces.
+                    {
                         long long del_send = static_cast<long long>(
                             subIndex.get_last_rebuild_remaining_deleted());
                         long long del_recv = 0LL; // unused on non-root ranks
                         comm.reduce(&del_send, &del_recv, 1, MPI_LONG_LONG_INT,
                                    MPI_SUM, 0);
+                    }
+                    // Contribute this shard's strategy vote (SUM of full-choosers).
+                    {
+                        int full_send = subIndex.get_last_rebuild_did_full() ? 1 : 0;
+                        int full_recv = 0; // unused on non-root ranks
+                        comm.reduce(&full_send, &full_recv, 1, MPI_INT, MPI_SUM, 0);
                     }
                     // Sync label_to_shard: report arrived labels to all ranks.
                     sync_label_to_shard_after_rebuild_exec();

@@ -366,6 +366,24 @@ public:
         int world_size,
         int num_building_threads = -1
     );
+
+    // Adaptive rebuild: run the (unified) migration exchange, then decide LOCALLY
+    // whether to reconstruct the shard from scratch (full) or apply it in place
+    // (delta), based on this shard's own churn and tombstone load. Because every
+    // rebuild path uses the same collectives, different executors may pick
+    // different strategies in the same maintenance round.
+    void rebuild_adaptive(
+        int meta_size,
+        int ncenters,
+        int world_size,
+        int ef_construction,
+        int M_sub,
+        int num_building_threads = -1
+    );
+
+    // Whether the most recent rebuild reconstructed from scratch (true) or applied
+    // an in-place delta (false).
+    bool get_last_rebuild_did_full() const { return last_rebuild_did_full_; }
     
     void partial_rebuild(
         int meta_size,
@@ -407,6 +425,15 @@ private:
         int                              num_building_threads,
         bool                             collect_kept);
 
+    // Post-exchange application halves, shared by rebuild / rebuild_delta /
+    // rebuild_adaptive. Both consume `mig` (moving its arrived_labels out into
+    // last_rebuild_moved_labels_) and set last_rebuild_graph_s_ /
+    // last_rebuild_remaining_deleted_. apply_full requires mig.kept_* populated
+    // (exchange with collect_kept=true).
+    void apply_full_rebuild(MigrantExchange& mig, int ef_construction, int M_sub,
+                            int num_building_threads);
+    void apply_delta_rebuild(MigrantExchange& mig, int num_building_threads);
+
     Communicator& comm_;
 
     hnswlib::HierarchicalNSW<float>* sub_HNSW_ = nullptr;
@@ -436,6 +463,10 @@ private:
     // Deleted slots unreplaced after most recent delta rebuild
     // Equals sub_HNSW_->deleted_elements.size() after insertions complete
     size_t last_rebuild_remaining_deleted_ = 0;
+
+    // Strategy chosen by the most recent rebuild: true = full reconstruction,
+    // false = in-place delta. Set by rebuild / rebuild_delta / rebuild_adaptive.
+    bool last_rebuild_did_full_ = false;
 
     // Arrived labels for label_to_shard sync via Allgatherv after rebuild
     std::vector<int> last_rebuild_moved_labels_;

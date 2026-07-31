@@ -28,6 +28,11 @@
 // Tuning constants (previously magic numbers).
 constexpr double KAFFPA_IMBALANCE       = 0.03;  // KaHIP allowed partition imbalance
 constexpr int    REPARTITION_META_EF    = 200;   // ef for the rebuilt meta-HNSW
+// rebuild_adaptive picks a full reconstruction over an in-place delta once a
+// shard's turnover — (arrived + departed + pre-existing tombstones) / (kept +
+// arrived) — reaches this fraction. Above it, delta's leftover tombstones and
+// inserts into a bloated graph cost more than building the shard fresh.
+constexpr double FULL_REBUILD_SLOT_THRESHOLD = 0.5;
 constexpr size_t INSERT_CAPACITY_SLACK  = 100;   // headroom before an insert forces a resize
 constexpr size_t RECALL_TARGET_CANDIDATES = 50;  // nearest centers scored for RecallTarget routing
 
@@ -2004,49 +2009,14 @@ Executor::MigrantExchange Executor::exchange_migrants(
     return result;
 }
 
-void Executor::rebuild(
-    int meta_size,
-    int ncenters,
-    int world_size,
-    int ef_construction,
-    int M_sub,
-    int num_building_threads
-) {
-    std::cout << "[Executor " << node_id_ << "] rebuilding index \n";
-    if (num_building_threads == -1)
-        num_building_threads = omp_get_max_threads();
+// Post-exchange application half for a FULL reconstruction: build a fresh HNSW
+// over the kept + arrived vectors and atomically swap it in. Requires mig.kept_*
+// populated (exchange with collect_kept=true). Leaves zero tombstones.
+void Executor::apply_full_rebuild(MigrantExchange& mig, int ef_construction, int M_sub,
+                                  int num_building_threads) {
+    const size_t kept_count = mig.kept_labels.size();
+    const int    total_recv = static_cast<int>(mig.arrived_labels.size());
 
-    // Receive the candidate meta-HNSW + partitioning.
-    std::vector<char> buffer;
-    comm_.recv_bytes(buffer, meta_size, 0, META_HNSW_SEND);
-
-    // Node-unique temp path to avoid cross-executor collisions on a shared cwd.
-    const std::string meta_tmp_path =
-        "tmp_hnsw_received_r" + std::to_string(node_id_) + ".bin";
-    std::ofstream outfile(meta_tmp_path, std::ios::binary);
-    outfile.write(buffer.data(), meta_size);
-    outfile.close();
-
-    hnswlib::HierarchicalNSW<float>* metaHNSW =
-        new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
-
-    std::vector<int> partitions;
-    comm_.recv_partitions(partitions, ncenters);
-
-    // Unified migration exchange (collect_kept=true: full reconstruction needs
-    // the elements that stay). Same collectives as the delta path.
-    MigrantExchange mig = exchange_migrants(metaHNSW, partitions, world_size,
-                                            num_building_threads, /*collect_kept=*/true);
-
-    delete metaHNSW;
-
-    const size_t kept_count  = mig.kept_labels.size();
-    const int    total_recv  = static_cast<int>(mig.arrived_labels.size());
-
-    std::cout << "[Executor " << node_id_ << "] iterate time : "  << mig.iterate_s  << "\n";
-    std::cout << "[Executor " << node_id_ << "] rebuild exchange time : " << mig.exchange_s << "\n";
-
-    // Reconstruct a fresh graph over kept + arrived elements.
     hnswlib::HierarchicalNSW<float>* next_sub_HNSW =
         new hnswlib::HierarchicalNSW<float>(space_, kept_count + total_recv,
                                             M_sub, ef_construction, 100, true);
@@ -2055,53 +2025,125 @@ void Executor::rebuild(
 
     // First insert into a fresh HNSW must be sequential; use a kept element if
     // any, otherwise an arrived one.
-    bool   first_done  = false;
-    size_t kept_start  = 0;
-    int    arr_start   = 0;
+    size_t kept_start = 0;
+    int    arr_start  = 0;
     if (kept_count > 0) {
         next_sub_HNSW->addPoint(mig.kept_vectors[0], mig.kept_labels[0], /*replace_deleted=*/true);
-        first_done = true;
         kept_start = 1;
     } else if (total_recv > 0) {
         next_sub_HNSW->addPoint(mig.arrived_vectors.data(), mig.arrived_labels[0], /*replace_deleted=*/true);
-        first_done = true;
         arr_start = 1;
     }
-    (void)first_done;
 
     #pragma omp parallel for num_threads(num_building_threads)
-    for (size_t i = kept_start; i < kept_count; i++) {
+    for (size_t i = kept_start; i < kept_count; i++)
         next_sub_HNSW->addPoint(mig.kept_vectors[i], mig.kept_labels[i], /*replace_deleted=*/true);
-    }
 
     #pragma omp parallel for num_threads(num_building_threads)
-    for (int i = arr_start; i < total_recv; i++) {
+    for (int i = arr_start; i < total_recv; i++)
         next_sub_HNSW->addPoint(mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
                                 mig.arrived_labels[i], /*replace_deleted=*/true);
-    }
     double end_hnsw = MPI_Wtime();
-
-    std::cout << "[Executor " << node_id_ << "] rebuild hnsw time : " <<  end_hnsw - start_hnsw << "\n";
 
     next_sub_HNSW->setEf(ef_construction);
 
-    // lock as you make the switch
     {   std::unique_lock lock(graph_mutex_);
-
-        delete sub_HNSW_;   // was free() — must be delete to invoke ~HierarchicalNSW
+        delete sub_HNSW_;   // delete (not free) to invoke ~HierarchicalNSW
         sub_HNSW_ = next_sub_HNSW;
     }
 
-    // A full reconstruction leaves no tombstones behind.
-    last_rebuild_remaining_deleted_ = 0;
+    last_rebuild_remaining_deleted_ = 0;               // full rebuild clears tombstones
+    last_rebuild_graph_s_           = end_hnsw - start_hnsw;
+    last_rebuild_moved_labels_      = std::move(mig.arrived_labels);
+}
 
-    // Cache per-phase timings before notifying coordinator (so getters are
-    // valid as soon as rebuild() returns on the experiment side).
-    last_rebuild_iterate_s_     = mig.iterate_s;
-    last_rebuild_exchange_s_    = mig.exchange_s;
-    last_rebuild_graph_s_       = end_hnsw - start_hnsw;
-    last_rebuild_moved_labels_  = std::move(mig.arrived_labels);
+// Post-exchange application half for an in-place DELTA: mark-delete departing
+// elements, then insert arrivals into the existing graph reusing freed slots.
+// Preserves graph topology; may leave tombstones behind (reported).
+void Executor::apply_delta_rebuild(MigrantExchange& mig, int num_building_threads) {
+    const int total_recv = static_cast<int>(mig.arrived_labels.size());
 
+    // Mark-delete departing elements. Their vectors were already copied into the
+    // send buffers during classify, so this is safe, and it frees slots for the
+    // arrivals' replace_deleted inserts. markDelete on distinct labels is
+    // thread-safe under a shared lock.
+    {
+        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+        #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
+        for (int i = 0; i < static_cast<int>(mig.departed_labels.size()); i++)
+            sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(mig.departed_labels[i]));
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lk(graph_mutex_);
+        const size_t needed = sub_HNSW_->getCurrentElementCount()
+                            + static_cast<size_t>(total_recv);
+        if (needed > sub_HNSW_->getMaxElements())
+            sub_HNSW_->resizeIndex(needed);
+    }
+
+    double start_hnsw = MPI_Wtime();
+    {
+        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+        #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
+        for (int i = 0; i < total_recv; i++)
+            sub_HNSW_->addPoint(mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
+                                static_cast<hnswlib::labeltype>(mig.arrived_labels[i]),
+                                /*replace_deleted=*/true);
+    }
+    double end_hnsw = MPI_Wtime();
+
+    // With replace_deleted=true, deleted_elements.size() == num_deleted_ and both
+    // equal the tombstone slots still sitting in the graph.
+    size_t remaining_deleted;
+    {
+        std::lock_guard<std::mutex> del_lock(sub_HNSW_->deleted_elements_lock);
+        remaining_deleted = sub_HNSW_->deleted_elements.size();
+    }
+    assert(remaining_deleted == sub_HNSW_->num_deleted_.load() &&
+           "deleted_elements.size() and num_deleted_ out of sync");
+
+    last_rebuild_remaining_deleted_ = remaining_deleted;
+    last_rebuild_graph_s_           = end_hnsw - start_hnsw;
+    last_rebuild_moved_labels_      = std::move(mig.arrived_labels);
+}
+
+void Executor::rebuild(
+    int meta_size,
+    int ncenters,
+    int world_size,
+    int ef_construction,
+    int M_sub,
+    int num_building_threads
+) {
+    std::cout << "[Executor " << node_id_ << "] rebuilding index (full)\n";
+    if (num_building_threads == -1)
+        num_building_threads = omp_get_max_threads();
+
+    // Receive the candidate meta-HNSW + partitioning.
+    std::vector<char> buffer;
+    comm_.recv_bytes(buffer, meta_size, 0, META_HNSW_SEND);
+    const std::string meta_tmp_path =
+        "tmp_hnsw_received_r" + std::to_string(node_id_) + ".bin";
+    { std::ofstream f(meta_tmp_path, std::ios::binary); f.write(buffer.data(), meta_size); }
+    hnswlib::HierarchicalNSW<float>* metaHNSW =
+        new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
+    std::vector<int> partitions;
+    comm_.recv_partitions(partitions, ncenters);
+
+    // Unified migration exchange (collect_kept=true: full reconstruction needs
+    // the elements that stay).
+    MigrantExchange mig = exchange_migrants(metaHNSW, partitions, world_size,
+                                            num_building_threads, /*collect_kept=*/true);
+    delete metaHNSW;
+
+    last_rebuild_iterate_s_  = mig.iterate_s;
+    last_rebuild_exchange_s_ = mig.exchange_s;
+    apply_full_rebuild(mig, ef_construction, M_sub, num_building_threads);
+    last_rebuild_did_full_   = true;
+
+    std::cout << "[Executor " << node_id_ << "] rebuild (full): iterate=" << mig.iterate_s
+              << " exchange=" << mig.exchange_s << " graph=" << last_rebuild_graph_s_ << "\n";
     comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
 
@@ -2138,76 +2180,80 @@ void Executor::rebuild_delta(
     // so a mix of full and delta executors in one round cannot deadlock.
     MigrantExchange mig = exchange_migrants(metaHNSW, partitions, world_size,
                                             num_building_threads, /*collect_kept=*/false);
-
-    const size_t n_departing = mig.departed_labels.size();
-    const int    total_recv  = static_cast<int>(mig.arrived_labels.size());
-
-    std::cout << "[Executor " << node_id_ << "] delta rebuild iterate: departed="
-              << n_departing << "\n";
-    std::cout << "[Executor " << node_id_ << "] delta rebuild exchange: arrived="
-              << total_recv << "\n";
-
-    // Mark-delete departing elements AFTER the exchange (their vectors were
-    // already copied into send buffers during classify, so this is safe). This
-    // frees slots for the arriving elements' replace_deleted inserts below.
-    // markDelete on distinct labels is thread-safe under a shared lock.
-    {
-        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
-        #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
-        for (int i = 0; i < static_cast<int>(mig.departed_labels.size()); i++) {
-            sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(mig.departed_labels[i]));
-        }
-    }
-
-    // Reserve capacity conservatively
-    {
-        std::unique_lock<std::shared_mutex> lk(graph_mutex_);
-        const size_t needed = sub_HNSW_->getCurrentElementCount()
-                            + static_cast<size_t>(total_recv);
-        if (needed > sub_HNSW_->getMaxElements())
-            sub_HNSW_->resizeIndex(needed);
-    }
-
-    double start_hnsw = MPI_Wtime();
-    {
-        std::shared_lock<std::shared_mutex> lk(graph_mutex_);
-        #pragma omp parallel for schedule(dynamic) num_threads(num_building_threads)
-        for (int i = 0; i < total_recv; i++) {
-            sub_HNSW_->addPoint(
-                mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
-                static_cast<hnswlib::labeltype>(mig.arrived_labels[i]),
-                /*replace_deleted=*/true);
-        }
-    }
-    double end_hnsw = MPI_Wtime();
-
-    // With allow_replace_deleted=true, deleted_elements is kept in sync with
-    // num_deleted_: every markDelete adds to it, every successful slot-reuse by
-    // addPoint removes from it.  So deleted_elements.size() == num_deleted_ and
-    // both equal the number of tombstone slots still sitting in the graph.
-    size_t remaining_deleted;
-    {
-        std::lock_guard<std::mutex> del_lock(sub_HNSW_->deleted_elements_lock);
-        remaining_deleted = sub_HNSW_->deleted_elements.size();
-    }
-    // Sanity cross-check (both fields should agree when replace_deleted=true).
-    assert(remaining_deleted == sub_HNSW_->num_deleted_.load() &&
-           "deleted_elements.size() and num_deleted_ out of sync");
-
-    std::cout << "[Executor " << node_id_ << "] delta rebuild complete:"
-              << "  departed=" << n_departing
-              << "  arrived=" << total_recv
-              << "  remaining_deleted_slots=" << remaining_deleted
-              << "\n";
-
-    last_rebuild_remaining_deleted_ = remaining_deleted;
-    last_rebuild_iterate_s_         = mig.iterate_s;
-    last_rebuild_exchange_s_        = mig.exchange_s;
-    last_rebuild_graph_s_           = end_hnsw - start_hnsw;
-    last_rebuild_moved_labels_      = std::move(mig.arrived_labels);
-
     delete metaHNSW;
 
+    last_rebuild_iterate_s_  = mig.iterate_s;
+    last_rebuild_exchange_s_ = mig.exchange_s;
+    apply_delta_rebuild(mig, num_building_threads);
+    last_rebuild_did_full_   = false;
+
+    std::cout << "[Executor " << node_id_ << "] delta rebuild complete:"
+              << "  iterate=" << mig.iterate_s << "  exchange=" << mig.exchange_s
+              << "  graph=" << last_rebuild_graph_s_
+              << "  remaining_deleted_slots=" << last_rebuild_remaining_deleted_ << "\n";
+    comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
+}
+
+// Adaptive rebuild: exchange migrants once, then let THIS shard decide whether a
+// full reconstruction or an in-place delta is cheaper, from its own turnover.
+void Executor::rebuild_adaptive(
+    int meta_size,
+    int ncenters,
+    int world_size,
+    int ef_construction,
+    int M_sub,
+    int num_building_threads
+) {
+    if (num_building_threads == -1)
+        num_building_threads = omp_get_max_threads();
+
+    std::vector<char> buffer;
+    comm_.recv_bytes(buffer, meta_size, 0, META_HNSW_SEND);
+    const std::string meta_tmp_path =
+        "tmp_hnsw_adaptive_r" + std::to_string(node_id_) + ".bin";
+    { std::ofstream f(meta_tmp_path, std::ios::binary); f.write(buffer.data(), meta_size); }
+    hnswlib::HierarchicalNSW<float>* metaHNSW =
+        new hnswlib::HierarchicalNSW<float>(space_, meta_tmp_path);
+    std::vector<int> partitions;
+    comm_.recv_partitions(partitions, ncenters);
+
+    // Pre-existing tombstones (dead weight this shard carries into the rebuild).
+    size_t tomb_before;
+    {   std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+        tomb_before = sub_HNSW_->getDeletedCount();
+    }
+
+    // Always collect kept: needed if this shard chooses full. The exchange is
+    // identical to both fixed paths, so choosing per-shard cannot deadlock.
+    MigrantExchange mig = exchange_migrants(metaHNSW, partitions, world_size,
+                                            num_building_threads, /*collect_kept=*/true);
+    delete metaHNSW;
+
+    last_rebuild_iterate_s_  = mig.iterate_s;
+    last_rebuild_exchange_s_ = mig.exchange_s;
+
+    const size_t kept     = mig.kept_labels.size();
+    const size_t arrived  = mig.arrived_labels.size();
+    const size_t departed = mig.departed_labels.size();
+
+    // Turnover: fresh inserts + departures + existing dead weight relative to the
+    // resulting live size. High turnover -> a clean full rebuild beats an in-place
+    // delta (which inserts into a bloated graph and leaves tombstones behind).
+    const double denom = static_cast<double>(std::max<size_t>(kept + arrived, 1));
+    const double churn = static_cast<double>(arrived + departed + tomb_before) / denom;
+    const bool   do_full = churn >= FULL_REBUILD_SLOT_THRESHOLD;
+
+    if (do_full) apply_full_rebuild(mig, ef_construction, M_sub, num_building_threads);
+    else         apply_delta_rebuild(mig, num_building_threads);
+    last_rebuild_did_full_ = do_full;
+
+    std::cout << "[Executor " << node_id_ << "] adaptive rebuild: "
+              << (do_full ? "FULL" : "delta")
+              << "  kept=" << kept << "  arrived=" << arrived
+              << "  departed=" << departed << "  pre_tomb=" << tomb_before
+              << "  churn=" << churn
+              << "  iterate=" << mig.iterate_s << "  exchange=" << mig.exchange_s
+              << "  graph=" << last_rebuild_graph_s_ << "\n";
     comm_.send_ack(REBUILD_SUCCESS, 0, REBUILD_SUCCESS);
 }
 
