@@ -383,6 +383,22 @@ public:
                    nullptr, 1, MPI_UNSIGNED_LONG_LONG, root, mpi_comm_);
     }
 
+    // Generic one-value-per-rank gather onto `root`. Caller supplies the MPI
+    // datatype matching T (e.g. MPI_INT, MPI_DOUBLE, MPI_UNSIGNED_LONG_LONG).
+    template<typename T>
+    void gather_value(T value, std::vector<T>& out, MPI_Datatype dtype,
+                      int world_size, int root = 0) {
+        if (rank == root) out.assign(world_size, T{});
+        MPI_Gather(&value, 1, dtype,
+                   (rank == root) ? out.data() : nullptr, 1, dtype, root, mpi_comm_);
+    }
+
+    // Contribute-only participant in a gather_value.
+    template<typename T>
+    void gather_value(T value, MPI_Datatype dtype, int root = 0) {
+        MPI_Gather(&value, 1, dtype, nullptr, 1, dtype, root, mpi_comm_);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Thin 1:1 wrappers over the remaining MPI collectives. These deliberately
     // mirror the MPI signatures (void* buffers, explicit datatype/op) — their

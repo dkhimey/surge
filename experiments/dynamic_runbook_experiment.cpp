@@ -705,6 +705,10 @@ int main(int argc, char** argv)
                 << ",rebuild_type"
                 << ",remaining_deleted_slots";
             for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_size";
+            for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_did_full";
+            for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_arrived";
+            for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_departed";
+            for (int i = 0; i < num_partitions; i++) csv << ",shard_" << i << "_graph_s";
             csv << "\n";
         }
 
@@ -721,6 +725,11 @@ int main(int argc, char** argv)
             double      dorebuild_wall_s          = -1.0;
             long long   remaining_deleted_slots   = -1;
             std::string rebuild_type              = "";
+            // Per-shard breakdown (index i = shard i); empty on non-rebuild rows.
+            std::vector<int>                shard_did_full;   // 1=full, 0=delta
+            std::vector<unsigned long long> shard_arrived;
+            std::vector<unsigned long long> shard_departed;
+            std::vector<double>             shard_graph_s;
         };
         static const RebuildStats kNoRebuild{};
 
@@ -757,6 +766,16 @@ int main(int argc, char** argv)
                 << "," << rb.rebuild_type
                 << "," << rb.remaining_deleted_slots;
             for (auto sz : sizes) csv << "," << sz;
+            // Per-shard rebuild breakdown; -1 filler on non-rebuild rows so the
+            // column count stays fixed.
+            auto emit_shard = [&](const auto& v) {
+                if (v.empty()) for (int i = 0; i < num_partitions; i++) csv << ",-1";
+                else           for (const auto& x : v) csv << "," << x;
+            };
+            emit_shard(rb.shard_did_full);
+            emit_shard(rb.shard_arrived);
+            emit_shard(rb.shard_departed);
+            emit_shard(rb.shard_graph_s);
             csv << "\n";
             csv.flush();
         };
@@ -991,6 +1010,21 @@ int main(int argc, char** argv)
                           : ("mixed_" + std::to_string(full_recv) + "full");
                     }
 
+                    // Per-shard breakdown (index 0 = coordinator dummy, dropped).
+                    {
+                        std::vector<int>                did_full_all;
+                        std::vector<unsigned long long> arrived_all, departed_all;
+                        std::vector<double>             graph_all;
+                        comm.gather_value(0,    did_full_all, MPI_INT,                world_size);
+                        comm.gather_value(0ULL, arrived_all,  MPI_UNSIGNED_LONG_LONG, world_size);
+                        comm.gather_value(0ULL, departed_all, MPI_UNSIGNED_LONG_LONG, world_size);
+                        comm.gather_value(0.0,  graph_all,    MPI_DOUBLE,             world_size);
+                        rb_stats.shard_did_full.assign(did_full_all.begin() + 1, did_full_all.end());
+                        rb_stats.shard_arrived .assign(arrived_all.begin()  + 1, arrived_all.end());
+                        rb_stats.shard_departed.assign(departed_all.begin() + 1, departed_all.end());
+                        rb_stats.shard_graph_s .assign(graph_all.begin()    + 1, graph_all.end());
+                    }
+
                     // Sync label_to_shard: each executor reports its arrived labels.
                     sync_label_to_shard_after_rebuild_coord();
 
@@ -1136,6 +1170,21 @@ int main(int argc, char** argv)
                             (full_recv == 0)      ? "delta"
                           : (full_recv == n_exec) ? "full"
                           : ("mixed_" + std::to_string(full_recv) + "full");
+                    }
+
+                    // Per-shard breakdown (index 0 = coordinator dummy, dropped).
+                    {
+                        std::vector<int>                did_full_all;
+                        std::vector<unsigned long long> arrived_all, departed_all;
+                        std::vector<double>             graph_all;
+                        comm.gather_value(0,    did_full_all, MPI_INT,                world_size);
+                        comm.gather_value(0ULL, arrived_all,  MPI_UNSIGNED_LONG_LONG, world_size);
+                        comm.gather_value(0ULL, departed_all, MPI_UNSIGNED_LONG_LONG, world_size);
+                        comm.gather_value(0.0,  graph_all,    MPI_DOUBLE,             world_size);
+                        rb_stats.shard_did_full.assign(did_full_all.begin() + 1, did_full_all.end());
+                        rb_stats.shard_arrived .assign(arrived_all.begin()  + 1, arrived_all.end());
+                        rb_stats.shard_departed.assign(departed_all.begin() + 1, departed_all.end());
+                        rb_stats.shard_graph_s .assign(graph_all.begin()    + 1, graph_all.end());
                     }
 
                     // Sync label_to_shard: each executor reports its arrived labels.
@@ -1823,6 +1872,15 @@ int main(int argc, char** argv)
                         int full_recv = 0; // unused on non-root ranks
                         comm.reduce(&full_send, &full_recv, 1, MPI_INT, MPI_SUM, 0);
                     }
+                    // Contribute this shard's per-shard breakdown (matches the
+                    // coordinator's four gathers, in the same order).
+                    comm.gather_value(subIndex.get_last_rebuild_did_full() ? 1 : 0, MPI_INT);
+                    comm.gather_value(static_cast<unsigned long long>(
+                                          subIndex.get_last_rebuild_arrived()),  MPI_UNSIGNED_LONG_LONG);
+                    comm.gather_value(static_cast<unsigned long long>(
+                                          subIndex.get_last_rebuild_departed()), MPI_UNSIGNED_LONG_LONG);
+                    comm.gather_value(subIndex.get_last_rebuild_graph_s(),       MPI_DOUBLE);
+
                     // Sync label_to_shard: report arrived labels to all ranks.
                     sync_label_to_shard_after_rebuild_exec();
                 }
@@ -1914,6 +1972,15 @@ int main(int argc, char** argv)
                         int full_recv = 0; // unused on non-root ranks
                         comm.reduce(&full_send, &full_recv, 1, MPI_INT, MPI_SUM, 0);
                     }
+                    // Contribute this shard's per-shard breakdown (matches the
+                    // coordinator's four gathers, in the same order).
+                    comm.gather_value(subIndex.get_last_rebuild_did_full() ? 1 : 0, MPI_INT);
+                    comm.gather_value(static_cast<unsigned long long>(
+                                          subIndex.get_last_rebuild_arrived()),  MPI_UNSIGNED_LONG_LONG);
+                    comm.gather_value(static_cast<unsigned long long>(
+                                          subIndex.get_last_rebuild_departed()), MPI_UNSIGNED_LONG_LONG);
+                    comm.gather_value(subIndex.get_last_rebuild_graph_s(),       MPI_DOUBLE);
+
                     // Sync label_to_shard: report arrived labels to all ranks.
                     sync_label_to_shard_after_rebuild_exec();
                 }

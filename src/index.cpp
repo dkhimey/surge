@@ -620,9 +620,18 @@ int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     double imbalance = KAFFPA_IMBALANCE;
     new_partitions = std::vector<int>(ncenters_, -1);
     int seed = gen_();
+    // Balance vectors, not centroids: weight each centroid by its live vector
+    // count so KaHIP equalizes the sum of weights (= vectors per worker) to within
+    // KAFFPA_IMBALANCE. Under clustered/shifting data, equal centroid counts leave
+    // one worker holding several times the mean (the rebuild/search straggler).
+    // center_counts_ is maintained exactly by the incremental updates and indexed
+    // by centroid id, same as the graph nodes.
+    std::vector<int> vwgt(ncenters_);
+    for (size_t i = 0; i < ncenters_; i++)
+        vwgt[i] = std::max(center_counts_[i], 1);   // KaHIP requires positive weights
     // run partitioning algo
     start = MPI_Wtime();
-    kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(),
+    kaffpa(&m_centers_int, vwgt.data(), xadj.data(), nullptr, adjncy.data(),
            &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, new_partitions.data());
     end = MPI_Wtime();
     double partition_time = end-start;
@@ -2139,6 +2148,7 @@ void Executor::rebuild(
 
     last_rebuild_iterate_s_  = mig.iterate_s;
     last_rebuild_exchange_s_ = mig.exchange_s;
+    last_rebuild_departed_   = mig.departed_labels.size();
     apply_full_rebuild(mig, ef_construction, M_sub, num_building_threads);
     last_rebuild_did_full_   = true;
 
@@ -2184,6 +2194,7 @@ void Executor::rebuild_delta(
 
     last_rebuild_iterate_s_  = mig.iterate_s;
     last_rebuild_exchange_s_ = mig.exchange_s;
+    last_rebuild_departed_   = mig.departed_labels.size();
     apply_delta_rebuild(mig, num_building_threads);
     last_rebuild_did_full_   = false;
 
@@ -2235,6 +2246,7 @@ void Executor::rebuild_adaptive(
     const size_t kept     = mig.kept_labels.size();
     const size_t arrived  = mig.arrived_labels.size();
     const size_t departed = mig.departed_labels.size();
+    last_rebuild_departed_ = departed;
 
     // Turnover: fresh inserts + departures + existing dead weight relative to the
     // resulting live size. High turnover -> a clean full rebuild beats an in-place

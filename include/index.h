@@ -336,6 +336,10 @@ public:
     // Count of deleted slots not yet reused after most recent delta rebuild
     size_t get_last_rebuild_remaining_deleted() const { return last_rebuild_remaining_deleted_; }
 
+    // Vectors that arrived / departed this shard during the most recent rebuild.
+    size_t get_last_rebuild_arrived()  const { return last_rebuild_moved_labels_.size(); }
+    size_t get_last_rebuild_departed() const { return last_rebuild_departed_; }
+
     // Labels of vectors that arrived during most recent rebuild (for label_to_shard sync)
     const std::vector<int>& get_last_rebuild_moved_labels() const { return last_rebuild_moved_labels_; }
 
@@ -467,6 +471,9 @@ private:
     // Strategy chosen by the most recent rebuild: true = full reconstruction,
     // false = in-place delta. Set by rebuild / rebuild_delta / rebuild_adaptive.
     bool last_rebuild_did_full_ = false;
+
+    // Vectors that departed this shard during the most recent rebuild.
+    size_t last_rebuild_departed_ = 0;
 
     // Arrived labels for label_to_shard sync via Allgatherv after rebuild
     std::vector<int> last_rebuild_moved_labels_;
