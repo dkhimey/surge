@@ -425,11 +425,13 @@ std::vector<size_t> Coordinator::get_partitions_for_search_recall_tgt_(float* ve
         *dist = centers[0].first;
     }
 
-    // Per-partition size prior: number of centers assigned to each partition.
-    // Derived from partitions_[] so it is valid even before any vectors are
-    // routed (e.g. theoretical_partitioning_quality).
-    std::vector<int> part_size(num_partitions_, 0);
-    for (int p : partitions_) ++part_size[static_cast<size_t>(p)];
+
+    std::vector<long long> part_size(num_partitions_, 0);
+    const bool have_counts = center_counts_.size() == partitions_.size();
+    for (size_t i = 0; i < partitions_.size(); ++i) {
+        const int pid = partitions_[i];
+        part_size[static_cast<size_t>(pid)] += have_counts ? center_counts_[i] : 1;
+    }
 
     // Distances normalised against the nearest center (d / d0).
     const double d0 = static_cast<double>(centers[0].first) + 1e-10;

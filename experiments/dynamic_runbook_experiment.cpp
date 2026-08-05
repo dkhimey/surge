@@ -1260,8 +1260,15 @@ int main(int argc, char** argv)
                 std::vector<ComboResult> combo_results;
                 combo_results.reserve(static_cast<size_t>(n_combos) * search_variants.size());
 
+                // Vectors per partition (not centroid count) — the |rho(P)| size
+                // prior the RecallTarget score expects. Counting centroids only
+                // matched vectors under centroid-balanced partitioning; with
+                // vector-weighted partitioning the two diverge and centroid counts
+                // mis-rank partitions. Sum the per-centroid vector counts instead.
                 std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
-                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
+                for (size_t c = 0; c < routing_partitions.size(); c++)
+                    routing_part_size[static_cast<size_t>(routing_partitions[c])] +=
+                        routing_center_counts[c];
 
                 for (const auto& variant : search_variants) {
                     const double search_scale     = variant.scale;
@@ -2016,8 +2023,15 @@ int main(int argc, char** argv)
                 }
                 routing_hnsw->setEf(EF_ROUTING);
 
+                // Vectors per partition (not centroid count) — the |rho(P)| size
+                // prior the RecallTarget score expects. Counting centroids only
+                // matched vectors under centroid-balanced partitioning; with
+                // vector-weighted partitioning the two diverge and centroid counts
+                // mis-rank partitions. Sum the per-centroid vector counts instead.
                 std::vector<int> routing_part_size(static_cast<size_t>(num_partitions), 0);
-                for (int p : routing_partitions) ++routing_part_size[static_cast<size_t>(p)];
+                for (size_t c = 0; c < routing_partitions.size(); c++)
+                    routing_part_size[static_cast<size_t>(routing_partitions[c])] +=
+                        routing_center_counts[c];
 
                 // Search-variant loop
                 for (const auto& variant : search_variants) {
