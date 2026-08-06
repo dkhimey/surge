@@ -8,9 +8,8 @@
 constexpr int KMEANS_EPOCHS = 100;
 constexpr int VECTOR_BATCH_SIZE = 100000;
 
-// Default repair strategy for Executor::patch_delete_local[_batch] (see
-// hnswalg.h for the *_DELETE constants
-constexpr int HNSW_DEFAULT_DELETE_MODEL = hnswlib::HierarchicalNSW<float>::SEARCH_DELETE;
+// Default repair strategy for Executor::patch_delete_local[_batch]
+constexpr int HNSW_DEFAULT_DELETE_MODEL = hnswlib::HierarchicalNSW<float>::TWOHOP_DELETE;
 
 enum class RoutingMode {
     BranchingFactor, // param = branching factor (number of nearest centroids to search)
