@@ -8,6 +8,17 @@
 constexpr int KMEANS_EPOCHS = 100;
 constexpr int VECTOR_BATCH_SIZE = 100000;
 
+// Default repair strategy for Executor::patch_delete_local[_batch] (see
+// hnswalg.h for the *_DELETE constants and WOLVERINE_EDGE_REPAIR_PLAN.md for
+// the integration plan). SEARCH_DELETE ("plain" Wolverine) is the default
+// rather than the cheaper PINTOPOUT_DELETE: the Phase 1 validation sweep
+// showed PINTOPOUT_DELETE's naive local reconnection degrades recall about
+// as badly as no repair at all (matching the Wolverine paper's finding that
+// naive DwFC-style reconnection can underperform doing nothing), whereas
+// SEARCH_DELETE/TWOHOP_DELETE/APPROXIMATE_TWOHOP_DELETE all held recall flat
+// across repeated delete rounds.
+constexpr int HNSW_DEFAULT_DELETE_MODEL = hnswlib::HierarchicalNSW<float>::SEARCH_DELETE;
+
 enum class RoutingMode {
     BranchingFactor, // param = branching factor (number of nearest centroids to search)
     NProbe,          // param = number of unique partitions_ to collect
@@ -315,6 +326,27 @@ public:
 
     // Batch delete with shared lock (thread-safe per-element in hnswlib)
     void mark_delete_local_batch(const std::vector<int>& labels);
+
+    // --- Wolverine-style physical delete + edge repair -----------------
+    // Unlike mark_delete_local[_batch] (soft tombstone: bit flip only, edges
+    // to the deleted vertex are left dangling until a later full/delta
+    // rebuild cleans them up once TOMBSTONE_RATIO_THRESHOLD is crossed),
+    // these physically sever the deleted vertex's edges and repair the
+    // monotonic search paths broken by its removal in place — see
+    // hnswalg.h's HierarchicalNSW::patchDelete and the *_DELETE model
+    // constants. Both silently skip labels absent from this shard, matching
+    // mark_delete_local[_batch]'s contract. newLinkSize <= 0 defaults to the
+    // live sub-HNSW's own M_ (its construction-time degree bound);
+    // num_threads <= 0 uses hardware_concurrency() (see hnswlib::ParallelFor).
+    void patch_delete_local(int label,
+                          int deleteModel = HNSW_DEFAULT_DELETE_MODEL,
+                          int newLinkSize = -1,
+                          int num_threads = -1);
+
+    void patch_delete_local_batch(const std::vector<int>& labels,
+                                int deleteModel = HNSW_DEFAULT_DELETE_MODEL,
+                                int newLinkSize = -1,
+                                int num_threads = -1);
 
     // Search batch of queries; returns sorted results (nearest-first)
     std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>

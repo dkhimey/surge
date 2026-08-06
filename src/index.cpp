@@ -2508,6 +2508,67 @@ void Executor::mark_delete_local_batch(const std::vector<int>& labels) {
     }
 }
 
+// Wolverine-style physical delete: patchDelete severs the vertex's edges and
+// repairs the surrounding graph in place, rather than leaving a tombstone for
+// a later rebuild to clean up. Held under a shared (reader) lock, same as
+// mark_delete_local[_batch] — patchDelete is internally thread-safe (per-row
+// link_list_locks_, label_lookup_lock, and its own internal ParallelFor over
+// num_threads), so concurrent inserts/searches/other deletes on this shard
+// are safe to interleave with it. Labels not present in this shard (or
+// already deleted) are silently skipped, matching mark_delete_local's
+// contract.
+void Executor::patch_delete_local(int label, int deleteModel, int newLinkSize, int num_threads) {
+    std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+    if (newLinkSize <= 0) {
+        newLinkSize = static_cast<int>(sub_HNSW_->M_);
+    }
+    try {
+        sub_HNSW_->patchDelete(
+            std::vector<hnswlib::labeltype>{static_cast<hnswlib::labeltype>(label)},
+            deleteModel, newLinkSize, num_threads);
+    } catch (...) {
+        // Label not found in this shard, or already deleted – silently skip.
+    }
+}
+
+// Batch variant of patch_delete_local. Pre-filters to labels this shard
+// actually owns (and that aren't already deleted) before calling patchDelete
+// once on the surviving set: patchDelete's internal ParallelFor throws on any
+// missing/already-deleted label and aborts the whole batch (see hnswalg.h),
+// so filtering up front is what makes "silently skip absent labels" hold at
+// batch granularity instead of failing the entire call over one bad label.
+void Executor::patch_delete_local_batch(const std::vector<int>& labels,
+                                      int deleteModel, int newLinkSize, int num_threads) {
+    if (labels.empty()) return;
+    std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+    if (newLinkSize <= 0) {
+        newLinkSize = static_cast<int>(sub_HNSW_->M_);
+    }
+
+    std::vector<hnswlib::labeltype> present;
+    present.reserve(labels.size());
+    {
+        std::unique_lock<std::mutex> lock_table(sub_HNSW_->label_lookup_lock);
+        for (int label : labels) {
+            auto it = sub_HNSW_->label_lookup_.find(static_cast<hnswlib::labeltype>(label));
+            if (it != sub_HNSW_->label_lookup_.end() && !sub_HNSW_->isMarkedDeleted(it->second)) {
+                present.push_back(static_cast<hnswlib::labeltype>(label));
+            }
+        }
+    }
+    if (present.empty()) return;
+
+    try {
+        sub_HNSW_->patchDelete(present, deleteModel, newLinkSize, num_threads);
+    } catch (...) {
+        // Defensive: a label could theoretically be concurrently deleted
+        // between the filter pass above and patchDelete's own lookup (e.g.
+        // by a racing mark_delete_local[_batch] call on the same label from
+        // another caller). patchDelete aborts the whole batch in that case;
+        // treat it the same as "nothing to do" rather than propagating.
+    }
+}
+
 // Search a batch of query vectors (received via AllToAllV phase-1) and return
 // results without MPI.  Each result vector is sorted nearest-first.
 std::vector<std::vector<std::pair<float, hnswlib::labeltype>>>
