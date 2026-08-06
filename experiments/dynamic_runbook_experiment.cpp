@@ -387,7 +387,7 @@ int main(int argc, char** argv)
             << "  center-movement threshold is not met (see --delete-policy below: under\n"
             << "  wolverine, this tombstone-forced check is disabled).\n"
             << "\n"
-            << "  --delete-policy <tombstone|wolverine>  (default: tombstone)\n"
+            << "  --delete-policy <tombstone|wolverine>  (default: tombstone)\n";
         return 1;
     }
 
