@@ -125,6 +125,11 @@ static constexpr double TOMBSTONE_RATIO_THRESHOLD = 0.50;
 static constexpr size_t CHECKPOINT_INTERVAL       = 50;
 static constexpr size_t REBUILD_CHECK_INTERVAL     = 6;
 
+// Which delete implementation the "delete" runbook step uses (--delete-policy).
+// Tombstone: Executor::mark_delete_local_batch (hnswlib markDelete)
+// Wolverine: Executor::patch_delete_local_batch (hnswlib patchDelete)
+enum class DeletePolicy { Tombstone, Wolverine };
+
 static const std::vector<int>   BRANCHING_FACTOR_PARAMS = {20, 25, 30, 40, 50, 60, 80};
 static const std::vector<int>   NPROBE_PARAMS           = {1, 2, 3, 4, 5, 6, 7, 8, 9};
 static const std::vector<float> TARGET_PARAMS           = {0.85f, 0.90f, 0.95f, 0.97f, 0.98f, 0.99f};
@@ -336,7 +341,8 @@ int main(int argc, char** argv)
             << " <full_threshold>"
             << " <k> <gt_prefix> <output_file>"
             << " [--init-state-dir <dir> --init-partitions <file> [--init-state-step <N>]]"
-            << " [--search-scale <f> | --search-fraction <p1[,p2,...]>]\n"
+            << " [--search-scale <f> | --search-fraction <p1[,p2,...]>]"
+            << " [--delete-policy <tombstone|wolverine>]\n"
             << "\n"
             << "  full_threshold : min centers to migrate to trigger a rebuild;\n"
             << "                   set >= " << NCENTERS << " to disable\n"
@@ -378,7 +384,10 @@ int main(int argc, char** argv)
             << "  ratio reaches " << TOMBSTONE_RATIO_THRESHOLD
             << " (" << static_cast<int>(TOMBSTONE_RATIO_THRESHOLD * 100) << "% unused slots) -- this\n"
             << "  check fires every step and triggers a rebuild on its own even when the\n"
-            << "  center-movement threshold is not met.\n";
+            << "  center-movement threshold is not met (see --delete-policy below: under\n"
+            << "  wolverine, this tombstone-forced check is disabled).\n"
+            << "\n"
+            << "  --delete-policy <tombstone|wolverine>  (default: tombstone)\n"
         return 1;
     }
 
@@ -397,6 +406,8 @@ int main(int argc, char** argv)
     // Search-scaling flags
     double      search_scale_arg     = 1.0;
     std::string search_fractions_arg;
+    // Delete policy flag
+    std::string delete_policy_arg    = "tombstone";
     for (int ai = 7; ai < argc; ++ai) {
         const std::string a = argv[ai];
         if      (a == "--init-state-dir"   && ai + 1 < argc) init_state_dir       = argv[++ai];
@@ -405,6 +416,7 @@ int main(int argc, char** argv)
         else if (a == "--search-scale"     && ai + 1 < argc) search_scale_arg     = std::stod(argv[++ai]);
         else if ((a == "--search-fraction" ||
                   a == "--search-fractions") && ai + 1 < argc) search_fractions_arg = argv[++ai];
+        else if (a == "--delete-policy"    && ai + 1 < argc) delete_policy_arg    = argv[++ai];
         else {
             std::cerr << "ERROR: unrecognised or incomplete argument: " << a << "\n";
             return 1;
@@ -412,6 +424,14 @@ int main(int argc, char** argv)
     }
     if (!search_fractions_arg.empty() && search_scale_arg != 1.0) {
         std::cerr << "ERROR: pass only one of --search-scale / --search-fraction\n";
+        return 1;
+    }
+    DeletePolicy delete_policy;
+    if      (delete_policy_arg == "tombstone") delete_policy = DeletePolicy::Tombstone;
+    else if (delete_policy_arg == "wolverine") delete_policy = DeletePolicy::Wolverine;
+    else {
+        std::cerr << "ERROR: --delete-policy must be 'tombstone' or 'wolverine' (got '"
+                  << delete_policy_arg << "')\n";
         return 1;
     }
     const bool use_init_state = !init_state_dir.empty() && !init_partitions_file.empty();
@@ -517,6 +537,10 @@ int main(int argc, char** argv)
         }
 
         if (rank == 0) {
+            std::cout << "[Sweep] delete policy: "
+                      << (delete_policy == DeletePolicy::Wolverine ? "wolverine (patchDelete, edge repair)"
+                                                                   : "tombstone (markDelete, rebuild-on-threshold)")
+                      << "\n";
             std::cout << "[Sweep] search variants (update_vecs=" << update_vecs
                       << ", search_steps=" << n_search_steps
                       << ", nq_orig=" << nq_orig << "):\n";
@@ -947,7 +971,9 @@ int main(int argc, char** argv)
                     comm.reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
                                MPI_MAX, 0);
                 }
-                const bool tombstone_forces = (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
+                // tombstoned slots no longer count toward threshold if delete policy is wolverine
+                const bool tombstone_forces =
+                    (delete_policy == DeletePolicy::Tombstone) && (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
 
                 int do_rebuild = (rb_type > 0 || tombstone_forces) ? 1 : 0;
                 comm.bcast(&do_rebuild, 1, MPI_INT, 0);
@@ -1109,7 +1135,8 @@ int main(int argc, char** argv)
                     comm.reduce(&coord_ratio, &max_ratio, 1, MPI_DOUBLE,
                                MPI_MAX, 0);
                 }
-                const bool tombstone_forces = (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
+                const bool tombstone_forces =
+                    (delete_policy == DeletePolicy::Tombstone) && (max_ratio >= TOMBSTONE_RATIO_THRESHOLD);
 
                 int do_rebuild = (rb_type > 0 || tombstone_forces) ? 1 : 0;
                 comm.bcast(&do_rebuild, 1, MPI_INT, 0);
@@ -1918,7 +1945,7 @@ int main(int argc, char** argv)
                     auto it = label_to_shard.find(label);
                     if (it != label_to_shard.end()) {
                         // label_to_shard is accurate even after delta rebuilds:
-                        // only the owning executor calls markDelete.
+                        // only the owning executor calls markDelete/patchDelete.
                         if (it->second == rank)
                             my_delete_labels.push_back(label);
                         label_to_shard.erase(it);
@@ -1926,7 +1953,11 @@ int main(int argc, char** argv)
                         my_delete_labels.push_back(label);
                     }
                 }
-                subIndex.mark_delete_local_batch(my_delete_labels);
+                if (delete_policy == DeletePolicy::Wolverine) {
+                    subIndex.patch_delete_local_batch(my_delete_labels);
+                } else {
+                    subIndex.mark_delete_local_batch(my_delete_labels);
+                }
 
                 {
                     double elapsed = MPI_Wtime() - t0_del;
