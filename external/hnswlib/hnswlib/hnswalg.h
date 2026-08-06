@@ -2,10 +2,13 @@
 
 #include "visited_list_pool.h"
 #include "hnswlib.h"
+#include <algorithm>
 #include <atomic>
+#include <numeric>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
+#include <thread>
 #include <unordered_set>
 #include <list>
 #include <memory>
@@ -14,11 +17,71 @@ namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
+// Minimal std::thread-based parallel-for, matching the helper bundled with
+// hnswlib's own benchmark tools (not part of core hnswlib). Added to support
+// the Wolverine-style batched delete/repair below (HierarchicalNSW::patchDelete).
+// numThreads <= 0 means "use hardware_concurrency()". Exceptions raised inside
+// fn are captured and rethrown on the calling thread after all workers stop.
+template<class Function>
+inline void ParallelFor(size_t start, size_t end, int numThreads, Function fn) {
+    if (numThreads <= 0) {
+        numThreads = static_cast<int>(std::thread::hardware_concurrency());
+        if (numThreads <= 0) numThreads = 1;
+    }
+    if (numThreads == 1) {
+        for (size_t id = start; id < end; id++) {
+            fn(id, 0);
+        }
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    std::atomic<size_t> current(start);
+    std::atomic<bool> hasError{false};
+    std::exception_ptr lastException = nullptr;
+    std::mutex lastExceptMutex;
+
+    for (int threadId = 0; threadId < numThreads; ++threadId) {
+        threads.emplace_back([&, threadId] {
+            while (true) {
+                size_t id = current.fetch_add(1);
+                if (id >= end) break;
+                try {
+                    fn(id, static_cast<size_t>(threadId));
+                } catch (...) {
+                    std::unique_lock<std::mutex> lastExceptLock(lastExceptMutex);
+                    lastException = std::current_exception();
+                    hasError = true;
+                    current = end;
+                    break;
+                }
+            }
+        });
+    }
+    for (auto &thread : threads) thread.join();
+    if (hasError) std::rethrow_exception(lastException);
+}
+
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
  public:
     static const tableint MAX_LABEL_OPERATION_LOCKS = 65536;
     static const unsigned char DELETE_MARK = 0x01;
+
+    // Repair strategies for Wolverine-style physical delete (see patchDelete
+    // below). VIOLENT_DELETE / PINTOPOUT_DELETE mirror the "Do" / local-
+    // reconnection baselines analyzed in the Wolverine paper; SEARCH_DELETE /
+    // TWOHOP_DELETE / APPROXIMATE_TWOHOP_DELETE correspond to Wolverine,
+    // Wolverine+, and Wolverine++ respectively (Liu, Zheng, Yue, Ruan, Zhou,
+    // Jensen. "Wolverine: Highly Efficient Monotonic Search Path Repair for
+    // Graph-based ANN Index Updates." PVLDB 18(7), 2025). Executor wiring and
+    // the interaction with num_deleted_/get_tombstone_ratio() bookkeeping is
+    // deferred to Phase 2 of the integration plan (docs: WOLVERINE_EDGE_REPAIR_PLAN.md).
+    static const int VIOLENT_DELETE            = 0;  // strip edges only, no repair
+    static const int PINTOPOUT_DELETE          = 1;  // local reconnection of surviving neighbors
+    static const int SEARCH_DELETE             = 2;  // Wolverine: fresh search per out-neighbor
+    static const int TWOHOP_DELETE             = 3;  // Wolverine+: 2-hop candidate reuse
+    static const int APPROXIMATE_TWOHOP_DELETE = 4;  // Wolverine++: filtered 2-hop candidates
 
     size_t max_elements_{0};
     mutable std::atomic<size_t> cur_element_count{0};  // current number of elements
@@ -1278,6 +1341,331 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             maxlevel_ = curlevel;
         }
         return cur_c;
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Wolverine-style physical delete + monotonic search-path repair.
+    //
+    // Ported from LDW2020/Wolverine (hnsw_Wolverine/hnswalg.h), the reference
+    // implementation for Liu et al., PVLDB 2025 (see the deleteModel constants
+    // above). Unlike markDelete (which only sets a tombstone bit and leaves
+    // stale edges in place), patchDelete physically severs the deleted
+    // vertex's edges, strips dangling references to it from every surviving
+    // node, and repairs the connectivity broken by its removal according to
+    // `deleteModel`.
+    //
+    // Deliberate differences from the original Wolverine source:
+    //  - Reuses this class's existing tombstone bit (isMarkedDeleted /
+    //    markDeletedInternal / deleted_elements) instead of introducing a
+    //    second, parallel "deleted" bookkeeping array (Wolverine's
+    //    deleteFlags/deleted_internalId). This avoids two inconsistent
+    //    notions of "deleted" coexisting in the same class.
+    //  - label_lookup_ is erased immediately per deleted label (still under
+    //    label_lookup_lock/label-op lock), matching "complete deletion"
+    //    semantics rather than markDelete's defer-to-replace_deleted model.
+    //  - Building internalDeleteList writes into a pre-sized vector by index
+    //    instead of concurrent vector::emplace_back from multiple worker
+    //    threads (the original source has a data race here: unsynchronized
+    //    push_back from ParallelFor workers).
+    //  - MYsearchBaseLayer (Wolverine's local variant) is dropped in favor of
+    //    this class's existing searchBaseLayer(ep, data, level), which already
+    //    performs the same from-entry-point layer search using ef_construction_.
+    //
+    // Not yet wired into Executor::mark_delete_local[_batch] — that hookup,
+    // plus deciding how get_tombstone_ratio() should treat patch-deleted
+    // slots, is Phase 2 of the integration plan.
+    // ─────────────────────────────────────────────────────────────────────
+
+    void mulLink(tableint thePoint, int level, std::vector<std::pair<dist_t, tableint>> &cand) {
+        size_t Mcurmax = level ? maxM_ : maxM0_;
+        std::unique_lock<std::mutex> lock(link_list_locks_[thePoint]);
+        linklistsizeint *thePoint_data = get_linklist_at_level(thePoint, level);
+        int thePoint_size = getListCount(thePoint_data);
+        tableint *thePoint_datal = (tableint *) (thePoint_data + 1);
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        for (size_t i = 0; i < cand.size(); i++) {
+            if (cand[i].second != thePoint &&
+                std::find(thePoint_datal, thePoint_datal + thePoint_size, cand[i].second) == thePoint_datal + thePoint_size) {
+                top_candidates.emplace(cand[i]);
+            }
+        }
+
+        if (static_cast<size_t>(thePoint_size) + top_candidates.size() < Mcurmax) {
+            while (!top_candidates.empty()) {
+                thePoint_datal[thePoint_size++] = top_candidates.top().second;
+                top_candidates.pop();
+            }
+            setListCount(thePoint_data, thePoint_size);
+        } else {
+            for (int i = 0; i < thePoint_size; i++) {
+                top_candidates.emplace(
+                    fstdistfunc_(getDataByInternalId(thePoint_datal[i]), getDataByInternalId(thePoint), dist_func_param_),
+                    thePoint_datal[i]);
+            }
+            getNeighborsByHeuristic2(top_candidates, Mcurmax);
+            thePoint_size = static_cast<int>(top_candidates.size());
+            for (int i = 0; i < thePoint_size; i++) {
+                thePoint_datal[i] = top_candidates.top().second;
+                top_candidates.pop();
+            }
+            setListCount(thePoint_data, thePoint_size);
+        }
+    }
+
+
+    void addCandToNewLink(
+        std::unordered_map<tableint, std::vector<std::vector<std::pair<dist_t, tableint>>>> &newLink,
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
+        int level, tableint thePoint) {
+        while (!top_candidates.empty()) {
+            tableint newInPoint = top_candidates.top().second;
+            dist_t newInPointDist = top_candidates.top().first;
+            auto it = newLink.find(newInPoint);
+            if (it == newLink.end()) {
+                it = newLink.emplace(newInPoint,
+                    std::vector<std::vector<std::pair<dist_t, tableint>>>(element_levels_[newInPoint] + 1)).first;
+            }
+            it->second[level].emplace_back(newInPointDist, thePoint);
+            top_candidates.pop();
+        }
+    }
+
+
+    // Batch delete by label. deleteModel selects the repair strategy (see the
+    // *_DELETE constants above); newLinkSize bounds how many new in-edges are
+    // added per out-neighbor of a deleted vertex; num_threads <= 0 uses
+    // hardware_concurrency().
+    void patchDelete(std::vector<labeltype> deleteList, int deleteModel, int newLinkSize, int num_threads) {
+        std::vector<tableint> internalDeleteList(deleteList.size());
+        std::atomic<bool> changeEp{false};
+
+        ParallelFor(0, deleteList.size(), num_threads, [&](size_t row, size_t /*threadId*/) {
+            labeltype label = deleteList[row];
+            std::unique_lock<std::mutex> lock_label(getLabelOpMutex(label));
+            std::unique_lock<std::mutex> lock_table(label_lookup_lock);
+            auto search = label_lookup_.find(label);
+            if (search == label_lookup_.end()) {
+                throw std::runtime_error("patchDelete: label not found: " + std::to_string(label));
+            }
+            tableint internalId = search->second;
+            if (isMarkedDeleted(internalId)) {
+                throw std::runtime_error("patchDelete: label already deleted: " + std::to_string(label));
+            }
+            label_lookup_.erase(search);
+            lock_table.unlock();
+
+            if (internalId == enterpoint_node_) {
+                changeEp = true;
+            }
+            markDeletedInternal(internalId);
+            internalDeleteList[row] = internalId;
+        });
+
+        patchDeleteInternalDeleteList(std::move(internalDeleteList), deleteModel, num_threads, newLinkSize, changeEp.load());
+    }
+
+
+    // Batch delete by a contiguous range of labels [deleteStart, deleteStart + deleteLen).
+    void patchDelete(labeltype deleteStart, size_t deleteLen, int deleteModel, int newLinkSize, int num_threads) {
+        std::vector<labeltype> deleteList(deleteLen);
+        std::iota(deleteList.begin(), deleteList.end(), deleteStart);
+        patchDelete(std::move(deleteList), deleteModel, newLinkSize, num_threads);
+    }
+
+
+    inline void patchDeleteInternalDeleteList(
+        std::vector<tableint> internalDeleteList, int deleteModel, int num_threads, int newLinkSize, bool changeEp) {
+        if (internalDeleteList.empty()) return;
+
+        // Reassign the entry point before the pruning pass below rewrites the
+        // adjacency lists it needs to walk.
+        if (changeEp) {
+            std::unique_lock<std::mutex> templock(global);
+            tableint internalId = enterpoint_node_;
+            bool changeOver = false;
+            for (int level = element_levels_[enterpoint_node_]; level >= 0 && !changeOver; level--) {
+                std::unique_lock<std::mutex> lock(link_list_locks_[internalId]);
+                linklistsizeint *data = get_linklist_at_level(internalId, level);
+                int size = getListCount(data);
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    if (!isMarkedDeleted(datal[i])) {
+                        enterpoint_node_ = datal[i];
+                        changeOver = true;
+                        break;
+                    }
+                }
+                maxlevel_ = level;
+            }
+            if (!changeOver) {
+                throw std::runtime_error("patchDelete: failed to find a replacement entry point "
+                                          "(graph may be empty or fully deleted)");
+            }
+        }
+
+        // Strip dangling references to deleted vertices from every surviving
+        // node's adjacency lists, and (for PINTOPOUT_DELETE) locally
+        // reconnect nodes that lost a neighbor. Skipping already-deleted rows
+        // is safe: a row deleted in this batch has its own list zeroed below
+        // regardless of what happens to it here, and a row deleted by an
+        // earlier call already has an empty list (no-op).
+        ParallelFor(0, cur_element_count, num_threads, [&](size_t row, size_t /*threadId*/) {
+            tableint rowId = static_cast<tableint>(row);
+            if (isMarkedDeleted(rowId)) return;
+
+            for (int level = element_levels_[rowId]; level >= 0; level--) {
+                std::unique_lock<std::mutex> lock(link_list_locks_[rowId]);
+                linklistsizeint *data = get_linklist_at_level(rowId, level);
+                int size = getListCount(data);
+                tableint *datal = (tableint *) (data + 1);
+
+                std::vector<tableint> connectedDeletePoint;
+                for (int i = 0; i < size; i++) {
+                    if (isMarkedDeleted(datal[i])) {
+                        connectedDeletePoint.push_back(datal[i]);
+                        datal[i--] = datal[--size];
+                    }
+                }
+
+                if (deleteModel == PINTOPOUT_DELETE && !connectedDeletePoint.empty()) {
+                    size_t Mcurmax = level ? maxM_ : maxM0_;
+                    std::unordered_set<tableint> cand_list;
+                    for (int i = 0; i < size; i++) cand_list.insert(datal[i]);
+                    for (tableint deletePoint : connectedDeletePoint) {
+                        std::vector<tableint> deletePoint_datal = getConnectionsWithLock(deletePoint, level);
+                        for (tableint link : deletePoint_datal) {
+                            if (link != rowId && !isMarkedDeleted(link)) cand_list.insert(link);
+                        }
+                    }
+                    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+                    for (tableint cand : cand_list) {
+                        top_candidates.emplace(fstdistfunc_(getDataByInternalId(cand), getDataByInternalId(rowId), dist_func_param_), cand);
+                    }
+                    getNeighborsByHeuristic2(top_candidates, Mcurmax);
+                    size = static_cast<int>(top_candidates.size());
+                    for (int i = 0; i < size; i++) {
+                        datal[i] = top_candidates.top().second;
+                        top_candidates.pop();
+                    }
+                }
+                setListCount(data, size);
+            }
+        });
+
+        // Wolverine / Wolverine+ / Wolverine++: repair monotonic search paths
+        // by adding new in-edges to each deleted vertex's out-neighbors,
+        // sourced from a fresh local search (SEARCH_DELETE), its 2-hop
+        // neighborhood (TWOHOP_DELETE), or a distance-filtered subset of that
+        // 2-hop neighborhood (APPROXIMATE_TWOHOP_DELETE). Reads the deleted
+        // vertices' own out-edges, which are still intact at this point (only
+        // zeroed in the final pass below).
+        if (deleteModel >= SEARCH_DELETE) {
+            ParallelFor(0, internalDeleteList.size(), num_threads, [&](size_t row, size_t /*threadId*/) {
+                std::unordered_map<tableint, std::vector<std::vector<std::pair<dist_t, tableint>>>> newLink;
+                tableint internalId = internalDeleteList[row];
+
+                for (int level = element_levels_[internalId]; level >= 0; level--) {
+                    std::vector<tableint> internalId_datal = getConnectionsWithLock(internalId, level);
+                    int internalId_size = static_cast<int>(internalId_datal.size());
+
+                    if (deleteModel == SEARCH_DELETE) {
+                        for (int linkID = 0; linkID < internalId_size; linkID++) {
+                            tableint thePoint = internalId_datal[linkID];
+                            // thePoint can itself be a member of this same delete
+                            // batch (internalId's own out-list isn't pruned until
+                            // the final pass below) — skip it, it doesn't need
+                            // repair and must not receive new in-edges.
+                            if (isMarkedDeleted(thePoint)) continue;
+                            auto top_candidates = searchBaseLayer(thePoint, getDataByInternalId(thePoint), level);
+                            getNeighborsByHeuristic2(top_candidates, newLinkSize);
+                            addCandToNewLink(newLink, top_candidates, level, thePoint);
+                        }
+                    } else if (deleteModel == TWOHOP_DELETE) {
+                        for (int linkID = 0; linkID < internalId_size; linkID++) {
+                            tableint thePoint = internalId_datal[linkID];
+                            if (isMarkedDeleted(thePoint)) continue;
+                            std::unordered_set<tableint> predict_list;
+                            std::vector<tableint> oneHopList = getConnectionsWithLock(thePoint, level);
+                            for (tableint oneHopPoint : oneHopList) {
+                                std::vector<tableint> twoHopList = getConnectionsWithLock(oneHopPoint, level);
+                                for (tableint twoHopPoint : twoHopList) {
+                                    predict_list.insert(twoHopPoint);
+                                    if (predict_list.size() > 5u * static_cast<size_t>(newLinkSize)) break;
+                                }
+                                if (predict_list.size() > 5u * static_cast<size_t>(newLinkSize)) break;
+                            }
+                            std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+                            for (tableint predict : predict_list) {
+                                top_candidates.emplace(
+                                    fstdistfunc_(getDataByInternalId(thePoint), getDataByInternalId(predict), dist_func_param_), predict);
+                            }
+                            getNeighborsByHeuristic2(top_candidates, newLinkSize);
+                            addCandToNewLink(newLink, top_candidates, level, thePoint);
+                        }
+                    } else if (deleteModel == APPROXIMATE_TWOHOP_DELETE) {
+                        for (int linkID = 0; linkID < internalId_size; linkID++) {
+                            tableint thePoint = internalId_datal[linkID];
+                            if (isMarkedDeleted(thePoint)) continue;
+                            tableint deletePoint = internalId;
+                            std::unordered_set<tableint> predict_list;
+                            dist_t thePoint_to_deletePoint_dist =
+                                fstdistfunc_(getDataByInternalId(thePoint), getDataByInternalId(deletePoint), dist_func_param_);
+                            for (tableint oneHopPoint : internalId_datal) {
+                                dist_t thePoint_to_oneHop_dist =
+                                    fstdistfunc_(getDataByInternalId(thePoint), getDataByInternalId(oneHopPoint), dist_func_param_);
+                                if (thePoint_to_oneHop_dist < thePoint_to_deletePoint_dist) {
+                                    predict_list.insert(oneHopPoint);
+                                    std::vector<tableint> twoHopList = getConnectionsWithLock(oneHopPoint, level);
+                                    for (tableint twoHopPoint : twoHopList) {
+                                        dist_t deletePoint_to_twoHop_dist = fstdistfunc_(
+                                            getDataByInternalId(deletePoint), getDataByInternalId(twoHopPoint), dist_func_param_);
+                                        dist_t thePoint_to_twoHop_dist = fstdistfunc_(
+                                            getDataByInternalId(thePoint), getDataByInternalId(twoHopPoint), dist_func_param_);
+                                        if (deletePoint_to_twoHop_dist > thePoint_to_deletePoint_dist &&
+                                            thePoint_to_twoHop_dist < thePoint_to_deletePoint_dist &&
+                                            thePoint_to_twoHop_dist + thePoint_to_deletePoint_dist > deletePoint_to_twoHop_dist) {
+                                            predict_list.insert(twoHopPoint);
+                                            if (predict_list.size() > 2u * static_cast<size_t>(newLinkSize)) break;
+                                        }
+                                    }
+                                }
+                                if (predict_list.size() > 2u * static_cast<size_t>(newLinkSize)) break;
+                            }
+                            std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+                            for (tableint predict : predict_list) {
+                                top_candidates.emplace(
+                                    fstdistfunc_(getDataByInternalId(thePoint), getDataByInternalId(predict), dist_func_param_), predict);
+                            }
+                            getNeighborsByHeuristic2(top_candidates, newLinkSize);
+                            addCandToNewLink(newLink, top_candidates, level, thePoint);
+                        }
+                    }
+                }
+
+                for (auto &kv : newLink) {
+                    tableint newInPoint = kv.first;
+                    for (int level = element_levels_[newInPoint]; level >= 0; level--) {
+                        if (!kv.second[level].empty()) {
+                            mulLink(newInPoint, level, kv.second[level]);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Finally sever the deleted vertices' own outgoing edges.
+        ParallelFor(0, internalDeleteList.size(), num_threads, [&](size_t row, size_t /*threadId*/) {
+            tableint internalId = internalDeleteList[row];
+            if (element_levels_[internalId] != 0) {
+                element_levels_[internalId] = 0;
+                free(linkLists_[internalId]);
+                linkLists_[internalId] = nullptr;
+            }
+            linklistsizeint *internalId_LinkList = get_linklist0(internalId);
+            setListCount(internalId_LinkList, 0);
+        });
     }
 
 
