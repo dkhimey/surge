@@ -1758,13 +1758,13 @@ void Executor::build(
     std::cout << "[Executor " << node_id_ << " ] Building local sub-index\n";
     double start = MPI_Wtime();
     float* norm_element = new float[dim_];
-    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, data_count_, M_sub, ef_construction, 100, true);
-    sub_HNSW_->addPoint(data_, indices_[0], /*replace_deleted=*/true); // first element not thread safe
+    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, data_count_, M_sub, ef_construction, 100, /*allow_replace_deleted=*/!wolverine_deletes_);
+    sub_HNSW_->addPoint(data_, indices_[0], /*replace_deleted=*/!wolverine_deletes_); // first element not thread safe
     omp_set_num_threads(num_building_threads);
     std::cout << "[Executor " << node_id_ << "] - num threads building index: " << num_building_threads << "/"  << omp_get_max_threads() << "\n";
     #pragma omp parallel for num_threads(num_building_threads)
     for (int j = 1; j < data_count_; j++) {
-        sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/!wolverine_deletes_);
     }
 
     delete[] norm_element;
@@ -1867,7 +1867,7 @@ void Executor::partial_rebuild(
     for (int i = 0; i < total_recv; i++) {
         float* vec = all_recv_vectors.data() + (i * dim_);
         int index = all_recv_labels[i];
-        sub_HNSW_->addPoint(vec, index, /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(vec, index, /*replace_deleted=*/!wolverine_deletes_);
     }
 
     sub_HNSW_->setEf(ef_construction);
@@ -2030,7 +2030,7 @@ void Executor::apply_full_rebuild(MigrantExchange& mig, int ef_construction, int
 
     hnswlib::HierarchicalNSW<float>* next_sub_HNSW =
         new hnswlib::HierarchicalNSW<float>(space_, kept_count + total_recv,
-                                            M_sub, ef_construction, 100, true);
+                                            M_sub, ef_construction, 100, /*allow_replace_deleted=*/!wolverine_deletes_);
 
     double start_hnsw = MPI_Wtime();
 
@@ -2039,21 +2039,21 @@ void Executor::apply_full_rebuild(MigrantExchange& mig, int ef_construction, int
     size_t kept_start = 0;
     int    arr_start  = 0;
     if (kept_count > 0) {
-        next_sub_HNSW->addPoint(mig.kept_vectors[0], mig.kept_labels[0], /*replace_deleted=*/true);
+        next_sub_HNSW->addPoint(mig.kept_vectors[0], mig.kept_labels[0], /*replace_deleted=*/!wolverine_deletes_);
         kept_start = 1;
     } else if (total_recv > 0) {
-        next_sub_HNSW->addPoint(mig.arrived_vectors.data(), mig.arrived_labels[0], /*replace_deleted=*/true);
+        next_sub_HNSW->addPoint(mig.arrived_vectors.data(), mig.arrived_labels[0], /*replace_deleted=*/!wolverine_deletes_);
         arr_start = 1;
     }
 
     #pragma omp parallel for num_threads(num_building_threads)
     for (size_t i = kept_start; i < kept_count; i++)
-        next_sub_HNSW->addPoint(mig.kept_vectors[i], mig.kept_labels[i], /*replace_deleted=*/true);
+        next_sub_HNSW->addPoint(mig.kept_vectors[i], mig.kept_labels[i], /*replace_deleted=*/!wolverine_deletes_);
 
     #pragma omp parallel for num_threads(num_building_threads)
     for (int i = arr_start; i < total_recv; i++)
         next_sub_HNSW->addPoint(mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
-                                mig.arrived_labels[i], /*replace_deleted=*/true);
+                                mig.arrived_labels[i], /*replace_deleted=*/!wolverine_deletes_);
     double end_hnsw = MPI_Wtime();
 
     next_sub_HNSW->setEf(ef_construction);
@@ -2100,19 +2100,19 @@ void Executor::apply_delta_rebuild(MigrantExchange& mig, int num_building_thread
         for (int i = 0; i < total_recv; i++)
             sub_HNSW_->addPoint(mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
                                 static_cast<hnswlib::labeltype>(mig.arrived_labels[i]),
-                                /*replace_deleted=*/true);
+                                /*replace_deleted=*/!wolverine_deletes_);
     }
     double end_hnsw = MPI_Wtime();
 
-    // With replace_deleted=true, deleted_elements.size() == num_deleted_ and both
-    // equal the tombstone slots still sitting in the graph.
-    size_t remaining_deleted;
-    {
+    // Tombstone slots still sitting in the graph. num_deleted_ is authoritative in
+    // both policies; under replace_deleted (tombstone) deleted_elements mirrors it,
+    // whereas under Wolverine (allow_replace_deleted off) deleted_elements is unused.
+    size_t remaining_deleted = sub_HNSW_->num_deleted_.load();
+    if (!wolverine_deletes_) {
         std::lock_guard<std::mutex> del_lock(sub_HNSW_->deleted_elements_lock);
-        remaining_deleted = sub_HNSW_->deleted_elements.size();
+        assert(remaining_deleted == sub_HNSW_->deleted_elements.size() &&
+               "deleted_elements.size() and num_deleted_ out of sync");
     }
-    assert(remaining_deleted == sub_HNSW_->num_deleted_.load() &&
-           "deleted_elements.size() and num_deleted_ out of sync");
 
     last_rebuild_remaining_deleted_ = remaining_deleted;
     last_rebuild_graph_s_           = end_hnsw - start_hnsw;
@@ -2160,8 +2160,8 @@ void Executor::rebuild(
 }
 
 // In-place rebuild: classify live elements, mark-delete migrants, insert newcomers.
-// Preserves graph topology; reuses freed slots via replace_deleted=true.
-// Logs count of remaining deleted slots (tombstones for departed elements).
+// Preserves graph topology; reuses freed slots via replace_deleted unless the
+// Wolverine delete policy disabled it. Logs count of remaining deleted slots.
 void Executor::rebuild_delta(
     int meta_size,
     int ncenters,
@@ -2468,14 +2468,14 @@ void Executor::insert_local_batch(const std::vector<float>& vecs,
     }
 
     // Phase 2: parallel inserts under shared lock.
-    // replace_deleted=true reuses tombstone slots from prior stream-deletes
-    // before allocating new capacity.  hnswlib addPoint is internally
+    // replace_deleted reuses tombstone slots from prior stream-deletes before
+    // allocating new capacity (disabled under Wolverine). hnswlib addPoint is internally
     // thread-safe (per-element locks and deleted_elements_lock for slot
     // selection), so concurrent calls on distinct labels are safe here.
     std::shared_lock<std::shared_mutex> lk(graph_mutex_);
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < incoming; i++)
-        sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/!wolverine_deletes_);
 }
 
 // Mark a single vector deleted without MPI.  Ignores labels not present in
@@ -2508,15 +2508,7 @@ void Executor::mark_delete_local_batch(const std::vector<int>& labels) {
     }
 }
 
-// Wolverine-style physical delete: patchDelete severs the vertex's edges and
-// repairs the surrounding graph in place, rather than leaving a tombstone for
-// a later rebuild to clean up. Held under a shared (reader) lock, same as
-// mark_delete_local[_batch] — patchDelete is internally thread-safe (per-row
-// link_list_locks_, label_lookup_lock, and its own internal ParallelFor over
-// num_threads), so concurrent inserts/searches/other deletes on this shard
-// are safe to interleave with it. Labels not present in this shard (or
-// already deleted) are silently skipped, matching mark_delete_local's
-// contract.
+// Wolverine-style delete
 void Executor::patch_delete_local(int label, int deleteModel, int newLinkSize, int num_threads) {
     std::shared_lock<std::shared_mutex> lk(graph_mutex_);
     if (newLinkSize <= 0) {
@@ -2531,12 +2523,6 @@ void Executor::patch_delete_local(int label, int deleteModel, int newLinkSize, i
     }
 }
 
-// Batch variant of patch_delete_local. Pre-filters to labels this shard
-// actually owns (and that aren't already deleted) before calling patchDelete
-// once on the surviving set: patchDelete's internal ParallelFor throws on any
-// missing/already-deleted label and aborts the whole batch (see hnswalg.h),
-// so filtering up front is what makes "silently skip absent labels" hold at
-// batch granularity instead of failing the entire call over one bad label.
 void Executor::patch_delete_local_batch(const std::vector<int>& labels,
                                       int deleteModel, int newLinkSize, int num_threads) {
     if (labels.empty()) return;
@@ -2560,12 +2546,13 @@ void Executor::patch_delete_local_batch(const std::vector<int>& labels,
 
     try {
         sub_HNSW_->patchDelete(present, deleteModel, newLinkSize, num_threads);
+    } catch (const std::exception& e) {
+        // Swallowed (a label may be concurrently deleted); logged for debugging.
+        std::cerr << "[Executor " << node_id_ << "] patchDelete failed: "
+                  << e.what() << "\n";
     } catch (...) {
-        // Defensive: a label could theoretically be concurrently deleted
-        // between the filter pass above and patchDelete's own lookup (e.g.
-        // by a racing mark_delete_local[_batch] call on the same label from
-        // another caller). patchDelete aborts the whole batch in that case;
-        // treat it the same as "nothing to do" rather than propagating.
+        std::cerr << "[Executor " << node_id_ << "] patchDelete failed: "
+                  << "unknown exception\n";
     }
 }
 
@@ -2614,7 +2601,7 @@ void Executor::insert_batch(size_t num_vecs, int tag) {
             sub_HNSW_->resizeIndex((current + num_vecs) * 2);
         }
         for (size_t i = 0; i < num_vecs; i++) {
-            sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/true);
+            sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/!wolverine_deletes_);
         }
     }
 
@@ -2630,7 +2617,7 @@ void Executor::insert(int tag) {
         std::shared_lock read_lock(graph_mutex_);
         // +1 because we're about to add one element
         if (sub_HNSW_->getCurrentElementCount() + INSERT_CAPACITY_SLACK <= sub_HNSW_->getMaxElements()) {
-            sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/true);
+            sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/!wolverine_deletes_);
 
             comm_.send_ack(INSERT_SUCCESS, 0, tag);
             return;
@@ -2648,7 +2635,7 @@ void Executor::insert(int tag) {
     // After resize, safe to add. Acquire shared lock again
     {
         std::shared_lock read_lock(graph_mutex_);
-        sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/true);
+        sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/!wolverine_deletes_);
     }
     comm_.send_ack(INSERT_SUCCESS, 0, tag);
 }
@@ -2726,6 +2713,6 @@ void Executor::load(const std::string& prefix, int ef_search) {
     std::string hnsw_path = prefix + suffix;
 
     std::cout << "[Executor " << node_id_ << " ] Loading sub-HNSW from: " << hnsw_path << "\n";
-    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path, false, 0, true);
+    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path, false, 0, /*allow_replace_deleted=*/!wolverine_deletes_);
     sub_HNSW_->setEf(ef_search);
 }

@@ -1678,6 +1678,8 @@ int main(int argc, char** argv)
     } else {
 
         Executor subIndex(rank, dim, comm);
+        // Disables replace_deleted slot reuse; required before build()/load().
+        subIndex.set_wolverine_deletes(delete_policy == DeletePolicy::Wolverine);
 
         if (!resuming) {
             // Receive initial vectors and build shard

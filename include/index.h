@@ -9,14 +9,7 @@ constexpr int KMEANS_EPOCHS = 100;
 constexpr int VECTOR_BATCH_SIZE = 100000;
 
 // Default repair strategy for Executor::patch_delete_local[_batch] (see
-// hnswalg.h for the *_DELETE constants and WOLVERINE_EDGE_REPAIR_PLAN.md for
-// the integration plan). SEARCH_DELETE ("plain" Wolverine) is the default
-// rather than the cheaper PINTOPOUT_DELETE: the Phase 1 validation sweep
-// showed PINTOPOUT_DELETE's naive local reconnection degrades recall about
-// as badly as no repair at all (matching the Wolverine paper's finding that
-// naive DwFC-style reconnection can underperform doing nothing), whereas
-// SEARCH_DELETE/TWOHOP_DELETE/APPROXIMATE_TWOHOP_DELETE all held recall flat
-// across repeated delete rounds.
+// hnswalg.h for the *_DELETE constants
 constexpr int HNSW_DEFAULT_DELETE_MODEL = hnswlib::HierarchicalNSW<float>::SEARCH_DELETE;
 
 enum class RoutingMode {
@@ -311,6 +304,12 @@ public:
     std::string save(const std::string& prefix);
     void set_ef_search(int ef_search);
 
+    // Wolverine physical deletes (patchDelete) sever edges and free slots, which
+    // is incompatible with hnswlib's replace_deleted slot-reuse machinery. When
+    // enabled, sub_HNSW_ is built with allow_replace_deleted off and inserts skip
+    // replace_deleted. Must be set before build()/load().
+    void set_wolverine_deletes(bool enabled) { wolverine_deletes_ = enabled; }
+
     void search(size_t k, int tag);
     void insert(int tag);
     void insert_batch(size_t num_vecs, int tag);
@@ -328,16 +327,6 @@ public:
     void mark_delete_local_batch(const std::vector<int>& labels);
 
     // --- Wolverine-style physical delete + edge repair -----------------
-    // Unlike mark_delete_local[_batch] (soft tombstone: bit flip only, edges
-    // to the deleted vertex are left dangling until a later full/delta
-    // rebuild cleans them up once TOMBSTONE_RATIO_THRESHOLD is crossed),
-    // these physically sever the deleted vertex's edges and repair the
-    // monotonic search paths broken by its removal in place — see
-    // hnswalg.h's HierarchicalNSW::patchDelete and the *_DELETE model
-    // constants. Both silently skip labels absent from this shard, matching
-    // mark_delete_local[_batch]'s contract. newLinkSize <= 0 defaults to the
-    // live sub-HNSW's own M_ (its construction-time degree bound);
-    // num_threads <= 0 uses hardware_concurrency() (see hnswlib::ParallelFor).
     void patch_delete_local(int label,
                           int deleteModel = HNSW_DEFAULT_DELETE_MODEL,
                           int newLinkSize = -1,
@@ -473,6 +462,10 @@ private:
     Communicator& comm_;
 
     hnswlib::HierarchicalNSW<float>* sub_HNSW_ = nullptr;
+
+    // Delete policy: true routes deletes through patchDelete and disables
+    // replace_deleted slot reuse (see set_wolverine_deletes).
+    bool wolverine_deletes_ = false;
 
     mutable std::shared_mutex graph_mutex_;
     // when inserting, each thread holds the shared lock, when swapping hnsw in final step, get exclusive lock
