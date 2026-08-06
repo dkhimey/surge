@@ -68,15 +68,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     static const tableint MAX_LABEL_OPERATION_LOCKS = 65536;
     static const unsigned char DELETE_MARK = 0x01;
 
-    // Repair strategies for Wolverine-style physical delete (see patchDelete
-    // below). VIOLENT_DELETE / PINTOPOUT_DELETE mirror the "Do" / local-
-    // reconnection baselines analyzed in the Wolverine paper; SEARCH_DELETE /
-    // TWOHOP_DELETE / APPROXIMATE_TWOHOP_DELETE correspond to Wolverine,
-    // Wolverine+, and Wolverine++ respectively (Liu, Zheng, Yue, Ruan, Zhou,
-    // Jensen. "Wolverine: Highly Efficient Monotonic Search Path Repair for
-    // Graph-based ANN Index Updates." PVLDB 18(7), 2025). Executor wiring and
-    // the interaction with num_deleted_/get_tombstone_ratio() bookkeeping is
-    // deferred to Phase 2 of the integration plan (docs: WOLVERINE_EDGE_REPAIR_PLAN.md).
+    // Second bit in the same tombstone byte, set only by patchDelete. 
+    // Distinguishes physically deleted, label_lookup_ entry from tombstoned
+    static const unsigned char PHYSICAL_DELETE_MARK = 0x02;
+
+    // Repair strategies for Wolverine-style physical delete
     static const int VIOLENT_DELETE            = 0;  // strip edges only, no repair
     static const int PINTOPOUT_DELETE          = 1;  // local reconnection of surviving neighbors
     static const int SEARCH_DELETE             = 2;  // Wolverine: fresh search per out-neighbor
@@ -857,7 +853,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         revSize_ = 1.0 / mult_;
         ef_ = 10;
         for (size_t i = 0; i < cur_element_count; i++) {
-            label_lookup_[getExternalLabel(i)] = i;
+            // A markDelete tombstone should still resolve through label_lookup_
+            if (!isPhysicallyDeleted(static_cast<tableint>(i))) {
+                label_lookup_[getExternalLabel(i)] = i;
+            }
             unsigned int linkListSize;
             readBinaryPOD(input, linkListSize);
             if (linkListSize == 0) {
@@ -979,7 +978,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         assert(internalId < cur_element_count);
         if (isMarkedDeleted(internalId)) {
             unsigned char *ll_cur = ((unsigned char *)get_linklist0(internalId)) + 2;
-            *ll_cur &= ~DELETE_MARK;
+            // Clear PHYSICAL_DELETE_MARK too
+            *ll_cur &= ~(DELETE_MARK | PHYSICAL_DELETE_MARK);
             num_deleted_ -= 1;
             if (allow_replace_deleted_) {
                 std::unique_lock <std::mutex> lock_deleted_elements(deleted_elements_lock);
@@ -997,6 +997,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     bool isMarkedDeleted(tableint internalId) const {
         unsigned char *ll_cur = ((unsigned char*)get_linklist0(internalId)) + 2;
         return *ll_cur & DELETE_MARK;
+    }
+
+    bool isPhysicallyDeleted(tableint internalId) const {
+        unsigned char *ll_cur = ((unsigned char*)get_linklist0(internalId)) + 2;
+        return *ll_cur & PHYSICAL_DELETE_MARK;
     }
 
 
@@ -1460,6 +1465,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 changeEp = true;
             }
             markDeletedInternal(internalId);
+            {
+                // Record that this tombstone came from patchDelete, not markDelete
+                unsigned char *ll_cur = ((unsigned char *) get_linklist0(internalId)) + 2;
+                *ll_cur |= PHYSICAL_DELETE_MARK;
+            }
             internalDeleteList[row] = internalId;
         });
 
