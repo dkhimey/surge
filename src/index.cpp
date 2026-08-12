@@ -845,25 +845,38 @@ int Coordinator::check_need_rebuild(int full_threshold, int partial_threshold,
                                     &cached_repart_bottom_s_,
                                     &cached_repart_kaffpa_s_,
                                     &cached_repart_relabel_s_);
+    (void) to_move;  // superseded by weight_frac below; repartition() still logs it.
 
-    // No rebuild if to_move below both thresholds; threshold >= ncenters disables that type
-    if (to_move < full_threshold && to_move < partial_threshold) {
+    // centers/elems: what would move under the fresh partitioning; total_vectors: live count.
+    int       centers       = 0;
+    long long elems         = 0;
+    long long total_vectors = 0;
+    for (size_t c = 0; c < new_parts.size(); c++) {
+        total_vectors += center_counts_[c];
+        if (new_parts[c] != partitions_[c]) {
+            centers++;
+            elems += center_counts_[c];
+        }
+    }
+
+    // Gate on vector-weight fraction, not raw centroid-count fraction: a few
+    // high-weight centroids can carry most of an imbalance without crossing a
+    // count-based threshold. full_threshold/partial_threshold stay expressed
+    // in centroids-out-of-ncenters_ for CLI compat; convert to a fraction and
+    // apply it to weight instead.
+    const double full_frac    = static_cast<double>(full_threshold)    / static_cast<double>(ncenters_);
+    const double partial_frac = static_cast<double>(partial_threshold) / static_cast<double>(ncenters_);
+    const double weight_frac  = total_vectors > 0
+        ? static_cast<double>(elems) / static_cast<double>(total_vectors)
+        : 0.0;
+
+    if (weight_frac < full_frac && weight_frac < partial_frac) {
         delete new_meta;
         return 0;
     }
 
-    // Count centers/elements that move; new_parts already relabeled by match_partitions_
-    {
-        int centers = 0, elems = 0;
-        for (size_t c = 0; c < new_parts.size(); c++) {
-            if (new_parts[c] != partitions_[c]) {
-                centers++;
-                elems += center_counts_[c];
-            }
-        }
-        cached_centers_moved_  = centers;
-        cached_elements_moved_ = elems;
-    }
+    cached_centers_moved_  = centers;
+    cached_elements_moved_ = static_cast<int>(elems);
 
     // Cache materials needed for do_rebuild_simple().
     cached_new_meta_HNSW_    = new_meta;
@@ -875,7 +888,7 @@ int Coordinator::check_need_rebuild(int full_threshold, int partial_threshold,
         cached_hnsw_buffer_.assign(std::istreambuf_iterator<char>(f), {});
     }
 
-    cached_rebuild_type_ = (to_move >= full_threshold) ? 1 : 2;
+    cached_rebuild_type_ = (weight_frac >= full_frac) ? 1 : 2;
     return cached_rebuild_type_;
 }
 
