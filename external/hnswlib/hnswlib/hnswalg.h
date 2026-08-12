@@ -1593,21 +1593,22 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             addCandToNewLink(newLink, top_candidates, level, thePoint);
                         }
                     } else if (deleteModel == TWOHOP_DELETE) {
+                        // Hop2(p): out-neighbors of internalId's out-neighbors
+                        std::unordered_set<tableint> hop2;
+                        for (tableint oneHopPoint : internalId_datal) {
+                            std::vector<tableint> twoHopList = getConnectionsWithLock(oneHopPoint, level);
+                            for (tableint twoHopPoint : twoHopList) {
+                                hop2.insert(twoHopPoint);
+                                if (hop2.size() > 5u * static_cast<size_t>(newLinkSize)) break;
+                            }
+                            if (hop2.size() > 5u * static_cast<size_t>(newLinkSize)) break;
+                        }
                         for (int linkID = 0; linkID < internalId_size; linkID++) {
                             tableint thePoint = internalId_datal[linkID];
                             if (isMarkedDeleted(thePoint)) continue;
-                            std::unordered_set<tableint> predict_list;
-                            std::vector<tableint> oneHopList = getConnectionsWithLock(thePoint, level);
-                            for (tableint oneHopPoint : oneHopList) {
-                                std::vector<tableint> twoHopList = getConnectionsWithLock(oneHopPoint, level);
-                                for (tableint twoHopPoint : twoHopList) {
-                                    predict_list.insert(twoHopPoint);
-                                    if (predict_list.size() > 5u * static_cast<size_t>(newLinkSize)) break;
-                                }
-                                if (predict_list.size() > 5u * static_cast<size_t>(newLinkSize)) break;
-                            }
                             std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-                            for (tableint predict : predict_list) {
+                            for (tableint predict : hop2) {
+                                if (predict == thePoint || isMarkedDeleted(predict)) continue;
                                 top_candidates.emplace(
                                     fstdistfunc_(getDataByInternalId(thePoint), getDataByInternalId(predict), dist_func_param_), predict);
                             }
