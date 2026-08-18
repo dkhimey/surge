@@ -584,7 +584,17 @@ std::pair<int, std::vector<int>> Coordinator::match_partitions_(const std::vecto
     //         test+=cost[i][j];
     //     }
     // }
-    std::cout << "TO MOVE: " << ncenters_ - score << " / " << ncenters_ << "\n";
+    long long elems_moved = 0, total_vectors = 0;
+    const bool have_counts = center_counts_.size() == static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        long long w = have_counts ? center_counts_[i] : 1;
+        total_vectors += w;
+        if (assignment[part1[i]] != part2[i]) elems_moved += w;
+    }
+    const double weight_frac = total_vectors > 0 ? static_cast<double>(elems_moved) / total_vectors : 0.0;
+
+    std::cout << "TO MOVE: " << ncenters_ - score << " / " << ncenters_
+              << "  weight_frac=" << weight_frac << " (" << elems_moved << "/" << total_vectors << ")\n";
 
     // Check if relabeled part1 matches part2
     // for (int i = 0; i < n; ++i) {
