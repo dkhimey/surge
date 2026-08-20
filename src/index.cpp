@@ -563,48 +563,6 @@ std::vector<int> Coordinator::distribute_vectors(
     return counts_per_partition;
 }
 
-std::pair<int, std::vector<int>> Coordinator::match_partitions_(const std::vector<int>& part1, const std::vector<int>& part2) {
-    int n = part1.size();
-    if (part2.size() != n) return {0, std::vector<int>()};
-
-    // Build cost matrix: cost[i][j] = number of times part1[i] aligns with part2[j]
-    std::vector<std::vector<int>> cost(num_partitions_, std::vector<int>(num_partitions_, 0));
-    for (int i = 0; i < n; ++i)
-        cost[part1[i]][part2[i]]++;
-
-    // Use maximum matching algorithm to find best matching
-    std::vector<int> assignment;
-    int score = maximum_matching(cost, assignment);
-
-    // int test = 0;
-    // for (int i = 0; i < assignment.size(); i++) {
-    //     for (int j = 0; j < assignment.size(); j++) {
-    //         if (assignment[i] == j) continue;
-    //         // std::cout << "      " << cost[i][j] << " vectors from " << j << " to " << assignment[i] << "\n";
-    //         test+=cost[i][j];
-    //     }
-    // }
-    long long elems_moved = 0, total_vectors = 0;
-    const bool have_counts = center_counts_.size() == static_cast<size_t>(n);
-    for (int i = 0; i < n; ++i) {
-        long long w = have_counts ? center_counts_[i] : 1;
-        total_vectors += w;
-        if (assignment[part1[i]] != part2[i]) elems_moved += w;
-    }
-    const double weight_frac = total_vectors > 0 ? static_cast<double>(elems_moved) / total_vectors : 0.0;
-
-    std::cout << "TO MOVE: " << ncenters_ - score << " / " << ncenters_
-              << "  weight_frac=" << weight_frac << " (" << elems_moved << "/" << total_vectors << ")\n";
-
-    // Check if relabeled part1 matches part2
-    // for (int i = 0; i < n; ++i) {
-    //     if (assignment[part1[i]] != part2[i])
-    //         return false;
-    // }
-
-    return {ncenters_ - score, assignment};
-}
-
 int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::HierarchicalNSW<float>*& new_meta_HNSW, int ef_construction, int M_meta,
                               double* out_hnsw_s, double* out_bottom_s, double* out_kaffpa_s, double* out_relabel_s) {
     double start = MPI_Wtime();
@@ -630,8 +588,16 @@ int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     int m_centers_int = (int) ncenters_;
     int w_partitions_int = (int) num_partitions_;
     double imbalance = KAFFPA_IMBALANCE;
-    new_partitions = std::vector<int>(ncenters_, -1);
     int seed = gen_();
+
+    // Warm start from the partitioning currently in force. KaHIP refines it in
+    // place rather than building one from scratch, so block ids keep their
+    // meaning across repartitions and the result needs no relabeling. An
+    // all-zero seed is not a valid k-way assignment, so the size mismatch case
+    // falls through to a cold run inside kaffpa_warmstart.
+    new_partitions = (partitions_.size() == ncenters_)
+                   ? partitions_
+                   : std::vector<int>(ncenters_, 0);
     // Balance vectors, not centroids: weight each centroid by its live vector
     // count so KaHIP equalizes the sum of weights (= vectors per worker) to within
     // KAFFPA_IMBALANCE. Under clustered/shifting data, equal centroid counts leave
@@ -643,31 +609,46 @@ int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::Hierarch
         vwgt[i] = std::max(center_counts_[i], 1);   // KaHIP requires positive weights
     // run partitioning algo
     start = MPI_Wtime();
-    kaffpa(&m_centers_int, vwgt.data(), xadj.data(), nullptr, adjncy.data(),
+    kaffpa_warmstart(&m_centers_int, vwgt.data(), xadj.data(), nullptr, adjncy.data(),
            &w_partitions_int, &imbalance, true, seed, STRONG, &edge_cut, new_partitions.data());
     end = MPI_Wtime();
     double partition_time = end-start;
 
-    start = MPI_Wtime();
-    std::pair<int, std::vector<int>> matching = match_partitions_(new_partitions, partitions_);
-    int to_move = matching.first;
-    std::vector<int> relabel = matching.second;
-
-    for (int i = 0; i < ncenters_; i++) {
-        new_partitions[i] = relabel[new_partitions[i]];
+    // Block ids are preserved by the warm start, so a centroid migrates exactly
+    // when its label differs from the one in force -- no bipartite matching
+    // needed to first undo a permutation.
+    int       to_move       = 0;
+    long long elems_moved   = 0;
+    long long total_vectors = 0;
+    const bool have_counts  = center_counts_.size() == ncenters_;
+    const bool have_prev    = partitions_.size() == ncenters_;
+    for (size_t i = 0; i < ncenters_; i++) {
+        const long long w = have_counts ? center_counts_[i] : 1;
+        total_vectors += w;
+        if (have_prev && new_partitions[i] != partitions_[i]) {
+            to_move++;
+            elems_moved += w;
+        }
     }
-    end = MPI_Wtime();
-    double partition_relabel = end-start;
+    const double weight_frac = total_vectors > 0
+        ? static_cast<double>(elems_moved) / total_vectors : 0.0;
+
+    std::cout << "TO MOVE: " << to_move << " / " << ncenters_
+              << "  weight_frac=" << weight_frac
+              << " (" << elems_moved << "/" << total_vectors << ")\n";
 
     std::cout << "[Coordinator] - meta hnsw time: " << hnsw_time << "\n";
     std::cout << "[Coordinator] - bottom layer graph build time: " << bottom_layer << "\n";
     std::cout << "[Coordinator] - bottom layer partition time: " << partition_time << "\n";
-    std::cout << "[Coordinator] - bottom layer relabel time: " << partition_relabel << "\n";
+    std::cout << "[Coordinator] - bottom layer edge cut: " << edge_cut
+              << " (" << edge_cut / double(adjncy.size() / 2) << " of edges)\n";
 
     if (out_hnsw_s)    *out_hnsw_s    = hnsw_time;
     if (out_bottom_s)  *out_bottom_s  = bottom_layer;
     if (out_kaffpa_s)  *out_kaffpa_s  = partition_time;
-    if (out_relabel_s) *out_relabel_s = partition_relabel;
+    // No relabeling under a warm start. Still reported so the results CSV keeps
+    // its column layout and runs resuming into an existing file stay aligned.
+    if (out_relabel_s) *out_relabel_s = 0.0;
 
     return to_move;
 }

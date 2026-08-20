@@ -124,8 +124,8 @@ public:
         int M_meta,
         double* out_hnsw_s    = nullptr,  // time to build new meta-HNSW
         double* out_bottom_s  = nullptr,  // time to extract bottom layer
-        double* out_kaffpa_s  = nullptr,  // time to run kaffpa
-        double* out_relabel_s = nullptr   // time to relabel partitions_
+        double* out_kaffpa_s  = nullptr,  // time to run kaffpa_warmstart
+        double* out_relabel_s = nullptr   // always 0: warm start needs no relabel
     );
 
     int rebuild(int world_size, int ef_construction, int M_meta, int full_threshold = 0, int partial_threshold = 0);
@@ -237,7 +237,6 @@ private:
     // building helpers
     int kmeans_(float* sample, size_t nPrime, size_t m_centers, float* centers, float EPSILON = 1e-4f);
     std::pair<std::vector<int>, std::vector<int>> get_bottom_layer_(hnswlib::HierarchicalNSW<float>* graph = nullptr);
-    std::pair<int, std::vector<int>> match_partitions_(const std::vector<int>& part1, const std::vector<int>& part2);
 
     // query helpers
     std::vector<size_t> get_partitions_for_search_branching_(float* vec, int branching_factor, float* dist = nullptr);

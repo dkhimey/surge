@@ -216,9 +216,10 @@ void kaffpa_warmstart(int* n,
         partition_config.seed = seed;
 
         if( !internal_input_partition_is_valid(part, *n, *nparts) ) {
-                if( !suppress_output ) {
-                        cout << "kaffpa_warmstart: invalid input partition, falling back to a cold run" << endl;
-                }
+                // Not gated on suppress_output: this fires at most once per call
+                // and the cold result is permuted relative to the input, which a
+                // caller relying on stable block ids has to know about.
+                cout << "kaffpa_warmstart: invalid input partition, falling back to a cold run" << endl;
                 internal_kaffpa_call(partition_config, suppress_output, n, vwgt, xadj, adjcwgt, adjncy, nparts, imbalance, false, edgecut, part, NULL);
                 return;
         }
