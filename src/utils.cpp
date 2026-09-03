@@ -64,7 +64,7 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"query_file",       "/dataset/big-ann-benchmarks/data/bigann-1B-clustered/query.public.10K.u8bin"},
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-1B-clustered/1000000000/runbook_bigann-1B-clustered.yaml"},
         }
-    }
+    },
 
     // ── Streaming datasets: MSTuring ─────────────────────────────────────────
     {"msturing-100M-clustered",
