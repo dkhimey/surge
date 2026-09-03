@@ -57,6 +57,14 @@ std::unordered_map<std::string, std::map<std::string, std::string>> DATASETS = {
             {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-500M-shift/500000000/runbook_bigann500Mshift.yaml/"},
         }
     },
+    {"bigann-1B-clustered",
+        {
+            {"base_file",        "/dataset/big-ann-benchmarks/data/bigann-1B-clustered/1B-bigann-clustered.u8bin"},
+            {"runbook",          "/dataset/big-ann-benchmarks/data/bigann-1B-clustered/runbook_bigann-1B-clustered.yaml"},
+            {"query_file",       "/dataset/big-ann-benchmarks/data/bigann-1B-clustered/query.public.10K.u8bin"},
+            {"ground_truth_dir", "/dataset/big-ann-benchmarks/data/bigann-1B-clustered/1000000000/runbook_bigann-1B-clustered.yaml"},
+        }
+    }
 
     // ── Streaming datasets: MSTuring ─────────────────────────────────────────
     {"msturing-100M-clustered",
