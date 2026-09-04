@@ -344,6 +344,13 @@ public:
     // Return active (non-deleted) elements in sub-HNSW
     size_t get_element_count() const;
 
+    // Raw hnswlib slot accounting, for memory reporting. get_slot_count()
+    // includes tombstones; get_max_elements() is the allocated capacity, which
+    // is what the graph actually costs in RAM.
+    size_t get_max_elements() const;
+    size_t get_slot_count() const;
+    size_t get_deleted_count() const;
+
     // Return fraction of deleted slots: num_deleted / getCurrentElementCount
     double get_tombstone_ratio() const;
 

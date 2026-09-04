@@ -2440,6 +2440,21 @@ size_t Executor::get_element_count() const {
     return (total > deleted) ? (total - deleted) : 0;
 }
 
+size_t Executor::get_max_elements() const {
+    std::shared_lock lock(graph_mutex_);
+    return sub_HNSW_ ? sub_HNSW_->getMaxElements() : 0;
+}
+
+size_t Executor::get_slot_count() const {
+    std::shared_lock lock(graph_mutex_);
+    return sub_HNSW_ ? sub_HNSW_->getCurrentElementCount() : 0;
+}
+
+size_t Executor::get_deleted_count() const {
+    std::shared_lock lock(graph_mutex_);
+    return sub_HNSW_ ? sub_HNSW_->getDeletedCount() : 0;
+}
+
 double Executor::get_tombstone_ratio() const {
     std::shared_lock lock(graph_mutex_);
     const size_t total   = sub_HNSW_->getCurrentElementCount();

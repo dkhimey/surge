@@ -20,13 +20,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -111,6 +114,32 @@ private:
     uint32_t   dim_    = 0;
     FileFormat format_;
 };
+
+// Resident set size of this process, in KiB. `cur` is the live RSS, `peak` the
+// high-water mark since the last reset_rss_peak() call. Both 0 if unreadable.
+static void read_rss_kb(unsigned long long& cur, unsigned long long& peak)
+{
+    cur = 0;
+    peak = 0;
+    std::ifstream st("/proc/self/status");
+    if (!st.is_open()) return;
+    std::string line;
+    while (std::getline(st, line)) {
+        if (line.compare(0, 6, "VmRSS:") == 0)
+            cur = std::strtoull(line.c_str() + 6, nullptr, 10);
+        else if (line.compare(0, 6, "VmHWM:") == 0)
+            peak = std::strtoull(line.c_str() + 6, nullptr, 10);
+    }
+}
+
+// Reset the kernel's RSS high-water mark so the next VmHWM reading is the peak
+// of one runbook step rather than of the whole run. Best-effort; a kernel that
+// rejects the write just leaves VmHWM monotonic.
+static void reset_rss_peak()
+{
+    std::ofstream cr("/proc/self/clear_refs");
+    if (cr.is_open()) cr << "5\n";
+}
 
 // Tuning parameters
 static constexpr int    NCENTERS             = 10000;
@@ -812,6 +841,44 @@ int main(int argc, char** argv)
             return std::vector<unsigned long long>(sizes.begin() + 1, sizes.end());
         };
 
+        // Per-rank memory report, printed after every insert / delete step.
+        auto report_memory = [&](int step_num, const std::string& op) {
+            unsigned long long rss = 0, peak = 0;
+            read_rss_kb(rss, peak);
+            std::vector<unsigned long long> all_rss, all_peak, all_max, all_cur, all_del;
+            comm.gather_sizes(rss,   all_rss,  world_size);
+            comm.gather_sizes(peak,  all_peak, world_size);
+            comm.gather_sizes(0ULL,  all_max,  world_size);
+            comm.gather_sizes(0ULL,  all_cur,  world_size);
+            comm.gather_sizes(0ULL,  all_del,  world_size);
+
+            constexpr double KIB_PER_GIB = 1024.0 * 1024.0;
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(2);
+            out << "[Mem] step " << step_num << " after " << op << "\n";
+            double rss_total = 0.0, peak_max = 0.0;
+            for (int r = 0; r < world_size; r++) {
+                const double g = static_cast<double>(all_rss[r])  / KIB_PER_GIB;
+                const double h = static_cast<double>(all_peak[r]) / KIB_PER_GIB;
+                rss_total += g;
+                peak_max = std::max(peak_max, h);
+                out << "[Mem]   rank " << std::setw(2) << r
+                    << (r == 0 ? " coord " : " shard ")
+                    << " rss=" << std::setw(7) << g << "G"
+                    << " peak=" << std::setw(7) << h << "G";
+                if (r > 0) {
+                    // Capacity, not live count, is what the graph costs in RAM.
+                    out << " slots=" << all_cur[r] << "/" << all_max[r]
+                        << " tomb=" << all_del[r];
+                }
+                out << "\n";
+            }
+            out << "[Mem]   cluster rss=" << rss_total
+                << "G  worst-rank peak=" << peak_max << "G\n";
+            std::cout << out.str() << std::flush;
+            reset_rss_peak();
+        };
+
         // Update routing state after rebuild
         auto sync_routing_after_rebuild = [&]() {
             routing_hnsw       = metaIndex.get_meta_hnsw();
@@ -1081,6 +1148,7 @@ int main(int argc, char** argv)
                     write_row(step.step_num, "rebuild", "", -1.0f, -1, -1,
                               total_rb_s, -1.0, -1.0, -1.0, -1.0, rb_stats, sizes);
                 }
+                report_memory(step.step_num, "insert");
 
             } else if (step.operation == "delete") {
                 const int n_delete = step.end - step.start;
@@ -1244,6 +1312,7 @@ int main(int argc, char** argv)
                     write_row(step.step_num, "rebuild", "", -1.0f, -1, -1,
                               total_rb_s, -1.0, -1.0, -1.0, -1.0, rb_stats, sizes);
                 }
+                report_memory(step.step_num, "delete");
 
             } else if (step.operation == "search") {
                 std::cout << "[Sweep] Step " << step.step_num
@@ -1730,6 +1799,19 @@ int main(int argc, char** argv)
             comm.gather_sizes(my_size);
         }
 
+        // Contribute-only half of the coordinator's report_memory. The five
+        // gathers must stay in the same order as there.
+        auto report_memory = [&]() {
+            unsigned long long rss = 0, peak = 0;
+            read_rss_kb(rss, peak);
+            comm.gather_sizes(rss);
+            comm.gather_sizes(peak);
+            comm.gather_sizes(static_cast<unsigned long long>(subIndex.get_max_elements()));
+            comm.gather_sizes(static_cast<unsigned long long>(subIndex.get_slot_count()));
+            comm.gather_sizes(static_cast<unsigned long long>(subIndex.get_deleted_count()));
+            reset_rss_peak();
+        };
+
         // Helper: sync label_to_shard after rebuild
         auto sync_label_to_shard_after_rebuild_exec = [&]() {
             const auto& arrived = subIndex.get_last_rebuild_moved_labels();
@@ -1925,6 +2007,7 @@ int main(int argc, char** argv)
                     unsigned long long my_size = subIndex.get_element_count();
                     comm.gather_sizes(my_size);
                 }
+                report_memory();
 
             } else if (op_code == 1) {
                 const int n_delete = range_end - range_start;
@@ -2029,6 +2112,7 @@ int main(int argc, char** argv)
                     unsigned long long my_size = subIndex.get_element_count();
                     comm.gather_sizes(my_size);
                 }
+                report_memory();
 
             // SEARCH (executor side of sweep loop)
             } else if (op_code == 2) {
