@@ -132,6 +132,19 @@ static void read_rss_kb(unsigned long long& cur, unsigned long long& peak)
     }
 }
 
+// Confirms a rebuild honored full-only mode: every shard must have reconstructed.
+// Prints a warning instead of the confirmation if any shard did a delta.
+static void confirm_rebuild_strategy(int step_num, const std::string& rebuild_type, bool full_only)
+{
+    if (!full_only) return;
+    if (rebuild_type == "full")
+        std::cout << "[Sweep] Step " << step_num
+                  << "  CONFIRMED: full rebuild on all shards (delta disabled)\n";
+    else
+        std::cerr << "[Sweep] Step " << step_num
+                  << "  WARNING: full-only mode but rebuild_type=" << rebuild_type << "\n";
+}
+
 // Reset the kernel's RSS high-water mark so the next VmHWM reading is the peak
 // of one runbook step rather than of the whole run. Best-effort; a kernel that
 // rejects the write just leaves VmHWM monotonic.
@@ -419,7 +432,11 @@ int main(int argc, char** argv)
             << "  --delete-policy <tombstone|wolverine>  (default: tombstone)\n"
             << "\n"
             << "  --warm-start   Warm-start KaHIP from the current partitioning at each\n"
-            << "                 repartition (default: off, i.e. cold kaffpa + relabeling).\n";
+            << "                 repartition (default: off, i.e. cold kaffpa + relabeling).\n"
+            << "\n"
+            << "  --allow-delta  Let each shard choose between a full rebuild and an in-place\n"
+            << "                 delta rebuild by turnover (default: every shard always\n"
+            << "                 reconstructs its graph from scratch; delta is never used).\n";
         return 1;
     }
 
@@ -441,6 +458,7 @@ int main(int argc, char** argv)
     // Delete policy flag
     std::string delete_policy_arg    = "tombstone";
     bool        warm_start_arg       = false;
+    bool        allow_delta          = false;
     for (int ai = 7; ai < argc; ++ai) {
         const std::string a = argv[ai];
         if      (a == "--init-state-dir"   && ai + 1 < argc) init_state_dir       = argv[++ai];
@@ -451,6 +469,8 @@ int main(int argc, char** argv)
                   a == "--search-fractions") && ai + 1 < argc) search_fractions_arg = argv[++ai];
         else if (a == "--delete-policy"    && ai + 1 < argc) delete_policy_arg    = argv[++ai];
         else if (a == "--warm-start")                        warm_start_arg       = true;
+        else if (a == "--allow-delta")                       allow_delta          = true;
+        else if (a == "--full-rebuilds-only")                allow_delta          = false;  // now the default
         else {
             std::cerr << "ERROR: unrecognised or incomplete argument: " << a << "\n";
             return 1;
@@ -576,6 +596,9 @@ int main(int argc, char** argv)
                                                                    : "tombstone (markDelete, rebuild-on-threshold)")
                       << "\n";
             std::cout << "[Sweep] KaHIP warm start: " << (warm_start_arg ? "on" : "off") << "\n";
+            std::cout << "[Sweep] rebuild strategy: "
+                      << (allow_delta ? "adaptive (per-shard full/delta, --allow-delta)"
+                                      : "FULL ONLY -- delta rebuilds disabled") << "\n";
             std::cout << "[Sweep] search variants (update_vecs=" << update_vecs
                       << ", search_steps=" << n_search_steps
                       << ", nq_orig=" << nq_orig << "):\n";
@@ -1108,6 +1131,7 @@ int main(int argc, char** argv)
                             (full_recv == 0)      ? "delta"
                           : (full_recv == n_exec) ? "full"
                           : ("mixed_" + std::to_string(full_recv) + "full");
+                        confirm_rebuild_strategy(step.step_num, rb_stats.rebuild_type, !allow_delta);
                     }
 
                     // Per-shard breakdown (index 0 = coordinator dummy, dropped).
@@ -1272,6 +1296,7 @@ int main(int argc, char** argv)
                             (full_recv == 0)      ? "delta"
                           : (full_recv == n_exec) ? "full"
                           : ("mixed_" + std::to_string(full_recv) + "full");
+                        confirm_rebuild_strategy(step.step_num, rb_stats.rebuild_type, !allow_delta);
                     }
 
                     // Per-shard breakdown (index 0 = coordinator dummy, dropped).
@@ -1754,7 +1779,7 @@ int main(int argc, char** argv)
     } else {
 
         Executor subIndex(rank, dim, comm);
-        // Disables replace_deleted slot reuse; required before build()/load().
+        subIndex.set_force_full_rebuild(!allow_delta);
 
         if (!resuming) {
             // Receive initial vectors and build shard

@@ -325,6 +325,10 @@ public:
     // Batch delete with shared lock (thread-safe per-element in hnswlib)
     void mark_delete_local_batch(const std::vector<int>& labels);
 
+    // When enabled, rebuild_adaptive always reconstructs the shard from scratch
+    // instead of choosing between a full and an in-place delta rebuild.
+    void set_force_full_rebuild(bool enabled) { force_full_rebuild_ = enabled; }
+
     // --- Wolverine-style physical delete + edge repair -----------------
     void patch_delete_local(int label,
                           int deleteModel = HNSW_DEFAULT_DELETE_MODEL,
@@ -468,6 +472,8 @@ private:
     Communicator& comm_;
 
     hnswlib::HierarchicalNSW<float>* sub_HNSW_ = nullptr;
+
+    bool force_full_rebuild_ = false;   // see set_force_full_rebuild()
 
     mutable std::shared_mutex graph_mutex_;
     // when inserting, each thread holds the shared lock, when swapping hnsw in final step, get exclusive lock

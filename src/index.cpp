@@ -2318,7 +2318,7 @@ void Executor::rebuild_adaptive(
     // delta (which inserts into a bloated graph and leaves tombstones behind).
     const double denom = static_cast<double>(std::max<size_t>(kept + arrived, 1));
     const double churn = static_cast<double>(arrived + departed + tomb_before) / denom;
-    const bool   do_full = churn >= FULL_REBUILD_SLOT_THRESHOLD;
+    const bool   do_full = force_full_rebuild_ || churn >= FULL_REBUILD_SLOT_THRESHOLD;
 
     if (do_full) apply_full_rebuild(mig, ef_construction, M_sub, num_building_threads);
     else         apply_delta_rebuild(mig, num_building_threads);
@@ -2547,7 +2547,7 @@ void Executor::insert_local_batch(const std::vector<float>& vecs,
 
     // Phase 2: parallel inserts under shared lock.
     // replace_deleted reuses tombstone slots from prior stream-deletes before
-    // allocating new capacity (disabled under Wolverine). hnswlib addPoint is internally
+    // allocating new capacity. hnswlib addPoint is internally
     // thread-safe (per-element locks and deleted_elements_lock for slot
     // selection), so concurrent calls on distinct labels are safe here.
     std::shared_lock<std::shared_mutex> lk(graph_mutex_);
