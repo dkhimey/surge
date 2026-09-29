@@ -618,15 +618,7 @@ int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     double imbalance = KAFFPA_IMBALANCE;
     int seed = gen_();
 
-    // Balance vectors, not centroids: weight each centroid by its live vector
-    // count so KaHIP equalizes the sum of weights (= vectors per worker) to within
-    // KAFFPA_IMBALANCE. Under clustered/shifting data, equal centroid counts leave
-    // one worker holding several times the mean (the rebuild/search straggler).
-    // center_counts_ is maintained exactly by the incremental updates and indexed
-    // by centroid id, same as the graph nodes.
-    std::vector<int> vwgt(ncenters_);
-    for (size_t i = 0; i < ncenters_; i++)
-        vwgt[i] = std::max(center_counts_[i], 1);   // KaHIP requires positive weights
+    std::vector<int> vwgt(ncenters_, 1);
 
     int    to_move        = 0;
     double partition_time = 0.0;
