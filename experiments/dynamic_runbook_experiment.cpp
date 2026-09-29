@@ -416,7 +416,10 @@ int main(int argc, char** argv)
             << "  center-movement threshold is not met (see --delete-policy below: under\n"
             << "  wolverine, this tombstone-forced check is disabled).\n"
             << "\n"
-            << "  --delete-policy <tombstone|wolverine>  (default: tombstone)\n";
+            << "  --delete-policy <tombstone|wolverine>  (default: tombstone)\n"
+            << "\n"
+            << "  --warm-start   Warm-start KaHIP from the current partitioning at each\n"
+            << "                 repartition (default: off, i.e. cold kaffpa + relabeling).\n";
         return 1;
     }
 
@@ -437,6 +440,7 @@ int main(int argc, char** argv)
     std::string search_fractions_arg;
     // Delete policy flag
     std::string delete_policy_arg    = "tombstone";
+    bool        warm_start_arg       = false;
     for (int ai = 7; ai < argc; ++ai) {
         const std::string a = argv[ai];
         if      (a == "--init-state-dir"   && ai + 1 < argc) init_state_dir       = argv[++ai];
@@ -446,6 +450,7 @@ int main(int argc, char** argv)
         else if ((a == "--search-fraction" ||
                   a == "--search-fractions") && ai + 1 < argc) search_fractions_arg = argv[++ai];
         else if (a == "--delete-policy"    && ai + 1 < argc) delete_policy_arg    = argv[++ai];
+        else if (a == "--warm-start")                        warm_start_arg       = true;
         else {
             std::cerr << "ERROR: unrecognised or incomplete argument: " << a << "\n";
             return 1;
@@ -570,6 +575,7 @@ int main(int argc, char** argv)
                       << (delete_policy == DeletePolicy::Wolverine ? "wolverine (patchDelete, edge repair)"
                                                                    : "tombstone (markDelete, rebuild-on-threshold)")
                       << "\n";
+            std::cout << "[Sweep] KaHIP warm start: " << (warm_start_arg ? "on" : "off") << "\n";
             std::cout << "[Sweep] search variants (update_vecs=" << update_vecs
                       << ", search_steps=" << n_search_steps
                       << ", nq_orig=" << nq_orig << "):\n";
@@ -626,6 +632,7 @@ int main(int argc, char** argv)
         const int init_n     = init.end - init.start;
 
         Coordinator metaIndex(dim, &comm);
+        metaIndex.set_warm_start(warm_start_arg);
 
         if (!resuming && use_init_state) {
             std::cout << "[Sweep] Loading starting state from cluster analysis: "

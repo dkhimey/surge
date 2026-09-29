@@ -102,6 +102,10 @@ public:
     double get_cached_repart_kaffpa_s()  const { return cached_repart_kaffpa_s_; }
     double get_cached_repart_relabel_s() const { return cached_repart_relabel_s_; }
 
+    // Warm-start KaHIP from the current partitioning on repartition (default off:
+    // cold kaffpa run followed by relabeling to maximize overlap).
+    void set_warm_start(bool enabled) { warm_start_ = enabled; }
+
     void load_gp(const std::string& prefix, int ef_search);
     void set_ef_search(int ef_search);
 
@@ -124,8 +128,8 @@ public:
         int M_meta,
         double* out_hnsw_s    = nullptr,  // time to build new meta-HNSW
         double* out_bottom_s  = nullptr,  // time to extract bottom layer
-        double* out_kaffpa_s  = nullptr,  // time to run kaffpa_warmstart
-        double* out_relabel_s = nullptr   // always 0: warm start needs no relabel
+        double* out_kaffpa_s  = nullptr,  // time to run kaffpa / kaffpa_warmstart
+        double* out_relabel_s = nullptr   // time to relabel partitions (0 under warm start)
     );
 
     int rebuild(int world_size, int ef_construction, int M_meta, int full_threshold = 0, int partial_threshold = 0);
@@ -237,6 +241,7 @@ private:
     // building helpers
     int kmeans_(float* sample, size_t nPrime, size_t m_centers, float* centers, float EPSILON = 1e-4f);
     std::pair<std::vector<int>, std::vector<int>> get_bottom_layer_(hnswlib::HierarchicalNSW<float>* graph = nullptr);
+    std::pair<int, std::vector<int>> match_partitions_(const std::vector<int>& part1, const std::vector<int>& part2);
 
     // query helpers
     std::vector<size_t> get_partitions_for_search_branching_(float* vec, int branching_factor, float* dist = nullptr);
@@ -260,6 +265,7 @@ private:
     double                           cached_repart_bottom_s_ = 0.0; // time to extract bottom layer
     double                           cached_repart_kaffpa_s_ = 0.0; // time to run kaffpa
     double                           cached_repart_relabel_s_= 0.0; // time for partition relabeling
+    bool                             warm_start_             = false; // see set_warm_start()
 
     // during insert, check if rebuild is already in progress, if so, just add to rebuild log
     std::atomic<bool> rebuild_pending_ = false; // indicates a rebuild must occur after the current one
