@@ -302,11 +302,6 @@ public:
     std::string save(const std::string& prefix);
     void set_ef_search(int ef_search);
 
-    // Wolverine physical deletes (patchDelete) sever edges and free slots, which
-    // is incompatible with hnswlib's replace_deleted slot-reuse machinery. When
-    // enabled, sub_HNSW_ is built with allow_replace_deleted off and inserts skip
-    // replace_deleted. Must be set before build()/load().
-    void set_wolverine_deletes(bool enabled) { wolverine_deletes_ = enabled; }
 
     void search(size_t k, int tag);
     void insert(int tag);
@@ -467,10 +462,6 @@ private:
     Communicator& comm_;
 
     hnswlib::HierarchicalNSW<float>* sub_HNSW_ = nullptr;
-
-    // Delete policy: true routes deletes through patchDelete and disables
-    // replace_deleted slot reuse (see set_wolverine_deletes).
-    bool wolverine_deletes_ = false;
 
     mutable std::shared_mutex graph_mutex_;
     // when inserting, each thread holds the shared lock, when swapping hnsw in final step, get exclusive lock

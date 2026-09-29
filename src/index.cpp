@@ -1762,13 +1762,13 @@ void Executor::build(
     std::cout << "[Executor " << node_id_ << " ] Building local sub-index\n";
     double start = MPI_Wtime();
     float* norm_element = new float[dim_];
-    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, data_count_, M_sub, ef_construction, 100, /*allow_replace_deleted=*/!wolverine_deletes_);
-    sub_HNSW_->addPoint(data_, indices_[0], /*replace_deleted=*/!wolverine_deletes_); // first element not thread safe
+    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, data_count_, M_sub, ef_construction, 100, /*allow_replace_deleted=*/true);
+    sub_HNSW_->addPoint(data_, indices_[0], /*replace_deleted=*/true); // first element not thread safe
     omp_set_num_threads(num_building_threads);
     std::cout << "[Executor " << node_id_ << "] - num threads building index: " << num_building_threads << "/"  << omp_get_max_threads() << "\n";
     #pragma omp parallel for num_threads(num_building_threads)
     for (int j = 1; j < data_count_; j++) {
-        sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/!wolverine_deletes_);
+        sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/true);
     }
 
     delete[] norm_element;
@@ -1871,7 +1871,7 @@ void Executor::partial_rebuild(
     for (int i = 0; i < total_recv; i++) {
         float* vec = all_recv_vectors.data() + (i * dim_);
         int index = all_recv_labels[i];
-        sub_HNSW_->addPoint(vec, index, /*replace_deleted=*/!wolverine_deletes_);
+        sub_HNSW_->addPoint(vec, index, /*replace_deleted=*/true);
     }
 
     sub_HNSW_->setEf(ef_construction);
@@ -1990,10 +1990,16 @@ Executor::MigrantExchange Executor::exchange_migrants(
         recv_vdispls[p] = recv_vdispls[p-1] + recv_counts[p-1];
     }
 
+    // Append and release each per-destination buffer in turn. Holding all of
+    // send_vecs alive alongside the flattened copy doubles the departing set
+    // (dim_ floats per migrant) at exactly the point arrived_vectors is being
+    // allocated, which is the peak of a full rebuild.
     std::vector<float> flat_send_vecs;
     { size_t tot = 0; for (auto& b : send_vecs) tot += b.size(); flat_send_vecs.reserve(tot); }
-    for (int p = 0; p < world_size; p++)
+    for (int p = 0; p < world_size; p++) {
         flat_send_vecs.insert(flat_send_vecs.end(), send_vecs[p].begin(), send_vecs[p].end());
+        std::vector<float>().swap(send_vecs[p]);
+    }
 
     // Counts/displacements are in vec_type units (= whole vectors), so reuse the
     // element counts directly instead of the dim_-scaled versions.
@@ -2001,6 +2007,7 @@ Executor::MigrantExchange Executor::exchange_migrants(
     comm_.all_to_all_v_flat(flat_send_vecs, num_to_send, send_vdispls,
                             result.arrived_vectors, recv_counts, recv_vdispls, vec_type);
     MPI_Type_free(&vec_type);
+    std::vector<float>().swap(flat_send_vecs);   // outbound copy is done with
 
     // Round 3: labels.
     std::vector<int> send_ldispls(world_size, 0), recv_ldispls(world_size, 0);
@@ -2009,10 +2016,13 @@ Executor::MigrantExchange Executor::exchange_migrants(
         recv_ldispls[p] = recv_ldispls[p-1] + recv_counts[p-1];
     }
 
+    // Same release-as-you-go as the vector round; num_to_send was captured above.
     std::vector<int> flat_send_labels;
     { size_t tot = 0; for (auto& b : send_labels) tot += b.size(); flat_send_labels.reserve(tot); }
-    for (int p = 0; p < world_size; p++)
+    for (int p = 0; p < world_size; p++) {
         flat_send_labels.insert(flat_send_labels.end(), send_labels[p].begin(), send_labels[p].end());
+        std::vector<int>().swap(send_labels[p]);
+    }
 
     result.arrived_labels.assign(total_recv, 0);
     comm_.all_to_all_v_flat(flat_send_labels, num_to_send, send_ldispls,
@@ -2034,7 +2044,7 @@ void Executor::apply_full_rebuild(MigrantExchange& mig, int ef_construction, int
 
     hnswlib::HierarchicalNSW<float>* next_sub_HNSW =
         new hnswlib::HierarchicalNSW<float>(space_, kept_count + total_recv,
-                                            M_sub, ef_construction, 100, /*allow_replace_deleted=*/!wolverine_deletes_);
+                                            M_sub, ef_construction, 100, /*allow_replace_deleted=*/true);
 
     double start_hnsw = MPI_Wtime();
 
@@ -2043,21 +2053,21 @@ void Executor::apply_full_rebuild(MigrantExchange& mig, int ef_construction, int
     size_t kept_start = 0;
     int    arr_start  = 0;
     if (kept_count > 0) {
-        next_sub_HNSW->addPoint(mig.kept_vectors[0], mig.kept_labels[0], /*replace_deleted=*/!wolverine_deletes_);
+        next_sub_HNSW->addPoint(mig.kept_vectors[0], mig.kept_labels[0], /*replace_deleted=*/true);
         kept_start = 1;
     } else if (total_recv > 0) {
-        next_sub_HNSW->addPoint(mig.arrived_vectors.data(), mig.arrived_labels[0], /*replace_deleted=*/!wolverine_deletes_);
+        next_sub_HNSW->addPoint(mig.arrived_vectors.data(), mig.arrived_labels[0], /*replace_deleted=*/true);
         arr_start = 1;
     }
 
     #pragma omp parallel for num_threads(num_building_threads)
     for (size_t i = kept_start; i < kept_count; i++)
-        next_sub_HNSW->addPoint(mig.kept_vectors[i], mig.kept_labels[i], /*replace_deleted=*/!wolverine_deletes_);
+        next_sub_HNSW->addPoint(mig.kept_vectors[i], mig.kept_labels[i], /*replace_deleted=*/true);
 
     #pragma omp parallel for num_threads(num_building_threads)
     for (int i = arr_start; i < total_recv; i++)
         next_sub_HNSW->addPoint(mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
-                                mig.arrived_labels[i], /*replace_deleted=*/!wolverine_deletes_);
+                                mig.arrived_labels[i], /*replace_deleted=*/true);
     double end_hnsw = MPI_Wtime();
 
     next_sub_HNSW->setEf(ef_construction);
@@ -2104,15 +2114,14 @@ void Executor::apply_delta_rebuild(MigrantExchange& mig, int num_building_thread
         for (int i = 0; i < total_recv; i++)
             sub_HNSW_->addPoint(mig.arrived_vectors.data() + static_cast<size_t>(i) * dim_,
                                 static_cast<hnswlib::labeltype>(mig.arrived_labels[i]),
-                                /*replace_deleted=*/!wolverine_deletes_);
+                                /*replace_deleted=*/true);
     }
     double end_hnsw = MPI_Wtime();
 
-    // Tombstone slots still sitting in the graph. num_deleted_ is authoritative in
-    // both policies; under replace_deleted (tombstone) deleted_elements mirrors it,
-    // whereas under Wolverine (allow_replace_deleted off) deleted_elements is unused.
+    // Tombstone slots still sitting in the graph. Both policies now run with
+    // allow_replace_deleted on, so deleted_elements mirrors num_deleted_ in each.
     size_t remaining_deleted = sub_HNSW_->num_deleted_.load();
-    if (!wolverine_deletes_) {
+    {
         std::lock_guard<std::mutex> del_lock(sub_HNSW_->deleted_elements_lock);
         assert(remaining_deleted == sub_HNSW_->deleted_elements.size() &&
                "deleted_elements.size() and num_deleted_ out of sync");
@@ -2494,7 +2503,7 @@ void Executor::insert_local_batch(const std::vector<float>& vecs,
     std::shared_lock<std::shared_mutex> lk(graph_mutex_);
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < incoming; i++)
-        sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/!wolverine_deletes_);
+        sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/true);
 }
 
 // Mark a single vector deleted without MPI.  Ignores labels not present in
@@ -2620,7 +2629,7 @@ void Executor::insert_batch(size_t num_vecs, int tag) {
             sub_HNSW_->resizeIndex((current + num_vecs) * 2);
         }
         for (size_t i = 0; i < num_vecs; i++) {
-            sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/!wolverine_deletes_);
+            sub_HNSW_->addPoint(vecs.data() + i * dim_, labels[i], /*replace_deleted=*/true);
         }
     }
 
@@ -2636,7 +2645,7 @@ void Executor::insert(int tag) {
         std::shared_lock read_lock(graph_mutex_);
         // +1 because we're about to add one element
         if (sub_HNSW_->getCurrentElementCount() + INSERT_CAPACITY_SLACK <= sub_HNSW_->getMaxElements()) {
-            sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/!wolverine_deletes_);
+            sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/true);
 
             comm_.send_ack(INSERT_SUCCESS, 0, tag);
             return;
@@ -2654,7 +2663,7 @@ void Executor::insert(int tag) {
     // After resize, safe to add. Acquire shared lock again
     {
         std::shared_lock read_lock(graph_mutex_);
-        sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/!wolverine_deletes_);
+        sub_HNSW_->addPoint(insert_vector, label, /*replace_deleted=*/true);
     }
     comm_.send_ack(INSERT_SUCCESS, 0, tag);
 }
@@ -2732,6 +2741,6 @@ void Executor::load(const std::string& prefix, int ef_search) {
     std::string hnsw_path = prefix + suffix;
 
     std::cout << "[Executor " << node_id_ << " ] Loading sub-HNSW from: " << hnsw_path << "\n";
-    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path, false, 0, /*allow_replace_deleted=*/!wolverine_deletes_);
+    sub_HNSW_ = new hnswlib::HierarchicalNSW<float>(space_, hnsw_path, false, 0, /*allow_replace_deleted=*/true);
     sub_HNSW_->setEf(ef_search);
 }

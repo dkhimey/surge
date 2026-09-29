@@ -1044,6 +1044,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // else add point to vacant place
         if (!is_vacant_place) {
             addPoint(data_point, label, -1);
+        } else if (isPhysicallyDeleted(internal_id_replaced)) {
+            // patchDelete emptied this slot, so updatePoint's neighbourhood-repair
+            // half has nothing to work from and its level is stuck at 0. Link the
+            // point in from scratch instead. No ghost-label cleanup is needed:
+            // patchDelete already erased the old label, and reviveSlot only writes
+            // the new one, so a live entry for the old label (re-inserted since)
+            // is left untouched.
+            reviveSlot(data_point, label, internal_id_replaced);
         } else {
             // we assume that there are no concurrent operations on deleted element
             labeltype label_replaced = getExternalLabel(internal_id_replaced);
@@ -1265,6 +1273,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             label_lookup_[label] = cur_c;
         }
 
+        return linkElementIntoGraph(data_point, label, cur_c, level);
+    }
+
+
+    // Draw a level for `cur_c`, allocate its upper-level lists, write the vector
+    // and label into the slot, and link it into the graph from scratch.
+    //
+    // The slot must hold no live edges: level-0 list count 0, linkLists_ null,
+    // and no in-edges anywhere. A never-used slot and a patchDelete'd slot both
+    // satisfy this, which is what lets reviveSlot share this path with addPoint.
+    // `level` < 0 draws a random level; > 0 forces one.
+    tableint linkElementIntoGraph(const void *data_point, labeltype label, tableint cur_c, int level) {
         std::unique_lock <std::mutex> lock_el(link_list_locks_[cur_c]);
         int curlevel = getRandomLevel(mult_);
         if (level > 0)
@@ -1346,6 +1366,27 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             maxlevel_ = curlevel;
         }
         return cur_c;
+    }
+
+    // Re-use a slot emptied by patchDelete for a new point.
+    //
+    // patchDelete leaves the slot in the same blank state as a never-used one
+    // (upper lists freed, level-0 count zeroed, every in-edge stripped, label
+    // erased from label_lookup_), so the new point is linked in by the ordinary
+    // insert path rather than by updatePoint. That matters: updatePoint keeps
+    // element_levels_[internalId], which patchDelete set to 0, so recycling
+    // through it would pin every reused slot to level 0 and flatten the
+    // hierarchy over sustained churn. Here the level is drawn afresh.
+    tableint reviveSlot(const void *data_point, labeltype label, tableint internalId) {
+        {
+            std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+            label_lookup_[label] = internalId;
+        }
+        // Before linkElementIntoGraph memsets the slot: this is what keeps
+        // num_deleted_ in step (the memset would otherwise silently clear the
+        // tombstone bits behind its back).
+        unmarkDeletedInternal(internalId);
+        return linkElementIntoGraph(data_point, label, internalId, -1);
     }
 
 
