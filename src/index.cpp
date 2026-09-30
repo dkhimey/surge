@@ -618,7 +618,12 @@ int Coordinator::repartition(std::vector<int>& new_partitions, hnswlib::Hierarch
     double imbalance = KAFFPA_IMBALANCE;
     int seed = gen_();
 
+    // Unit weights balance centers per worker; vector-count weights balance stored
+    // data but can pack a query-hot cluster onto one worker.
     std::vector<int> vwgt(ncenters_, 1);
+    if (weighted_partitioning_)
+        for (size_t i = 0; i < ncenters_; i++)
+            vwgt[i] = std::max(center_counts_[i], 1);   // KaHIP requires positive weights
 
     int    to_move        = 0;
     double partition_time = 0.0;
@@ -878,7 +883,7 @@ int Coordinator::check_need_rebuild(int full_threshold, int partial_threshold,
                                     &cached_repart_bottom_s_,
                                     &cached_repart_kaffpa_s_,
                                     &cached_repart_relabel_s_);
-    (void) to_move;  // superseded by weight_frac below; repartition() still logs it.
+    (void) to_move;  // superseded by moved_frac below; repartition() still logs it.
 
     // centers/elems: what would move under the fresh partitioning; total_vectors: live count.
     int       centers       = 0;
@@ -892,18 +897,23 @@ int Coordinator::check_need_rebuild(int full_threshold, int partial_threshold,
         }
     }
 
-    // Gate on vector-weight fraction, not raw centroid-count fraction: a few
-    // high-weight centroids can carry most of an imbalance without crossing a
-    // count-based threshold. full_threshold/partial_threshold stay expressed
-    // in centroids-out-of-ncenters_ for CLI compat; convert to a fraction and
-    // apply it to weight instead.
+    // Thresholds are in centroids-out-of-ncenters_. Unweighted: compare against the
+    // fraction of centers that would move. Weighted: apply the same fraction to the
+    // share of live vectors that would move, matching what KaHIP balanced.
     const double full_frac    = static_cast<double>(full_threshold)    / static_cast<double>(ncenters_);
     const double partial_frac = static_cast<double>(partial_threshold) / static_cast<double>(ncenters_);
     const double weight_frac  = total_vectors > 0
         ? static_cast<double>(elems) / static_cast<double>(total_vectors)
         : 0.0;
+    const double center_frac  = static_cast<double>(centers) / static_cast<double>(ncenters_);
+    const double moved_frac   = weighted_partitioning_ ? weight_frac : center_frac;
 
-    if (weight_frac < full_frac && weight_frac < partial_frac) {
+    std::cout << "[Coordinator] rebuild check: centers_moved=" << centers << "/" << ncenters_
+              << "  weight_frac=" << weight_frac
+              << "  trigger=" << (weighted_partitioning_ ? "weight_frac" : "center_frac")
+              << " " << moved_frac << " vs " << full_frac << "\n";
+
+    if (moved_frac < full_frac && moved_frac < partial_frac) {
         delete new_meta;
         return 0;
     }
@@ -921,7 +931,7 @@ int Coordinator::check_need_rebuild(int full_threshold, int partial_threshold,
         cached_hnsw_buffer_.assign(std::istreambuf_iterator<char>(f), {});
     }
 
-    cached_rebuild_type_ = (weight_frac >= full_frac) ? 1 : 2;
+    cached_rebuild_type_ = (moved_frac >= full_frac) ? 1 : 2;
     return cached_rebuild_type_;
 }
 

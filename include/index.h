@@ -106,6 +106,11 @@ public:
     // cold kaffpa run followed by relabeling to maximize overlap).
     void set_warm_start(bool enabled) { warm_start_ = enabled; }
 
+    // Weight KaHIP vertices by live vector count on repartition, and gate rebuilds
+    // on the fraction of vectors that would move (default off: unit weights, and
+    // rebuilds gated on the number of centers that would move).
+    void set_weighted_partitioning(bool enabled) { weighted_partitioning_ = enabled; }
+
     void load_gp(const std::string& prefix, int ef_search);
     void set_ef_search(int ef_search);
 
@@ -266,6 +271,7 @@ private:
     double                           cached_repart_kaffpa_s_ = 0.0; // time to run kaffpa
     double                           cached_repart_relabel_s_= 0.0; // time for partition relabeling
     bool                             warm_start_             = false; // see set_warm_start()
+    bool                             weighted_partitioning_  = false; // see set_weighted_partitioning()
 
     // during insert, check if rebuild is already in progress, if so, just add to rebuild log
     std::atomic<bool> rebuild_pending_ = false; // indicates a rebuild must occur after the current one

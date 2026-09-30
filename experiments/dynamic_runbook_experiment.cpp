@@ -434,6 +434,11 @@ int main(int argc, char** argv)
             << "  --warm-start   Warm-start KaHIP from the current partitioning at each\n"
             << "                 repartition (default: off, i.e. cold kaffpa + relabeling).\n"
             << "\n"
+            << "  --weighted-partitioning  Weight each center by its live vector count at\n"
+            << "                 repartition, and trigger rebuilds on the fraction of vectors\n"
+            << "                 that would move (default: off, i.e. unit weights, and rebuilds\n"
+            << "                 trigger once >= full_threshold centers would move).\n"
+            << "\n"
             << "  --allow-delta  Let each shard choose between a full rebuild and an in-place\n"
             << "                 delta rebuild by turnover (default: every shard always\n"
             << "                 reconstructs its graph from scratch; delta is never used).\n";
@@ -458,6 +463,7 @@ int main(int argc, char** argv)
     // Delete policy flag
     std::string delete_policy_arg    = "tombstone";
     bool        warm_start_arg       = false;
+    bool        weighted_partitioning = false;
     bool        allow_delta          = false;
     for (int ai = 7; ai < argc; ++ai) {
         const std::string a = argv[ai];
@@ -469,6 +475,7 @@ int main(int argc, char** argv)
                   a == "--search-fractions") && ai + 1 < argc) search_fractions_arg = argv[++ai];
         else if (a == "--delete-policy"    && ai + 1 < argc) delete_policy_arg    = argv[++ai];
         else if (a == "--warm-start")                        warm_start_arg       = true;
+        else if (a == "--weighted-partitioning")             weighted_partitioning = true;
         else if (a == "--allow-delta")                       allow_delta          = true;
         else if (a == "--full-rebuilds-only")                allow_delta          = false;  // now the default
         else {
@@ -596,6 +603,10 @@ int main(int argc, char** argv)
                                                                    : "tombstone (markDelete, rebuild-on-threshold)")
                       << "\n";
             std::cout << "[Sweep] KaHIP warm start: " << (warm_start_arg ? "on" : "off") << "\n";
+            std::cout << "[Sweep] partitioning: "
+                      << (weighted_partitioning ? "weighted by vector count (rebuild trigger: vector fraction moved)"
+                                                : "unweighted (rebuild trigger: centers moved)")
+                      << "\n";
             std::cout << "[Sweep] rebuild strategy: "
                       << (allow_delta ? "adaptive (per-shard full/delta, --allow-delta)"
                                       : "FULL ONLY -- delta rebuilds disabled") << "\n";
@@ -656,6 +667,7 @@ int main(int argc, char** argv)
 
         Coordinator metaIndex(dim, &comm);
         metaIndex.set_warm_start(warm_start_arg);
+        metaIndex.set_weighted_partitioning(weighted_partitioning);
 
         if (!resuming && use_init_state) {
             std::cout << "[Sweep] Loading starting state from cluster analysis: "
