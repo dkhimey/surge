@@ -2578,12 +2578,26 @@ void Executor::mark_delete_local(int label) {
 void Executor::mark_delete_local_batch(const std::vector<int>& labels) {
     if (labels.empty()) return;
     std::shared_lock<std::shared_mutex> lk(graph_mutex_);
+
+    // Callers may pass labels held by other shards. Filter in one locked pass so
+    // markDelete doesn't throw on each miss (concurrent throws serialize).
+    std::vector<hnswlib::labeltype> present;
+    present.reserve(labels.size());
+    {
+        std::unique_lock<std::mutex> lock_table(sub_HNSW_->label_lookup_lock);
+        for (int label : labels) {
+            auto it = sub_HNSW_->label_lookup_.find(static_cast<hnswlib::labeltype>(label));
+            if (it != sub_HNSW_->label_lookup_.end() && !sub_HNSW_->isMarkedDeleted(it->second))
+                present.push_back(static_cast<hnswlib::labeltype>(label));
+        }
+    }
+
     #pragma omp parallel for schedule(dynamic)
-    for (size_t i = 0; i < labels.size(); i++) {
+    for (size_t i = 0; i < present.size(); i++) {
         try {
-            sub_HNSW_->markDelete(static_cast<hnswlib::labeltype>(labels[i]));
+            sub_HNSW_->markDelete(present[i]);
         } catch (...) {
-            // Label not found in this shard – silently skip.
+            // Raced with another delete of the same label – skip.
         }
     }
 }

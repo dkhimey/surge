@@ -328,7 +328,7 @@ public:
     // Mark single vector deleted; silently ignores missing labels
     void mark_delete_local(int label);
 
-    // Batch delete with shared lock (thread-safe per-element in hnswlib)
+    // Batch delete with shared lock; labels not live in this shard are skipped
     void mark_delete_local_batch(const std::vector<int>& labels);
 
     // When enabled, rebuild_adaptive always reconstructs the shard from scratch

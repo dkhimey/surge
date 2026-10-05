@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <malloc.h>
 #include <mpi.h>
 #include <omp.h>
 
@@ -326,23 +327,10 @@ static void bcastRoutingState(
             out_meta->setEf(EF_SEARCH);
         }
     }
-    // Broadcast label_to_center as parallel label/center arrays.
-    if (include_ltc) {
-        std::vector<int> labels, centers;
-        if (rank == 0) {
-            labels.reserve(coord_ltc->size());
-            centers.reserve(coord_ltc->size());
-            for (auto& [lbl, cid] : *coord_ltc) { labels.push_back(lbl); centers.push_back(cid); }
-        }
-        comm.bcast_vector(labels,  MPI_INT);
-        comm.bcast_vector(centers, MPI_INT);
-        if (rank != 0) {
-            out_ltc.clear(); out_ltc.reserve(labels.size());
-            for (size_t i = 0; i < labels.size(); i++) out_ltc[labels[i]] = centers[i];
-        } else {
-            out_ltc.clear();
-            for (auto& [lbl, cid] : *coord_ltc) out_ltc[lbl] = cid;
-        }
+    // label_to_center is coordinator-only; executors never receive it.
+    if (include_ltc && rank == 0) {
+        out_ltc.clear();
+        for (auto& [lbl, cid] : *coord_ltc) out_ltc[lbl] = cid;
     }
 }
 
@@ -761,15 +749,6 @@ int main(int argc, char** argv)
                         if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
                             label_to_shard[lbl] = routing_partitions[cid] + 1;
                 }
-            }
-            {
-            // Broadcast label to shard to executors
-                int n_lts = static_cast<int>(label_to_shard.size());
-                comm.bcast(&n_lts, 1, MPI_INT, 0);
-                std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
-                { int i = 0; for (auto& [k, v] : label_to_shard) { lts_keys[i] = k; lts_vals[i] = v; ++i; } }
-                comm.bcast(lts_keys.data(), n_lts, MPI_INT, 0);
-                comm.bcast(lts_vals.data(), n_lts, MPI_INT, 0);
             }
         }
 
@@ -1384,6 +1363,27 @@ int main(int argc, char** argv)
                     comm.bcast(routing_center_counts.data(), n, MPI_INT, 0);
                 }
 
+                // Executors hold no label_to_shard, so send them the partition of
+                // each GT id (row-major nq_orig x k, -1 = deleted/missing).
+                {
+                    std::vector<int> gt_part;
+                    if (have_gt) {
+                        const size_t rows = std::min(nq_orig, gt.size());
+                        gt_part.assign(rows * static_cast<size_t>(k), -1);
+                        for (size_t q = 0; q < rows; q++) {
+                            const int kk = std::min(static_cast<int>(gt[q].size()), k);
+                            for (int i = 0; i < kk; i++) {
+                                const int gid = gt[q][i];
+                                if (gid < 0) continue;
+                                auto it = label_to_shard.find(gid);
+                                if (it != label_to_shard.end())
+                                    gt_part[q * k + i] = it->second - 1;
+                            }
+                        }
+                    }
+                    comm.bcast_vector(gt_part, MPI_INT);
+                }
+
                 routing_hnsw->setEf(EF_ROUTING);
 
                 struct ComboResult {
@@ -1823,20 +1823,6 @@ int main(int argc, char** argv)
                           routing_hnsw, routing_partitions, label_to_center,
                           &meta_space, /*include_ltc=*/true);
 
-        // Populate label_to_shard
-        if (!resuming) {
-            for (auto& [lbl, cid] : label_to_center)
-                if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
-                    label_to_shard[lbl] = routing_partitions[cid] + 1;
-        } else {
-            int n_lts = 0;
-            comm.bcast(&n_lts, 1, MPI_INT, 0);
-            std::vector<int> lts_keys(n_lts), lts_vals(n_lts);
-            comm.bcast(lts_keys.data(), n_lts, MPI_INT, 0);
-            comm.bcast(lts_vals.data(), n_lts, MPI_INT, 0);
-            label_to_shard.reserve(n_lts);
-            for (int j = 0; j < n_lts; j++) label_to_shard[lts_keys[j]] = lts_vals[j];
-        }
         if (!resuming) {
             unsigned long long my_size = subIndex.get_element_count();
             comm.gather_sizes(my_size);
@@ -1845,6 +1831,9 @@ int main(int argc, char** argv)
         // Contribute-only half of the coordinator's report_memory. The five
         // gathers must stay in the same order as there.
         auto report_memory = [&]() {
+            // Return freed heap (step buffers, graphs dropped by rebuilds) to the
+            // OS so RSS reflects live memory. Runs outside the timed regions.
+            malloc_trim(0);
             unsigned long long rss = 0, peak = 0;
             read_rss_kb(rss, peak);
             comm.gather_sizes(rss);
@@ -1869,9 +1858,7 @@ int main(int argc, char** argv)
             comm.allgatherv(arrived.empty() ? &dummy : arrived.data(), my_n, MPI_INT,
                            all_moved.data(), all_ns.data(), displs.data(),
                            MPI_INT);
-            for (int r = 0; r < world_size; r++)
-                for (int i = displs[r]; i < displs[r] + all_ns[r]; i++)
-                    label_to_shard[all_moved[i]] = r;
+            // Only the coordinator keeps label_to_shard.
         };
 
         // Section marker
@@ -1972,14 +1959,7 @@ int main(int argc, char** argv)
                     comm.allgatherv(my_centers.data(), my_n, MPI_INT,
                                    all_centers.data(), all_ns.data(), displs.data(),
                                    MPI_INT);
-                    for (int i = 0; i < total; i++)
-                        label_to_center[all_labels[i]] = all_centers[i];
-
-                    for (int i = 0; i < total; i++) {
-                        const int cid = all_centers[i];
-                        if (cid >= 0 && cid < static_cast<int>(routing_partitions.size()))
-                            label_to_shard[all_labels[i]] = routing_partitions[cid] + 1;
-                    }
+                    // Only the coordinator keeps label_to_center / label_to_shard.
                 }
 
                 {
@@ -2055,32 +2035,13 @@ int main(int argc, char** argv)
             } else if (op_code == 1) {
                 const int n_delete = range_end - range_start;
 
-                std::vector<int> del_center_ids(n_delete, -1);
-                for (int i = 0; i < n_delete; i++) {
-                    auto it = label_to_center.find(range_start + i);
-                    if (it != label_to_center.end()) del_center_ids[i] = it->second;
-                }
-
                 comm.barrier();
                 const double t0_del = MPI_Wtime();
 
-                std::vector<int> my_delete_labels;
-                for (int i = 0; i < n_delete; i++) {
-                    const int label = range_start + i;
-                    const int cid   = del_center_ids[i];
-                    if (cid == -1) continue;
-                    label_to_center.erase(label);
-                    auto it = label_to_shard.find(label);
-                    if (it != label_to_shard.end()) {
-                        // label_to_shard is accurate even after delta rebuilds:
-                        // only the owning executor calls markDelete/patchDelete.
-                        if (it->second == rank)
-                            my_delete_labels.push_back(label);
-                        label_to_shard.erase(it);
-                    } else {
-                        my_delete_labels.push_back(label);
-                    }
-                }
+                // Pass the whole range; both delete paths skip labels this shard
+                // doesn't hold (or already tombstoned) via label_lookup_.
+                std::vector<int> my_delete_labels(n_delete);
+                std::iota(my_delete_labels.begin(), my_delete_labels.end(), range_start);
                 if (delete_policy == DeletePolicy::Wolverine) {
                     subIndex.patch_delete_local_batch(my_delete_labels);
                 } else {
@@ -2181,6 +2142,9 @@ int main(int argc, char** argv)
                     routing_center_counts.resize(n);
                     comm.bcast(routing_center_counts.data(), n, MPI_INT, 0);
                 }
+                // GT id -> partition table from the coordinator (see coordinator side).
+                std::vector<int> gt_part;
+                comm.bcast_vector(gt_part, MPI_INT);
                 routing_hnsw->setEf(EF_ROUTING);
 
                 // Vectors per partition (not centroid count) — the |rho(P)| size
@@ -2214,11 +2178,8 @@ int main(int argc, char** argv)
                         auto&       glist = gt_partitions[q - my_qs];
                         glist.assign(kk, -1);
                         for (int i = 0; i < kk; i++) {
-                            const int gid = gt_q[i];
-                            if (gid < 0) continue;
-                            auto it = label_to_shard.find(gid);
-                            if (it == label_to_shard.end()) continue;  // deleted → miss
-                            glist[i] = it->second - 1;                 // shard rank → raw partition id
+                            const size_t idx = q * static_cast<size_t>(k) + i;
+                            if (idx < gt_part.size()) glist[i] = gt_part[idx];  // -1 = deleted → miss
                         }
                     }
                 }
