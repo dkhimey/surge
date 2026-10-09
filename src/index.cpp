@@ -21,6 +21,8 @@
 #include <sstream>
 #include <iomanip>
 #include <omp.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // TAG_SEND_NUM / TAG_SEND_VECS / TAG_SEND_LABELS are defined in communicator.h
 // (shared with the Communicator's exchange_counts/exchange_vectors helpers).
@@ -1818,9 +1820,40 @@ void Executor::build(
     sub_HNSW_->addPoint(data_, indices_[0], /*replace_deleted=*/true); // first element not thread safe
     omp_set_num_threads(num_building_threads);
     std::cout << "[Executor " << node_id_ << "] - num threads building index: " << num_building_threads << "/"  << omp_get_max_threads() << "\n";
-    #pragma omp parallel for num_threads(num_building_threads)
-    for (int j = 1; j < data_count_; j++) {
-        sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/true);
+
+    // When the staging buffer is ours (filled by receive_data), insert in chunks and
+    // return each inserted chunk's pages to the OS, so the staged copy shrinks as the
+    // HNSW (which stores its own copy) grows. Caller-owned data from set_data is untouched.
+    const bool owns_staging = !local_vectors_.empty() && data_ == local_vectors_.data();
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t chunk = 1 << 20;
+    uintptr_t released_upto = 0;  // page-aligned address below which pages were released
+
+    for (size_t chunk_begin = 1; chunk_begin < data_count_; chunk_begin += chunk) {
+        const size_t chunk_end = std::min(chunk_begin + chunk, data_count_);
+        #pragma omp parallel for num_threads(num_building_threads) schedule(dynamic, 256)
+        for (size_t j = chunk_begin; j < chunk_end; j++) {
+            sub_HNSW_->addPoint(data_ + j*dim_, indices_[j], /*replace_deleted=*/true);
+        }
+
+        if (owns_staging) {
+            // Only release whole pages lying entirely within [data_, data_ + chunk_end*dim_).
+            uintptr_t lo = std::max(released_upto,
+                                    (reinterpret_cast<uintptr_t>(data_) + page - 1) & ~(page - 1));
+            uintptr_t hi = reinterpret_cast<uintptr_t>(data_ + chunk_end * dim_) & ~(page - 1);
+            if (hi > lo) {
+                madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
+                released_upto = hi;
+            }
+        }
+    }
+
+    if (owns_staging) {
+        // Released pages now read as zeros; drop the buffers so nothing can use them.
+        std::vector<float>().swap(local_vectors_);
+        std::vector<int>().swap(local_indices_);
+        data_ = nullptr;
+        indices_ = nullptr;
     }
 
     delete[] norm_element;
